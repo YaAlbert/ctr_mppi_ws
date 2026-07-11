@@ -1,0 +1,20 @@
+model:
+  implementation: approximate
+  backbone_points: 50
+  integration_step: 0.001
+  validate_input: true
+  clip_to_joint_limits: true
+
+  approximate:
+    curvature_scale: [1.0, 1.0, 1.0]
+    torsion_scale: [1.0, 1.0, 1.0]
+
+  cosserat:
+    enabled: false
+    solver: rk4
+    max_iterations: 100
+    tolerance: 1.0e-6
+
+  residual_model:
+    enabled: false
+    model_path: ""

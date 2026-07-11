@@ -1,0 +1,36 @@
+hardware:
+  enabled: false
+  implementation: mock
+
+  communication:
+    protocol: mock
+    serial_device: /dev/ttyUSB0
+    baud_rate: 115200
+    can_interface: can0
+    timeout: 0.05
+
+  motors:
+    count: 6
+    ids: [1, 2, 3, 4, 5, 6]
+    command_mode: velocity
+
+    direction:
+      insertion: [1, 1, 1]
+      rotation: [1, 1, 1]
+
+    encoder_resolution:
+      insertion: [1.0, 1.0, 1.0]
+      rotation: [1.0, 1.0, 1.0]
+
+    conversion_scale:
+      insertion: [1.0, 1.0, 1.0]
+      rotation: [1.0, 1.0, 1.0]
+
+  homing:
+    required: false
+    method: none
+
+  watchdog:
+    enabled: true
+    timeout: 0.10
+    stop_on_timeout: true

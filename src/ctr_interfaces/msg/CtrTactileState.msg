@@ -1,0 +1,10 @@
+std_msgs/Header header
+float64[] raw_values
+float64[] filtered_values
+geometry_msgs/Vector3 force
+float64 force_magnitude
+bool contact
+bool warning
+bool stop
+bool valid
+string diagnostic_status

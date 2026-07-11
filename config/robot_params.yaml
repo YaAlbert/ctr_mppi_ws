@@ -1,0 +1,36 @@
+robot:
+  name: three_tube_ctr
+  number_of_tubes: 3
+
+  frames:
+    world: world
+    base: base_link
+    tip: ctr_tip
+    tactile: tactile_frame
+
+  initial_configuration:
+    insertion: [0.0, 0.0, 0.0]
+    rotation: [0.0, 0.0, 0.0]
+
+  tube:
+    length: [0.20, 0.18, 0.16]
+    outer_diameter: [0.0030, 0.0025, 0.0020]
+    inner_diameter: [0.0025, 0.0020, 0.0015]
+    precurvature: [5.0, 6.0, 7.0]
+    precurved_length: [0.08, 0.07, 0.06]
+
+  material:
+    young_modulus: [1.0e9, 1.0e9, 1.0e9]
+    shear_modulus: [3.8e8, 3.8e8, 3.8e8]
+
+  limits:
+    insertion_min: [0.0, 0.0, 0.0]
+    insertion_max: [0.10, 0.10, 0.10]
+    rotation_min: [-3.14159, -3.14159, -3.14159]
+    rotation_max: [3.14159, 3.14159, 3.14159]
+
+    insertion_velocity_max: [0.002, 0.002, 0.002]
+    rotation_velocity_max: [0.10, 0.10, 0.10]
+
+    insertion_acceleration_max: [0.005, 0.005, 0.005]
+    rotation_acceleration_max: [0.20, 0.20, 0.20]

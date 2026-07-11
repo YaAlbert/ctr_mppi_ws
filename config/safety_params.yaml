@@ -1,0 +1,25 @@
+safety:
+  enabled: true
+
+  state_timeout: 0.10
+  command_timeout: 0.10
+  tactile_timeout: 0.10
+
+  stop_on_state_timeout: true
+  stop_on_tactile_timeout: true
+  stop_on_invalid_value: true
+
+  soft_contact:
+    velocity_scale: 0.30
+    force_weight_scale: 5.0
+    obstacle_weight_scale: 2.0
+
+  retreat:
+    enabled: true
+    distance: 0.002
+    speed: 0.0005
+    maximum_duration: 5.0
+
+  emergency_stop:
+    latch: true
+    require_manual_reset: true

@@ -1,0 +1,33 @@
+mppi:
+  enabled: true
+  control_frequency: 20.0
+  dt: 0.05
+
+  horizon: 10
+  num_samples: 500
+  lambda: 0.001
+  random_seed: 42
+
+  command_type: joint_velocity
+  warm_start: true
+  shift_previous_solution: true
+
+  noise_std:
+    insertion: [0.0005, 0.0005, 0.0005]
+    rotation: [0.02, 0.02, 0.02]
+
+  weights:
+    tip: 100.0
+    shape: 0.0
+    control: 0.5
+    smoothness: 1.0
+    obstacle: 0.0
+    terminal: 100.0
+    force: 0.0
+    joint_limit: 100000.0
+    stability: 0.0
+
+  convergence:
+    tip_tolerance: 0.002
+    shape_tolerance: 0.003
+    stable_cycles: 10

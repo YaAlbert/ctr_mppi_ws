@@ -1,0 +1,9 @@
+std_msgs/Header header
+float64[6] q
+float64[6] q_dot
+geometry_msgs/Point[] backbone
+geometry_msgs/Pose tip_pose
+geometry_msgs/Vector3 tactile_force
+bool contact
+bool valid
+string diagnostic_status

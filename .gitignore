@@ -1,0 +1,38 @@
+# ROS2 generated directories
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.swp
+*~
+
+# ROS bag files
+*.db3
+*.mcap
+
+# Large experiment outputs
+results/
+outputs/

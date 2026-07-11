@@ -1,0 +1,7 @@
+std_msgs/Header header
+string reference_type
+geometry_msgs/PoseStamped tip
+geometry_msgs/Point[] backbone
+---
+bool accepted
+string message

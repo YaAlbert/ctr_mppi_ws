@@ -1,0 +1,22 @@
+simulation:
+  update_frequency: 100.0
+  use_sim_time: true
+
+  actuator:
+    enabled: true
+    first_order_lag: false
+    time_constant: 0.05
+    command_delay: 0.0
+    dead_zone: 0.0
+    backlash: 0.0
+
+  noise:
+    joint_position_std: 0.0
+    joint_velocity_std: 0.0
+    tactile_std: 0.0
+
+  communication:
+    command_dropout_probability: 0.0
+    state_dropout_probability: 0.0
+
+  initial_scenario: fixed_target

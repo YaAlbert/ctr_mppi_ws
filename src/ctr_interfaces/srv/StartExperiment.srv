@@ -1,0 +1,6 @@
+std_msgs/Header header
+string experiment_name
+string metadata
+---
+bool accepted
+string message

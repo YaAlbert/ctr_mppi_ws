@@ -1,0 +1,9 @@
+std_msgs/Header header
+float64 solve_time
+float64 minimum_cost
+float64 mean_cost
+float64 effective_sample_weight
+float64 command_magnitude
+bool command_saturated
+bool valid
+string diagnostic_status
