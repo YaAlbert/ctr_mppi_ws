@@ -54,9 +54,41 @@
     reference material only. They are not assumed to satisfy the ROS2
     safety architecture.
 
-22. No ROS2 package skeleton exists yet, so package names and interfaces
-    in the architecture documents are still proposed targets.
+22. A ROS2 package skeleton now exists in `src/`, but it is not yet verified
+    complete until the current Ubuntu source tree builds successfully and the
+    installed packages/interfaces are discoverable after sourcing the isolated
+    install workspace.
 
 23. YAML defaults are conservative software-development placeholders until
     each associated TODO ID is resolved by the named file, datasheet,
     calibration, or experiment in `docs/18_unresolved_items.md`.
+
+24. Work created on Windows is treated as historical existing material. It is
+    not considered a completed milestone unless verified against the current
+    Ubuntu repository, installed ROS2 Humble environment, and build/test
+    results.
+
+25. The current `log/` directory is assumed to contain Ubuntu-generated colcon
+    inspection logs only. It is not a successful build log and does not prove
+    package buildability.
+
+26. The absence of `build/` and `install/` means there is no current installed
+    workspace for `ros2 pkg prefix` or generated interface import checks.
+
+27. The `ament_python` rosdep key is currently unresolved in the Ubuntu rosdep
+    database, even though colcon's `ros.ament_python` build extension is
+    installed. This is treated as a build-readiness issue until resolved by a
+    manifest policy decision or a successful isolated build with documented
+    rationale.
+
+28. Package-local Python tests are treated as useful unit evidence only when
+    run directly from each package test directory. Top-level
+    `python3 -m unittest discover -s src` currently discovers zero tests.
+
+29. CRLF line endings in documentation, YAML, and selected MATLAB/data files
+    are treated as a compatibility issue to track, not as proof of source
+    invalidity.
+
+30. MATLAB hardware GUI files using Windows COM ports are reference material
+    only. They are not Ubuntu hardware drivers and must not be used to justify
+    physical hardware readiness.

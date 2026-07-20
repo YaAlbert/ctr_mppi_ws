@@ -16,6 +16,27 @@ can reference the finding.
 | MODEL-002 | MATLAB input units | Phase 3 MATLAB public scripts use `rho` in mm and `theta` in degrees | Unit conversion test comparing MATLAB fixtures to Python SI inputs | Model | Resolved by audit |
 | MODEL-003 | MATLAB backbone point ordering | `sample_ctr_centerline` emits ordered backbone points from base toward tip | Python port test against `WorkspaceSamples.mat` representative backbones | Model | Resolved by audit |
 
+## Ubuntu milestone verification
+
+| Milestone | Current state | Ubuntu evidence | Evidence needed for verified complete |
+|---|---|---|---|
+| Milestone 1: ROS2 skeleton | Present but unverified | 11 packages are discovered by `colcon list`; package manifests, setup files, custom interfaces, YAML files, launch files, and placeholder nodes are present | Successful isolated `colcon build`; source isolated install; `ros2 pkg prefix` succeeds for project packages; `ros2 interface show` succeeds for generated interfaces; launch smoke tests pass |
+| Milestone 2: CTR model | Partially complete | `ApproximateCTRModel.forward_kinematics(q)` exists and direct package-local tests pass | MATLAB-to-Python fixture comparison; parameter source-of-truth decision; validation thresholds documented and passing |
+| Milestone 3: ROS2 simulation | Partially complete | `CTRSimulationCore` and `simulator_node.py` exist and direct simulation core tests pass | Ubuntu build and launch; runtime topic publication checks; RViz marker verification; unit/axis/frequency checks |
+
+## Ubuntu build-readiness and compatibility findings
+
+| ID | Finding | Current evidence | Evidence needed to resolve | Module | Priority |
+|---|---|---|---|---|---|
+| BUILD-001 | No Ubuntu build result exists for the current source tree | `build/` and `install/` are absent; isolated `colcon build` has not been run | Successful isolated `colcon build` with logged package list, warnings, failures, and installed workspace verification | Build | Critical |
+| BUILD-002 | `rosdep` cannot resolve `ament_python` | `rosdep check --from-paths src --ignore-src` reports no rosdep rule for `ament_python`; colcon `ros.ament_python` extension is installed | Manifest policy decision plus clean `rosdep check`, or documented justification that buildtool dependency is acceptable despite rosdep behavior and successful isolated build | Build | Critical |
+| BUILD-003 | Project packages are not discoverable by `ros2 pkg prefix` before build/install | `ros2 pkg prefix ctr_sim` and `ros2 pkg prefix ctr_interfaces` report package not found before sourcing an install workspace | Successful isolated install, source `install_ubuntu_audit/setup.bash`, and verify `ros2 pkg prefix` for project packages | Build | Critical |
+| TEST-003 | Top-level unittest discovery finds zero tests | `python3 -m unittest discover -s src` ran zero tests; direct package-local tests passed | Adopt a documented test invocation and verify it in CI or update test layout so top-level discovery finds intended tests | Testing | Medium |
+| COMPAT-001 | CRLF line endings remain in repository assets | CRLF detected in docs, YAML, README/CODEX_TASK, and selected MATLAB/data files | Line-ending policy decision and conversion/verification where required for Ubuntu tooling | Compatibility | Medium |
+| COMPAT-002 | MATLAB hardware reference code uses Windows COM ports | `Drive.m` and `CTRControlApp_PseudoPMC.m` reference `COM5`, `COM6`, and `COM13` | Ubuntu hardware interface design using ROS2-safe hardware nodes and documented device mapping; do not use COM-port MATLAB code as hardware readiness evidence | Hardware | High |
+| COMPAT-003 | MATLAB `.mat` fixtures were created on Windows | `file` reports PCWIN64 MATLAB v5 files | Load and validate fixtures in Ubuntu MATLAB/Octave/Python workflow or replace with documented Ubuntu-generated fixtures | Data | Medium |
+| COMPAT-004 | Current `log/` is inspection output, not build evidence | `log/` contains `list_*` and `extensions_*` colcon logs only | Successful isolated build logs under a named audit log directory | Build | Medium |
+
 ## Open items
 
 | ID | Item | Default | Required input | File or experiment needed to resolve it | Module | Priority |
@@ -28,12 +49,13 @@ can reference the finding.
 | CTR-006 | Young's modulus | 1e9 Pa | Material data | Material datasheet or bending calibration experiment | Model | Medium |
 | CTR-007 | Shear modulus | 3.8e8 Pa | Material data | Material datasheet or torsion calibration experiment | Model | Medium |
 | CTR-008 | Tube friction | Not modeled | Experiment | Insertion/rotation friction characterization experiment | Model | Medium |
-| MODEL-004 | Python CTR model implementation | approximate | Ported model logic | `src/ctr_model` Python port of `Robot.m`, `Tube.m`, and `sample_ctr_centerline.m` | Model | Critical |
+| MODEL-004 | Python CTR model implementation | approximate scaffold exists | Ported or validated model logic | `src/ctr_model` Python port of `Robot.m`, `Tube.m`, and `sample_ctr_centerline.m`, or documented validation showing the scaffold is sufficient for the milestone | Model | Critical |
 | MODEL-005 | MATLAB-to-Python validation thresholds | tip and mean backbone error below 1e-3 m | Benchmark agreement target | Python test fixture using `WorkspaceSamples.mat` and MATLAB comparison outputs | Model | High |
 | MODEL-006 | Source-of-truth tube parameter set | Use YAML placeholders | Decision between YAML placeholders and Phase 3 MATLAB parameters | Parameter review comparing `config/robot_params.yaml` to Phase 3 `initialize_ctr_model()` values | Model | Critical |
-| ROS-001 | ROS2 package skeleton | Package list in `docs/07_ros2_architecture.md` | Package manifests and build files | Create package files under `src/` and verify with `colcon build` | ROS2 | Critical |
-| ROS-002 | Custom ROS2 interfaces | Topic and service list in `docs/08_ros2_interfaces.md` | Message and service definitions | Create `.msg` and `.srv` files in `ctr_interfaces` and validate generated types | ROS2 | Critical |
-| ROS-003 | Runtime launch modes | simulation, simulation_with_sensor_noise, hardware_in_loop, mock_hardware, physical_hardware | Launch files and mode parameters | `ctr_bringup` launch files plus startup tests | ROS2 | High |
+| ROS-001 | ROS2 package skeleton | Package files present, build unverified | Ubuntu build verification | Isolated `colcon build`, installed package discovery, and launch smoke tests | ROS2 | Critical |
+| ROS-002 | Custom ROS2 interfaces | `.msg` and `.srv` files present, generated types unverified | Generated interface validation | Build `ctr_interfaces`, source isolated install, verify `ros2 interface show` and Python imports for generated types | ROS2 | Critical |
+| ROS-003 | Runtime launch modes | simulation, mock_hardware, physical_hardware launch files present | Runtime launch validation | `ctr_bringup` launch startup tests for each mode, with hardware I/O disabled unless commissioned | ROS2 | High |
+| ROS-004 | `simulation_with_sensor_noise` and `hardware_in_loop` modes | Documented modes, no dedicated launch validation found | Mode design and launch coverage | Launch arguments or dedicated launch files plus smoke tests for the documented modes | ROS2 | Medium |
 | TODO-OWNER-001 | Package maintainer metadata | `todo@example.com` and `TODO-OWNER-001` | Project maintainer identity | Update all package manifests and setup files after owner decision | Metadata | Medium |
 | TODO-LICENSE-001 | Package license metadata | `TODO-LICENSE-001` | Project license decision | Add project license file and update all package manifests/setup files | Metadata | High |
 | FRAME-001 | Slicer LPS to robot/world transform | Slicer LPS coordinates in mm | Registration transform | Vessel-to-robot registration experiment or documented transform file | Simulation | High |
@@ -47,6 +69,8 @@ can reference the finding.
 | COST-002 | Obstacle safety distance | Not defined | Safety margin | Add value to configuration after lumen/obstacle clearance experiment | Controller | High |
 | COST-003 | Hard collision penalty | Not defined | Cost tuning | Cost-function sweep in static obstacle simulation | Controller | High |
 | COST-004 | Proximity penalty shape | Not defined | Cost tuning | Cost-function sweep in static and dynamic obstacle simulations | Controller | Medium |
+| COST-005 | Shape tracking cost implementation | Disabled interface | Shape reference and resampling design | Implement and test backbone shape cost using validated backbone point alignment/resampling | Controller | High |
+| COST-006 | Stability cost implementation | Disabled interface | Stability criterion | Define and test stability term, or document why it remains disabled for the current research scope | Controller | Medium |
 | SNS-001 | Tactile sensor model | Unknown | Hardware info | Sensor datasheet or selected simulated sensor specification | Tactile | Critical |
 | SNS-002 | Tactile output type | Unknown | Hardware info | Sensor datasheet and raw serial/data capture file | Tactile | Critical |
 | SNS-003 | Zero offset | 0 | Calibration | No-load tactile calibration dataset | Tactile | Critical |
