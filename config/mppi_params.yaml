@@ -31,3 +31,38 @@ mppi:
     tip_tolerance: 0.002
     shape_tolerance: 0.003
     stable_cycles: 10
+
+# Milestone 5 software-test references are centered near the approximate
+# model's zero-configuration tip [0.0192, 0.0, 0.08] m. They are not physical
+# CTR workspace limits.
+reference:
+  mode: fixed_target
+  trajectory_type: circle
+  frame_id: base_link
+  loop: true
+  completion_behavior: loop
+  sample_period: 0.05
+  duration: 10.0
+  publish_frequency: 20.0
+  stale_timeout: 0.20
+
+  fixed_target: [0.0192, 0.0, 0.08]
+
+  circle:
+    center: [0.0192, 0.0, 0.08]
+    radius: 0.0005
+    angular_velocity: 0.6283185307179586
+    phase: 0.0
+
+  ellipse:
+    center: [0.0192, 0.0, 0.08]
+    radii: [0.0006, 0.0003]
+    angular_velocity: 0.6283185307179586
+    phase: 0.0
+
+  helix:
+    center: [0.0192, 0.0, 0.0795]
+    radius: 0.0004
+    height: 0.001
+    angular_velocity: 0.6283185307179586
+    phase: 0.0

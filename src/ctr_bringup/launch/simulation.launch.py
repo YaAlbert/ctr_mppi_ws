@@ -5,6 +5,7 @@ from ctr_bringup.parameter_validation import validate_config_paths
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
+from launch.substitutions import PythonExpression
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -29,7 +30,21 @@ def generate_launch_description():
     runtime_mode = LaunchConfiguration("runtime_mode")
     start_manual_command_publisher = LaunchConfiguration("start_manual_command_publisher")
     start_mppi_controller = LaunchConfiguration("start_mppi_controller")
+    start_reference_manager = LaunchConfiguration("start_reference_manager")
+    reference_mode = LaunchConfiguration("reference_mode")
+    reference_type = LaunchConfiguration("reference_type")
     mppi_publish_safe_for_simulation = LaunchConfiguration("mppi_publish_safe_for_simulation")
+    reference_manager_condition = IfCondition(
+        PythonExpression(
+            [
+                "'",
+                start_reference_manager,
+                "' == 'true' or '",
+                reference_mode,
+                "' == 'trajectory'",
+            ]
+        )
+    )
 
     return LaunchDescription(
         [
@@ -47,6 +62,21 @@ def generate_launch_description():
                 "start_mppi_controller",
                 default_value="false",
                 description="Start the Milestone 4 MPPI ROS2 wrapper.",
+            ),
+            DeclareLaunchArgument(
+                "start_reference_manager",
+                default_value="false",
+                description="Start the Milestone 5 reference manager. Trajectory mode starts it automatically.",
+            ),
+            DeclareLaunchArgument(
+                "reference_mode",
+                default_value="fixed_target",
+                description="Reference operating mode: fixed_target or trajectory.",
+            ),
+            DeclareLaunchArgument(
+                "reference_type",
+                default_value="circle",
+                description="Trajectory type for reference manager trajectory mode: circle, ellipse, or helix.",
             ),
             DeclareLaunchArgument(
                 "mppi_publish_safe_for_simulation",
@@ -106,7 +136,24 @@ def generate_launch_description():
                         "config_paths": _config_paths(),
                         "runtime_mode": runtime_mode,
                         "target_position": [0.0, 0.0, 0.08],
+                        "reference_mode": reference_mode,
+                        "reference_type": reference_type,
                         "publish_safe_command_for_simulation": mppi_publish_safe_for_simulation,
+                    }
+                ],
+            ),
+            Node(
+                package="ctr_mppi_controller",
+                executable="reference_manager_node",
+                name="reference_manager",
+                output="screen",
+                condition=reference_manager_condition,
+                parameters=[
+                    {
+                        "config_paths": _config_paths(),
+                        "runtime_mode": runtime_mode,
+                        "reference_mode": reference_mode,
+                        "reference_type": reference_type,
                     }
                 ],
             ),

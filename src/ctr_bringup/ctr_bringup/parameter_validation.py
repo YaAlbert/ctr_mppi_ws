@@ -118,7 +118,16 @@ def validate_project_config(config: dict[str, Any]) -> list[str]:
     """Return validation errors for the full project configuration."""
 
     errors: list[str] = []
-    for section in ("robot", "model", "mppi", "hardware", "safety", "simulation", "tactile"):
+    for section in (
+        "robot",
+        "model",
+        "mppi",
+        "reference",
+        "hardware",
+        "safety",
+        "simulation",
+        "tactile",
+    ):
         if section not in config:
             errors.append(f"Missing required section `{section}`.")
 
@@ -128,6 +137,8 @@ def validate_project_config(config: dict[str, Any]) -> list[str]:
         errors.extend(_validate_model(config["model"]))
     if "mppi" in config:
         errors.extend(_validate_mppi(config["mppi"]))
+    if "reference" in config:
+        errors.extend(_validate_reference(config["reference"]))
     if "hardware" in config:
         errors.extend(_validate_hardware(config["hardware"]))
     if "safety" in config:
@@ -231,6 +242,71 @@ def _validate_mppi(mppi: Any) -> list[str]:
     weights = mppi.get("weights", {})
     for key in ("tip", "shape", "control", "smoothness", "obstacle", "terminal", "force", "joint_limit", "stability"):
         errors.extend(_require_number(weights, key, "mppi.weights", nonnegative=True))
+    return errors
+
+
+def _validate_reference(reference: Any) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(reference, dict):
+        return ["`reference` must be a map."]
+
+    if reference.get("mode") not in {"fixed_target", "trajectory"}:
+        errors.append("`reference.mode` must be `fixed_target` or `trajectory`.")
+    if reference.get("trajectory_type") not in {"circle", "ellipse", "helix"}:
+        errors.append("`reference.trajectory_type` must be `circle`, `ellipse`, or `helix`.")
+    if not isinstance(reference.get("frame_id"), str) or not reference["frame_id"]:
+        errors.append("`reference.frame_id` must be a non-empty string.")
+    if not isinstance(reference.get("loop"), bool):
+        errors.append("`reference.loop` must be a boolean.")
+    completion = reference.get("completion_behavior")
+    if completion not in {"loop", "hold_final"}:
+        errors.append("`reference.completion_behavior` must be `loop` or `hold_final`.")
+    elif isinstance(reference.get("loop"), bool) and reference["loop"] != (completion == "loop"):
+        errors.append("`reference.loop` must match `reference.completion_behavior`.")
+
+    errors.extend(_require_positive_number(reference, "sample_period", "reference"))
+    errors.extend(_require_positive_number(reference, "duration", "reference"))
+    errors.extend(_require_positive_number(reference, "publish_frequency", "reference"))
+    errors.extend(_require_positive_number(reference, "stale_timeout", "reference"))
+    errors.extend(_require_numeric_list(reference, "fixed_target", 3, "reference"))
+
+    sample_period = _as_finite_number(reference.get("sample_period"))
+    duration = _as_finite_number(reference.get("duration"))
+    if sample_period is not None and duration is not None and sample_period > 0.0 and duration > 0.0:
+        if int(duration / sample_period) + 1 < 2:
+            errors.append("`reference.duration` and `reference.sample_period` must produce at least two points.")
+
+    circle = reference.get("circle", {})
+    if not isinstance(circle, dict):
+        errors.append("`reference.circle` must be a map.")
+    else:
+        errors.extend(_require_numeric_list(circle, "center", 3, "reference.circle"))
+        errors.extend(_require_number(circle, "radius", "reference.circle", nonnegative=True))
+        errors.extend(_require_number(circle, "angular_velocity", "reference.circle"))
+        errors.extend(_require_number(circle, "phase", "reference.circle"))
+
+    ellipse = reference.get("ellipse", {})
+    if not isinstance(ellipse, dict):
+        errors.append("`reference.ellipse` must be a map.")
+    else:
+        errors.extend(_require_numeric_list(ellipse, "center", 3, "reference.ellipse"))
+        errors.extend(_require_numeric_list(ellipse, "radii", 2, "reference.ellipse", positive=True))
+        errors.extend(_require_number(ellipse, "angular_velocity", "reference.ellipse"))
+        errors.extend(_require_number(ellipse, "phase", "reference.ellipse"))
+
+    helix = reference.get("helix", {})
+    if not isinstance(helix, dict):
+        errors.append("`reference.helix` must be a map.")
+    else:
+        errors.extend(_require_numeric_list(helix, "center", 3, "reference.helix"))
+        errors.extend(_require_number(helix, "radius", "reference.helix", nonnegative=True))
+        errors.extend(_require_number(helix, "height", "reference.helix"))
+        height = _as_finite_number(helix.get("height"))
+        if height == 0.0:
+            errors.append("`reference.helix.height` must be non-zero.")
+        errors.extend(_require_number(helix, "angular_velocity", "reference.helix"))
+        errors.extend(_require_number(helix, "phase", "reference.helix"))
+
     return errors
 
 

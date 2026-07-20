@@ -20,6 +20,7 @@ setup(
         "console_scripts": [
             "mppi_controller_placeholder_node = ctr_mppi_controller.nodes.mppi_controller_placeholder_node:main",
             "mppi_controller_node = ctr_mppi_controller.nodes.mppi_controller_node:main",
+            "reference_manager_node = ctr_mppi_controller.nodes.reference_manager_node:main",
         ]
     },
 )

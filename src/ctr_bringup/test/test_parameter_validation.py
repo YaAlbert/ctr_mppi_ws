@@ -1,4 +1,6 @@
 import importlib.util
+import copy
+import os
 import sys
 import tempfile
 import unittest
@@ -70,6 +72,47 @@ class ParameterValidationTest(unittest.TestCase):
         self.assertTrue(all(isinstance(path, str) for path in paths))
         self.assertEqual(len(CONFIG_FILES), len(paths))
 
+    def test_simulation_launch_declares_reference_manager_arguments(self):
+        from launch.actions import DeclareLaunchArgument
+        from launch_ros.actions import Node
+
+        launch_path = REPO_ROOT / "src" / "ctr_bringup" / "launch" / "simulation.launch.py"
+        spec = importlib.util.spec_from_file_location("simulation_launch_reference_args_under_test", launch_path)
+        module = importlib.util.module_from_spec(spec)
+        self.assertIsNotNone(spec.loader)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package_share = Path(temp_dir)
+            previous_ros_log_dir = os.environ.get("ROS_LOG_DIR")
+            os.environ["ROS_LOG_DIR"] = str(package_share / "ros_log")
+            config_dir = package_share / "config"
+            config_dir.mkdir()
+            for source_path in CONFIG_FILES:
+                (config_dir / source_path.name).write_text("placeholder: true\n", encoding="utf-8")
+
+            module.get_package_share_directory = lambda package_name: str(package_share)
+            try:
+                launch_description = module.generate_launch_description()
+            finally:
+                if previous_ros_log_dir is None:
+                    os.environ.pop("ROS_LOG_DIR", None)
+                else:
+                    os.environ["ROS_LOG_DIR"] = previous_ros_log_dir
+
+        launch_arguments = {
+            entity.name
+            for entity in launch_description.entities
+            if isinstance(entity, DeclareLaunchArgument)
+        }
+        self.assertIn("start_reference_manager", launch_arguments)
+        self.assertIn("reference_mode", launch_arguments)
+        self.assertIn("reference_type", launch_arguments)
+
+        node_actions = [entity for entity in launch_description.entities if isinstance(entity, Node)]
+        executables = {getattr(node, "_Node__node_executable", None) for node in node_actions}
+        self.assertIn("reference_manager_node", executables)
+
     def test_config_paths_reject_empty_required_array(self):
         with self.assertRaises(ParameterValidationError) as context:
             validate_config_paths([])
@@ -93,6 +136,24 @@ class ParameterValidationTest(unittest.TestCase):
     def test_duplicate_sections_are_rejected(self):
         with self.assertRaises(ParameterValidationError):
             load_parameter_files([CONFIG_FILES[0], CONFIG_FILES[0]])
+
+    def test_reference_yaml_section_validates(self):
+        config = load_parameter_files(CONFIG_FILES)
+        self.assertEqual([], [error for error in validate_project_config(config) if "reference" in error])
+
+    def test_reference_invalid_mode_is_rejected(self):
+        config = load_parameter_files(CONFIG_FILES)
+        config = copy.deepcopy(config)
+        config["reference"]["mode"] = "invalid"
+        errors = validate_project_config(config)
+        self.assertTrue(any("reference.mode" in error for error in errors))
+
+    def test_reference_zero_helix_height_is_rejected(self):
+        config = load_parameter_files(CONFIG_FILES)
+        config = copy.deepcopy(config)
+        config["reference"]["helix"]["height"] = 0.0
+        errors = validate_project_config(config)
+        self.assertTrue(any("reference.helix.height" in error for error in errors))
 
     def test_invalid_robot_tube_count_is_rejected(self):
         config = load_parameter_files(CONFIG_FILES)
