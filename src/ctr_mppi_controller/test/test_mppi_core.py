@@ -1,6 +1,7 @@
 import copy
 import sys
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 
 import numpy as np
@@ -50,6 +51,34 @@ def make_controller():
     config = make_test_config()
     model = ApproximateCTRModel(config)
     return config, model, MPPICore(config, model)
+
+
+class FirstThreeJointTipModel:
+    def forward_kinematics(self, q):
+        tip = np.asarray(q, dtype=float)[:3].copy()
+        return SimpleNamespace(
+            backbone_points=np.vstack((np.zeros(3), tip)),
+            tip_position=tip,
+        )
+
+
+def make_cost_indexing_controller():
+    config = make_test_config()
+    config["mppi"]["dt"] = 1.0
+    config["mppi"]["horizon"] = 3
+    config["mppi"]["num_samples"] = 2
+    config["mppi"]["weights"]["tip"] = 1.0
+    config["mppi"]["weights"]["control"] = 0.0
+    config["mppi"]["weights"]["smoothness"] = 0.0
+    config["mppi"]["weights"]["terminal"] = 0.0
+    config["robot"]["limits"]["insertion_max"] = [10.0, 10.0, 10.0]
+    config["robot"]["limits"]["rotation_min"] = [-10.0, -10.0, -10.0]
+    config["robot"]["limits"]["rotation_max"] = [10.0, 10.0, 10.0]
+    config["robot"]["limits"]["insertion_velocity_max"] = [10.0, 10.0, 10.0]
+    config["robot"]["limits"]["rotation_velocity_max"] = [10.0, 10.0, 10.0]
+    config["mppi"]["noise_std"]["insertion"] = [0.0, 0.0, 0.0]
+    config["mppi"]["noise_std"]["rotation"] = [0.0, 0.0, 0.0]
+    return MPPICore(config, FirstThreeJointTipModel())
 
 
 class MPPICoreTest(unittest.TestCase):
@@ -117,6 +146,36 @@ class MPPICoreTest(unittest.TestCase):
         self.assertAlmostEqual(0.0, result.minimum_cost)
         self.assertTrue(np.all(np.isfinite(result.command)))
         self.assertTrue(np.all(np.abs(result.command) <= controller.velocity_max))
+
+    def test_fixed_target_reference_sequence_is_tiled(self):
+        _, _, controller = make_controller()
+        target = np.array([0.01, 0.02, 0.03])
+        reference_sequence = controller._reference_sequence(target_tip=target, target_tip_sequence=None)
+        self.assertEqual((controller.horizon, 3), reference_sequence.shape)
+        self.assertTrue(np.allclose(np.tile(target, (controller.horizon, 1)), reference_sequence))
+
+    def test_fixed_target_matches_equivalent_tiled_sequence(self):
+        config, model, fixed_controller = make_controller()
+        sequence_controller = MPPICore(config, model)
+        target_q = np.zeros(fixed_controller.control_dimension)
+        target_q[: config["robot"]["number_of_tubes"]] = 0.003
+        target = model.forward_kinematics(target_q).tip_position
+        target_sequence = np.tile(target, (fixed_controller.horizon, 1))
+
+        fixed_result = fixed_controller.solve(
+            q=np.zeros(fixed_controller.control_dimension),
+            q_dot=np.zeros(fixed_controller.control_dimension),
+            target_tip=target,
+        )
+        sequence_result = sequence_controller.solve(
+            q=np.zeros(sequence_controller.control_dimension),
+            q_dot=np.zeros(sequence_controller.control_dimension),
+            target_tip_sequence=target_sequence,
+        )
+
+        self.assertTrue(np.allclose(fixed_result.command, sequence_result.command))
+        self.assertTrue(np.allclose(fixed_result.nominal_sequence, sequence_result.nominal_sequence))
+        self.assertTrue(np.allclose(fixed_controller.last_costs, sequence_controller.last_costs))
 
     def test_solve_returns_bounded_command_and_metrics(self):
         config, model, controller = make_controller()
@@ -204,6 +263,88 @@ class MPPICoreTest(unittest.TestCase):
                 q_dot=np.zeros(controller.control_dimension),
                 target_tip=np.full(3, np.inf),
             )
+
+    def test_both_reference_inputs_are_rejected(self):
+        _, model, controller = make_controller()
+        target = model.forward_kinematics(np.zeros(controller.control_dimension)).tip_position
+        with self.assertRaises(ValueError):
+            controller.solve(
+                q=np.zeros(controller.control_dimension),
+                q_dot=np.zeros(controller.control_dimension),
+                target_tip=target,
+                target_tip_sequence=np.tile(target, (controller.horizon, 1)),
+            )
+
+    def test_missing_reference_input_is_rejected(self):
+        _, _, controller = make_controller()
+        with self.assertRaises(ValueError):
+            controller.solve(
+                q=np.zeros(controller.control_dimension),
+                q_dot=np.zeros(controller.control_dimension),
+            )
+
+    def test_rejects_bad_target_sequence(self):
+        _, _, controller = make_controller()
+        with self.assertRaises(ValueError):
+            controller.solve(
+                q=np.zeros(controller.control_dimension),
+                q_dot=np.zeros(controller.control_dimension),
+                target_tip_sequence=np.zeros((controller.horizon - 1, 3)),
+            )
+        with self.assertRaises(ValueError):
+            controller.solve(
+                q=np.zeros(controller.control_dimension),
+                q_dot=np.zeros(controller.control_dimension),
+                target_tip_sequence=np.full((controller.horizon, 3), np.inf),
+            )
+
+    def test_per_step_trajectory_references_are_used_by_running_cost(self):
+        controller = make_cost_indexing_controller()
+        sequence = np.zeros((controller.horizon, controller.control_dimension))
+        sequence[0, :3] = [1.0, 0.0, 0.0]
+        sequence[1, :3] = [0.0, 1.0, 0.0]
+        sequence[2, :3] = [0.0, 0.0, 1.0]
+        target_sequence = np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [9.0, 9.0, 9.0],
+            ]
+        )
+
+        rollout = controller.rollout_candidate(
+            q0=np.zeros(controller.control_dimension),
+            sequence=sequence,
+            previous_command=np.zeros(controller.control_dimension),
+            target_tip_sequence=target_sequence,
+        )
+
+        self.assertAlmostEqual(192.0, rollout.cost)
+
+    def test_final_sequence_point_is_used_by_terminal_cost(self):
+        controller = make_cost_indexing_controller()
+        controller.weights["tip"] = 0.0
+        controller.weights["terminal"] = 1.0
+        sequence = np.zeros((controller.horizon, controller.control_dimension))
+        sequence[0, :3] = [1.0, 0.0, 0.0]
+        sequence[1, :3] = [0.0, 1.0, 0.0]
+        sequence[2, :3] = [0.0, 0.0, 1.0]
+        target_sequence = np.array(
+            [
+                [9.0, 9.0, 9.0],
+                [8.0, 8.0, 8.0],
+                [1.0, 1.0, 1.0],
+            ]
+        )
+
+        rollout = controller.rollout_candidate(
+            q0=np.zeros(controller.control_dimension),
+            sequence=sequence,
+            previous_command=np.zeros(controller.control_dimension),
+            target_tip_sequence=target_sequence,
+        )
+
+        self.assertAlmostEqual(0.0, rollout.cost)
 
 
 class ClosedLoopFixedTargetIntegrationTest(unittest.TestCase):

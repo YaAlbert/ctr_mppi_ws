@@ -1,4 +1,4 @@
-"""ROS-independent MPPI controller core for Milestone 4."""
+"""ROS-independent MPPI controller core."""
 
 from __future__ import annotations
 
@@ -203,18 +203,19 @@ class MPPICore:
         q0: np.ndarray | list[float] | tuple[float, ...],
         sequence: np.ndarray,
         previous_command: np.ndarray | list[float] | tuple[float, ...],
-        target_tip: np.ndarray | list[float] | tuple[float, ...],
+        target_tip: np.ndarray | list[float] | tuple[float, ...] | None = None,
+        target_tip_sequence: np.ndarray | list[list[float]] | tuple[tuple[float, ...], ...] | None = None,
     ) -> MPPIRollout:
         q = _array_shape(q0, "q0", (self.control_dimension,)).copy()
         sequence_array = _array_shape(sequence, "sequence", (self.horizon, self.control_dimension))
         previous = _array_shape(previous_command, "previous_command", (self.control_dimension,)).copy()
-        target = _array_shape(target_tip, "target_tip", (3,))
+        reference_sequence = self._reference_sequence(target_tip=target_tip, target_tip_sequence=target_tip_sequence)
 
         total = 0.0
         command_saturated = False
         final_tip = None
 
-        for command in sequence_array:
+        for step_index, command in enumerate(sequence_array):
             clipped_command = np.clip(command, -self.velocity_max, self.velocity_max)
             next_q_unclipped = q + self.dt * clipped_command
             q = np.clip(next_q_unclipped, self.q_min, self.q_max)
@@ -223,7 +224,7 @@ class MPPICore:
 
             model_result = self._validated_model_result(q)
             final_tip = model_result.tip_position
-            total += self._weight("tip") * tip_tracking_cost(final_tip, target)
+            total += self._weight("tip") * tip_tracking_cost(final_tip, reference_sequence[step_index])
             total += self._weight("control") * control_magnitude_cost(clipped_command)
             total += self._weight("smoothness") * control_smoothness_cost(clipped_command, previous)
             total += shape_tracking_cost(enabled=self._weight("shape") > 0.0)
@@ -235,7 +236,7 @@ class MPPICore:
         if final_tip is None:
             raise ValueError("rollout sequence is empty")
         terminal = self._validated_model_result(q).tip_position
-        total += self._weight("terminal") * terminal_tip_cost(terminal, target)
+        total += self._weight("terminal") * terminal_tip_cost(terminal, reference_sequence[-1])
         if not np.isfinite(total):
             raise ValueError("rollout cost is not finite")
         return MPPIRollout(
@@ -265,12 +266,13 @@ class MPPICore:
         *,
         q: np.ndarray | list[float] | tuple[float, ...],
         q_dot: np.ndarray | list[float] | tuple[float, ...],
-        target_tip: np.ndarray | list[float] | tuple[float, ...],
+        target_tip: np.ndarray | list[float] | tuple[float, ...] | None = None,
+        target_tip_sequence: np.ndarray | list[list[float]] | tuple[tuple[float, ...], ...] | None = None,
     ) -> MPPIResult:
         start = perf_counter()
         q0 = _array_shape(q, "q", (self.control_dimension,))
         previous_command = _array_shape(q_dot, "q_dot", (self.control_dimension,))
-        target = _array_shape(target_tip, "target_tip", (3,))
+        reference_sequence = self._reference_sequence(target_tip=target_tip, target_tip_sequence=target_tip_sequence)
 
         if self.warm_start and self.shift_previous_solution:
             self.nominal_sequence[:-1] = self.nominal_sequence[1:]
@@ -288,7 +290,7 @@ class MPPICore:
                 q0=q0,
                 sequence=candidate_sequences[sample_index],
                 previous_command=previous_command,
-                target_tip=target,
+                target_tip_sequence=reference_sequence,
             )
             costs[sample_index] = rollout.cost
             final_q[sample_index] = rollout.final_q
@@ -319,7 +321,7 @@ class MPPICore:
             effective_sample_weight=effective_sample_weight,
             command_magnitude=float(np.linalg.norm(command)),
             command_saturated=bool(command_saturated),
-            diagnostic_status="MPPI Milestone 4: tip/control/smoothness/terminal costs enabled; advanced costs disabled.",
+            diagnostic_status="MPPI controller: tip/control/smoothness/terminal costs enabled; advanced costs disabled.",
         )
 
     def _rollout_cost(
@@ -328,14 +330,31 @@ class MPPICore:
         q0: np.ndarray,
         sequence: np.ndarray,
         previous_command: np.ndarray,
-        target_tip: np.ndarray,
+        target_tip: np.ndarray | None = None,
+        target_tip_sequence: np.ndarray | None = None,
     ) -> float:
         return self.rollout_candidate(
             q0=q0,
             sequence=sequence,
             previous_command=previous_command,
             target_tip=target_tip,
+            target_tip_sequence=target_tip_sequence,
         ).cost
+
+    def _reference_sequence(
+        self,
+        *,
+        target_tip: np.ndarray | list[float] | tuple[float, ...] | None,
+        target_tip_sequence: np.ndarray | list[list[float]] | tuple[tuple[float, ...], ...] | None,
+    ) -> np.ndarray:
+        if target_tip is None and target_tip_sequence is None:
+            raise ValueError("exactly one of target_tip or target_tip_sequence must be provided")
+        if target_tip is not None and target_tip_sequence is not None:
+            raise ValueError("exactly one of target_tip or target_tip_sequence must be provided")
+        if target_tip is not None:
+            target = _array_shape(target_tip, "target_tip", (3,))
+            return np.tile(target, (self.horizon, 1))
+        return _array_shape(target_tip_sequence, "target_tip_sequence", (self.horizon, 3)).copy()
 
     def _validate_disabled_costs(self) -> None:
         disabled = {
