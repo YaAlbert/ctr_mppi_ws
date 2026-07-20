@@ -30,6 +30,48 @@
 - controller publishes solve-time metrics;
 - controller does not crash on invalid reference input.
 
+Status: verified complete for the minimum fixed-target MPPI scope on
+2026-07-21 in the current Ubuntu 22.04 / ROS2 Humble environment.
+
+Unit-test verification:
+
+- `ctr_bringup`: 19 focused tests passed;
+- `ctr_mppi_controller`: 14 focused tests passed;
+- `ctr_sim`: 4 focused tests passed.
+
+Build verification:
+
+- clean isolated build used `build_shutdown_final`, `install_shutdown_final`,
+  and `log_shutdown_final`;
+- all 11 packages finished successfully.
+
+ROS2 runtime verification:
+
+- foreground PTY launch used `install_shutdown_final`;
+- nodes verified alive before shutdown:
+  - `/parameter_validator`;
+  - `/ctr_simulator`;
+  - `/mppi_controller`;
+- no hardware node started;
+- topics verified:
+  - `/ctr/state`;
+  - `/ctr/mppi_command`;
+  - `/ctr/safe_command`;
+  - `/ctr/controller/metrics`;
+- Ctrl-C was delivered to the actual foreground `ros2 launch` process group;
+- `ros2 launch` exited naturally with exit code 0;
+- all child nodes finished cleanly;
+- no project process or zombie remained;
+- no `KeyboardInterrupt` traceback, `rcl_shutdown already called`, rclpy
+  exception, process death, or signal escalation occurred.
+
+Scope exclusions still apply:
+
+- hardware execution remains disabled and unverified;
+- the CTR model is still an approximate model;
+- trajectory tracking, shape control, obstacle avoidance, tactile control, and
+  hardware support are not complete.
+
 ## Milestone 5
 
 - reference path is tracked;
