@@ -155,6 +155,17 @@ class ParameterValidationTest(unittest.TestCase):
         errors = validate_project_config(config)
         self.assertTrue(any("reference.helix.height" in error for error in errors))
 
+    def test_tracking_metrics_yaml_section_validates(self):
+        config = load_parameter_files(CONFIG_FILES)
+        self.assertEqual([], [error for error in validate_project_config(config) if "tracking_metrics" in error])
+
+    def test_tracking_metrics_invalid_stable_cycles_is_rejected(self):
+        config = load_parameter_files(CONFIG_FILES)
+        config = copy.deepcopy(config)
+        config["tracking_metrics"]["stable_cycles"] = 0
+        errors = validate_project_config(config)
+        self.assertTrue(any("tracking_metrics.stable_cycles" in error for error in errors))
+
     def test_invalid_robot_tube_count_is_rejected(self):
         config = load_parameter_files(CONFIG_FILES)
         config["robot"]["number_of_tubes"] = 2

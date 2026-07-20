@@ -123,6 +123,7 @@ def validate_project_config(config: dict[str, Any]) -> list[str]:
         "model",
         "mppi",
         "reference",
+        "tracking_metrics",
         "hardware",
         "safety",
         "simulation",
@@ -139,6 +140,8 @@ def validate_project_config(config: dict[str, Any]) -> list[str]:
         errors.extend(_validate_mppi(config["mppi"]))
     if "reference" in config:
         errors.extend(_validate_reference(config["reference"]))
+    if "tracking_metrics" in config:
+        errors.extend(_validate_tracking_metrics(config["tracking_metrics"]))
     if "hardware" in config:
         errors.extend(_validate_hardware(config["hardware"]))
     if "safety" in config:
@@ -307,6 +310,20 @@ def _validate_reference(reference: Any) -> list[str]:
         errors.extend(_require_number(helix, "angular_velocity", "reference.helix"))
         errors.extend(_require_number(helix, "phase", "reference.helix"))
 
+    return errors
+
+
+def _validate_tracking_metrics(tracking_metrics: Any) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(tracking_metrics, dict):
+        return ["`tracking_metrics` must be a map."]
+    if not isinstance(tracking_metrics.get("enabled"), bool):
+        errors.append("`tracking_metrics.enabled` must be a boolean.")
+    errors.extend(_require_positive_number(tracking_metrics, "publish_frequency", "tracking_metrics"))
+    errors.extend(_require_positive_number(tracking_metrics, "transient_tolerance", "tracking_metrics"))
+    errors.extend(_require_positive_number(tracking_metrics, "stable_cycles", "tracking_metrics", integer=True))
+    if not isinstance(tracking_metrics.get("reset_on_new_trajectory"), bool):
+        errors.append("`tracking_metrics.reset_on_new_trajectory` must be a boolean.")
     return errors
 
 

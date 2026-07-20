@@ -26,12 +26,16 @@ except ImportError:
 
 
 from ctr_mppi_controller.nodes.mppi_controller_node import (  # noqa: E402
+    active_reference_point,
     reference_mode_from_config,
     reference_type_from_config,
+    should_publish_metrics,
     solve_reference_kwargs,
     target_sequence_from_path,
+    trajectory_metrics_diagnostic_array,
 )
 from ctr_mppi_controller.nodes.reference_manager_node import path_from_points  # noqa: E402
+from ctr_mppi_controller.trajectory_metrics import TrajectoryMetricsAccumulator, TrajectoryMetricsConfig  # noqa: E402
 
 
 def horizon_path(points, *, frame_id="base_link", stamp_s=10):
@@ -166,6 +170,57 @@ class MPPIControllerNodeHelpersTest(unittest.TestCase):
         self.assertEqual("helix", reference_type_from_config(config, "helix"))
         with self.assertRaises(ValueError):
             reference_type_from_config(config, "square")
+
+    def test_active_reference_point_selects_fixed_or_sequence(self):
+        fixed = np.array([0.1, 0.2, 0.3])
+        self.assertTrue(np.allclose(fixed, active_reference_point({"target_tip": fixed})))
+        sequence = np.array([[0.4, 0.5, 0.6], [0.7, 0.8, 0.9]])
+        self.assertTrue(np.allclose(sequence[0], active_reference_point({"target_tip_sequence": sequence})))
+
+    def test_metrics_publish_rate_gate(self):
+        self.assertTrue(should_publish_metrics(last_publish_time_s=None, current_time_s=1.0, publish_frequency=5.0))
+        self.assertFalse(should_publish_metrics(last_publish_time_s=1.0, current_time_s=1.1, publish_frequency=5.0))
+        self.assertTrue(should_publish_metrics(last_publish_time_s=1.0, current_time_s=1.2, publish_frequency=5.0))
+        self.assertTrue(should_publish_metrics(last_publish_time_s=2.0, current_time_s=1.0, publish_frequency=5.0))
+
+    def test_trajectory_metrics_diagnostic_contains_required_fields(self):
+        config = TrajectoryMetricsConfig(
+            enabled=True,
+            publish_frequency=5.0,
+            transient_tolerance=0.001,
+            stable_cycles=1,
+            reset_on_new_trajectory=True,
+        )
+        accumulator = TrajectoryMetricsAccumulator(config=config, command_dimension=2, trajectory_type="circle")
+        accumulator.add_sample(
+            timestamp=0.0,
+            tip_position=[0.0, 0.0, 0.0],
+            reference_position=[0.0, 0.0, 0.0],
+            command=[0.1, -0.2],
+            dt=0.1,
+            solve_time=0.01,
+            command_saturated=True,
+        )
+        msg = trajectory_metrics_diagnostic_array(accumulator.snapshot(), frame_id="base_link", stamp=None)
+        values = {item.key: item.value for item in msg.status[0].values}
+        for key in (
+            "trajectory_type",
+            "sample_count",
+            "rmse",
+            "mean_error",
+            "max_error",
+            "control_effort",
+            "transient_duration",
+            "mean_solve_time",
+            "max_solve_time",
+            "command_saturation_count",
+            "maximum_command_per_joint",
+            "experiment_elapsed_time",
+            "completion_state",
+        ):
+            self.assertIn(key, values)
+        self.assertEqual("circle", values["trajectory_type"])
+        self.assertEqual("1", values["sample_count"])
 
 
 if __name__ == "__main__":

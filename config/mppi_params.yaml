@@ -66,3 +66,10 @@ reference:
     height: 0.001
     angular_velocity: 0.6283185307179586
     phase: 0.0
+
+tracking_metrics:
+  enabled: true
+  publish_frequency: 5.0
+  transient_tolerance: 0.001
+  stable_cycles: 10
+  reset_on_new_trajectory: true
