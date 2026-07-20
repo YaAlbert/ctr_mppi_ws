@@ -1,8 +1,11 @@
+from pathlib import Path
+
+from ament_index_python.packages import get_package_share_directory
+from ctr_bringup.parameter_validation import validate_config_paths
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch_ros.substitutions import FindPackageShare
 
 
 CONFIG_NAMES = (
@@ -17,7 +20,8 @@ CONFIG_NAMES = (
 
 
 def _config_paths():
-    return [PathJoinSubstitution([FindPackageShare("ctr_bringup"), "config", name]) for name in CONFIG_NAMES]
+    config_dir = Path(get_package_share_directory("ctr_bringup")) / "config"
+    return validate_config_paths([str(config_dir / name) for name in CONFIG_NAMES])
 
 
 def _placeholder(package, executable, name, runtime_mode):

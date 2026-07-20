@@ -39,6 +39,43 @@ class ParameterValidationError(ValueError):
     """Raised when one or more project parameter files fail validation."""
 
 
+def validate_config_paths(
+    paths: Iterable[str | Path] | None,
+    *,
+    required: bool = True,
+    label: str = "config_paths",
+) -> list[str]:
+    """Validate ROS-provided project YAML paths and preserve their order."""
+
+    if paths is None:
+        path_values: list[str | Path] = []
+    elif isinstance(paths, (str, bytes)):
+        raise ParameterValidationError(f"`{label}` must be a string array, not a scalar string.")
+    else:
+        path_values = list(paths)
+
+    if required and not path_values:
+        raise ParameterValidationError(f"`{label}` must contain at least one YAML path.")
+
+    validated: list[str] = []
+    seen: set[str] = set()
+    for index, value in enumerate(path_values):
+        if not isinstance(value, (str, Path)):
+            raise ParameterValidationError(f"`{label}[{index}]` must be a string path.")
+        path = Path(value)
+        if not path.exists():
+            raise FileNotFoundError(f"Parameter file not found: {path}")
+        if not path.is_file():
+            raise ParameterValidationError(f"`{label}[{index}]` is not a file: {path}")
+        resolved = str(path.resolve())
+        if resolved in seen:
+            raise ParameterValidationError(f"Duplicate parameter path in `{label}`: {resolved}")
+        seen.add(resolved)
+        validated.append(resolved)
+
+    return validated
+
+
 def load_yaml_file(path: str | Path) -> dict[str, Any]:
     """Load one project YAML file and return a dictionary."""
 

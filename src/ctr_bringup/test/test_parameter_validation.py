@@ -1,4 +1,6 @@
+import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -12,6 +14,7 @@ from ctr_bringup.parameter_validation import (  # noqa: E402
     UNRESOLVED_TODO_IDS,
     load_parameter_files,
     project_config_with_overrides,
+    validate_config_paths,
     validate_project_config,
     validate_or_raise,
 )
@@ -33,6 +36,59 @@ class ParameterValidationTest(unittest.TestCase):
         config = load_parameter_files(CONFIG_FILES)
         validate_or_raise(config)
         self.assertEqual([], validate_project_config(config))
+
+    def test_config_paths_reject_previous_concatenated_scalar_failure(self):
+        concatenated = f"{CONFIG_FILES[0]}{CONFIG_FILES[1]}"
+        with self.assertRaises(ParameterValidationError) as context:
+            validate_config_paths(concatenated)
+        self.assertIn("string array", str(context.exception))
+
+    def test_config_paths_preserve_separate_ordered_string_entries(self):
+        paths = [str(CONFIG_FILES[0]), str(CONFIG_FILES[1]), str(CONFIG_FILES[2])]
+        validated = validate_config_paths(paths)
+        self.assertEqual([str(path.resolve()) for path in CONFIG_FILES[:3]], validated)
+        self.assertEqual(3, len(validated))
+
+    def test_simulation_launch_config_paths_are_separate_string_entries(self):
+        launch_path = REPO_ROOT / "src" / "ctr_bringup" / "launch" / "simulation.launch.py"
+        spec = importlib.util.spec_from_file_location("simulation_launch_under_test", launch_path)
+        module = importlib.util.module_from_spec(spec)
+        self.assertIsNotNone(spec.loader)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package_share = Path(temp_dir)
+            config_dir = package_share / "config"
+            config_dir.mkdir()
+            for source_path in CONFIG_FILES:
+                (config_dir / source_path.name).write_text("placeholder: true\n", encoding="utf-8")
+
+            module.get_package_share_directory = lambda package_name: str(package_share)
+            paths = module._config_paths()
+
+        self.assertEqual([str((config_dir / path.name).resolve()) for path in CONFIG_FILES], paths)
+        self.assertTrue(all(isinstance(path, str) for path in paths))
+        self.assertEqual(len(CONFIG_FILES), len(paths))
+
+    def test_config_paths_reject_empty_required_array(self):
+        with self.assertRaises(ParameterValidationError) as context:
+            validate_config_paths([])
+        self.assertIn("at least one", str(context.exception))
+
+    def test_config_paths_reject_non_string_items(self):
+        with self.assertRaises(ParameterValidationError) as context:
+            validate_config_paths([str(CONFIG_FILES[0]), 42])
+        self.assertIn("config_paths[1]", str(context.exception))
+
+    def test_config_paths_reject_missing_files(self):
+        missing = CONFIG_FILES[0].with_name("missing_params.yaml")
+        with self.assertRaises(FileNotFoundError):
+            validate_config_paths([str(missing)])
+
+    def test_config_paths_reject_duplicates(self):
+        with self.assertRaises(ParameterValidationError) as context:
+            validate_config_paths([str(CONFIG_FILES[0]), str(CONFIG_FILES[0])])
+        self.assertIn("Duplicate parameter path", str(context.exception))
 
     def test_duplicate_sections_are_rejected(self):
         with self.assertRaises(ParameterValidationError):

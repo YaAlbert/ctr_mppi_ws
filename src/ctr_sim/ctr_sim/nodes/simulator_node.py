@@ -14,11 +14,13 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
 
-from ctr_bringup.parameter_validation import load_parameter_files, validate_or_raise
+from ctr_bringup.parameter_validation import load_parameter_files, validate_config_paths, validate_or_raise
+from ctr_bringup.placeholder_node import run_node_until_shutdown
 from ctr_interfaces.msg import CtrBackbone, CtrJointCommand, CtrJointState, CtrState
 from ctr_model.approximate_model import ApproximateCTRModel
 from ctr_sim.simulation_core import CTRSimulationCore
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 
 
 class CTRSimulatorNode(Node):
@@ -26,14 +28,12 @@ class CTRSimulatorNode(Node):
 
     def __init__(self):
         super().__init__("simulator_node")
-        self.declare_parameter("config_paths", [])
+        self.declare_parameter("config_paths", Parameter.Type.STRING_ARRAY)
         self.declare_parameter("runtime_mode", "simulation")
         self.declare_parameter("target_position", [0.0, 0.0, 0.08])
         self.declare_parameter("command_timeout", 0.25)
 
-        config_paths = [str(path) for path in self.get_parameter("config_paths").value]
-        if not config_paths:
-            raise RuntimeError("TODO-ROS-001: simulator_node requires `config_paths`.")
+        config_paths = validate_config_paths(self.get_parameter("config_paths").value)
 
         self.config = load_parameter_files(config_paths)
         validate_or_raise(self.config)
@@ -275,13 +275,7 @@ def _vector3(values, label: str) -> np.ndarray:
 
 
 def main(args=None):
-    rclpy.init(args=args)
-    node = CTRSimulatorNode()
-    try:
-        rclpy.spin(node)
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
+    run_node_until_shutdown(rclpy, CTRSimulatorNode, args=args)
 
 
 if __name__ == "__main__":

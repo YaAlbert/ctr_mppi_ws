@@ -6,11 +6,13 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped
 
-from ctr_bringup.parameter_validation import load_parameter_files, validate_or_raise
+from ctr_bringup.parameter_validation import load_parameter_files, validate_config_paths, validate_or_raise
+from ctr_bringup.placeholder_node import run_node_until_shutdown
 from ctr_interfaces.msg import CtrControllerMetrics, CtrJointCommand, CtrState
 from ctr_model.approximate_model import ApproximateCTRModel
 from ctr_mppi_controller.mppi_core import MPPICore
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 
 
 class MPPIControllerNode(Node):
@@ -18,14 +20,12 @@ class MPPIControllerNode(Node):
 
     def __init__(self):
         super().__init__("mppi_controller_node")
-        self.declare_parameter("config_paths", [])
+        self.declare_parameter("config_paths", Parameter.Type.STRING_ARRAY)
         self.declare_parameter("runtime_mode", "simulation")
         self.declare_parameter("target_position", [0.0, 0.0, 0.08])
         self.declare_parameter("publish_safe_command_for_simulation", False)
 
-        config_paths = [str(path) for path in self.get_parameter("config_paths").value]
-        if not config_paths:
-            raise RuntimeError("TODO-ROS-001: mppi_controller_node requires `config_paths`.")
+        config_paths = validate_config_paths(self.get_parameter("config_paths").value)
 
         self.config = load_parameter_files(config_paths)
         validate_or_raise(self.config)
@@ -113,13 +113,7 @@ def _vector3(values, label: str) -> np.ndarray:
 
 
 def main(args=None):
-    rclpy.init(args=args)
-    node = MPPIControllerNode()
-    try:
-        rclpy.spin(node)
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
+    run_node_until_shutdown(rclpy, MPPIControllerNode, args=args)
 
 
 if __name__ == "__main__":

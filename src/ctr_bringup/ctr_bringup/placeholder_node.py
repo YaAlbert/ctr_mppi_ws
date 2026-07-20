@@ -5,7 +5,49 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 
-from .parameter_validation import load_parameter_files, validate_or_raise
+from .parameter_validation import load_parameter_files, validate_config_paths, validate_or_raise
+
+
+def run_node_until_shutdown(rclpy_module, node_factory, *, args=None) -> None:
+    """Initialize, construct, spin, and clean up a ROS2 node."""
+
+    node = None
+    rclpy_module.init(args=args)
+    try:
+        node = node_factory()
+        spin_node_until_shutdown(rclpy_module, node)
+    finally:
+        if node is None:
+            _shutdown_context_if_active(rclpy_module)
+
+
+def spin_node_until_shutdown(rclpy_module, node) -> None:
+    """Spin a ROS2 node and tolerate normal keyboard shutdown."""
+
+    try:
+        rclpy_module.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _destroy_node(node)
+        _shutdown_context_if_active(rclpy_module)
+
+
+def _destroy_node(node) -> None:
+    try:
+        node.destroy_node()
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        pass
+
+
+def _shutdown_context_if_active(rclpy_module) -> None:
+    try:
+        if rclpy_module.ok():
+            rclpy_module.shutdown()
+    except KeyboardInterrupt:
+        pass
 
 
 def create_placeholder_main(
@@ -20,16 +62,20 @@ def create_placeholder_main(
     def main(args=None):
         import rclpy
         from rclpy.node import Node
+        from rclpy.parameter import Parameter
 
         class PlaceholderNode(Node):
             def __init__(self):
                 super().__init__(node_name)
-                self.declare_parameter("config_paths", [])
+                self.declare_parameter("config_paths", Parameter.Type.STRING_ARRAY)
                 self.declare_parameter("runtime_mode", "simulation")
                 self.declare_parameter("placeholder_scope", package_name)
                 self.declare_parameter("enable_hardware_io", False)
 
-                config_paths = [str(path) for path in self.get_parameter("config_paths").value]
+                config_paths = validate_config_paths(
+                    self.get_parameter("config_paths").value,
+                    required=bool(required_sections),
+                )
                 runtime_mode = self.get_parameter("runtime_mode").value
                 enable_hardware_io = bool(self.get_parameter("enable_hardware_io").value)
 
@@ -61,13 +107,7 @@ def create_placeholder_main(
             def _heartbeat(self):
                 self.get_logger().debug(f"{package_name} placeholder alive.")
 
-        rclpy.init(args=args)
-        node = PlaceholderNode()
-        try:
-            rclpy.spin(node)
-        finally:
-            node.destroy_node()
-            rclpy.shutdown()
+        run_node_until_shutdown(rclpy, PlaceholderNode, args=args)
 
     return main
 
