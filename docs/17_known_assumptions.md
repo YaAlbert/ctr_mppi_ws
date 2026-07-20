@@ -92,3 +92,19 @@
 30. MATLAB hardware GUI files using Windows COM ports are reference material
     only. They are not Ubuntu hardware drivers and must not be used to justify
     physical hardware readiness.
+
+31. Milestone 5 trajectory defaults are software-test trajectories near the
+    current approximate-model initial tip. They are not physical workspace
+    limits and do not prove physical tracking accuracy.
+
+32. Milestone 5 trajectory RMSE values are runtime smoke-test metrics. They are
+    not rigorous performance-validation results because state, reference,
+    command, and metric timestamps are not yet synchronized strongly enough for
+    that claim.
+
+33. The current Milestone 5 MPPI implementation is treated as a simplified
+    weighted random-shooting MPPI-style controller until the complete MPPI
+    formulation and cost/noise scaling are reviewed.
+
+34. Milestone 5 runtime tests verify simulation-only integration. Hardware
+    execution remains disabled and unverified.

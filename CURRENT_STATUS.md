@@ -3,8 +3,9 @@
 Last updated: 2026-07-21
 
 Status source: current Ubuntu 22.04 repository audit, focused test results,
-clean isolated build results, and Milestone 4 foreground ROS2 runtime smoke
-test. Documentation only was updated for this status refresh.
+clean isolated build results, Milestone 4 foreground ROS2 runtime smoke test,
+and Milestone 5 bounded simulation-only trajectory smoke tests. Documentation
+only was updated for this status refresh.
 
 The current Ubuntu repository and runtime environment are the operational
 source of truth. Earlier Windows-created work is treated as historical project
@@ -19,9 +20,9 @@ assets unless it has been verified in the current Ubuntu environment.
 - `colcon`: available at `/usr/bin/colcon`.
 - `pip3` and `python3 -m pip`: not available in the current environment.
 - Latest clean isolated build verification:
-  `build_shutdown_final`, `install_shutdown_final`, and `log_shutdown_final`.
+  `build_m5c_verify`, `install_m5c_verify`, and `log_m5c_verify`.
 - Latest clean isolated build result: 11 packages finished successfully.
-- Latest runtime smoke test used the isolated `install_shutdown_final`
+- Latest runtime smoke tests used the isolated `install_m5c_verify`
   workspace, not older `build/` or `install/` directories.
 - Conventional ROS2 Humble guarded shutdown is in use for the Milestone 4
   simulation path. No custom SIGINT handler, SIGINT masking, or forced
@@ -78,8 +79,13 @@ assets unless it has been verified in the current Ubuntu environment.
     evaluation packages still contain placeholder runtime nodes.
   - Minimum fixed-target MPPI tip reaching is implemented and runtime verified
     against the approximate model.
-  - MPPI shape, obstacle, tactile-force, trajectory-tracking, and stability
-    behavior is not complete.
+  - Minimum trajectory-mode reference generation, horizon consumption, ROS2
+    reference-manager integration, and trajectory metrics are functionally
+    integrated and simulation smoke verified.
+  - Milestone 5 trajectory tracking is not performance verified, not real-time
+    capable, not physically validated, and not hardware validated.
+  - MPPI shape, obstacle, tactile-force, and stability behavior is not
+    complete.
   - Package-local unit tests pass when run directly, but top-level
     `unittest discover -s src` discovers zero tests.
 
@@ -149,6 +155,7 @@ assets unless it has been verified in the current Ubuntu environment.
 | Milestone 2: CTR model | Partially complete | `ApproximateCTRModel.forward_kinematics(q)` exists; package-local model tests pass; output shape and finite-value checks exist | Port or validate against MATLAB fixtures; decide source-of-truth tube parameters; add MATLAB-to-Python comparison tests and thresholds |
 | Milestone 3: ROS2 simulation | Partially complete; Milestone 4 loop runtime verified | `CTRSimulationCore` and `simulator_node.py` exist; simulation core tests pass; foreground runtime smoke verified `/ctr/state`, `/ctr/mppi_command`, `/ctr/safe_command`, and `/ctr/controller/metrics` while `/ctr_simulator` remained alive | Dedicated Milestone 3 acceptance audit for topic frequencies, units, axes, RViz marker visualization, and non-MPPI command paths |
 | Milestone 4: minimum MPPI fixed-target reaching | Runtime verified complete for scoped minimum | Focused tests passed: `ctr_bringup` 19, `ctr_mppi_controller` 14, `ctr_sim` 4; clean isolated build finished all 11 packages; foreground PTY smoke test verified `/parameter_validator`, `/ctr_simulator`, `/mppi_controller`, MPPI command, safe command, state, metrics, clean Ctrl-C shutdown, and no tracebacks | Hardware execution remains disabled and unverified; approximate CTR model remains unresolved by `MODEL-004`; trajectory tracking, shape control, obstacle avoidance, tactile control, and hardware support are not part of Milestone 4 completion |
+| Milestone 5: tip trajectory tracking | Functionally integrated and runtime smoke verified; performance not verified | Focused tests passed: `ctr_mppi_controller` 77, `ctr_bringup` 25, `ctr_sim` 4, total 106; clean isolated build finished all 11 packages; 12 s circle, ellipse, and helix simulation-only runtime paths executed; `/ctr/reference/path`, `/ctr/reference/horizon`, `/ctr/reference/tip`, and `/ctr/controller/trajectory_metrics` published; commands were finite and within configured limits; no hardware node started; launch exited with code 0 and no residual project process or zombie remained | Real-time trajectory control is not verified; controller significantly overruns the configured 0.05 s period; timestamp-aligned metrics, stronger baseline synchronization, nontrivial trajectory experiments, MPPI profiling/optimization, and physical validation remain unresolved |
 
 ## Current implemented functions
 
@@ -167,8 +174,18 @@ assets unless it has been verified in the current Ubuntu environment.
   approximate model
 - [x] Minimum MPPI fixed-target ROS2 runtime integration verified for
   simulation
+- [x] Circle, ellipse, and helix reference trajectory generation
+- [x] Loop and hold-final trajectory horizon extraction
+- [x] Elapsed-time trajectory indexing
+- [x] MPPI per-step horizon reference consumption with fixed-target
+  compatibility
+- [x] ROS2 reference-manager publications for `/ctr/reference/path`,
+  `/ctr/reference/horizon`, and `/ctr/reference/tip`
+- [x] Trajectory metrics publication on `/ctr/controller/trajectory_metrics`
+- [x] Bounded simulation-only runtime smoke tests for circle, ellipse, and
+  helix trajectory modes
 - [x] Ubuntu clean isolated `colcon build` verification for all 11 packages
-- [x] Installed ROS2 simulation launch path verified from `install_shutdown_final`
+- [x] Installed ROS2 simulation launch path verified from `install_m5c_verify`
 - [x] Conventional ROS2 Humble guarded shutdown verified for
   `/parameter_validator`, `/ctr_simulator`, and `/mppi_controller`
 - [ ] Validated Python CTR model against MATLAB fixtures
@@ -177,23 +194,24 @@ assets unless it has been verified in the current Ubuntu environment.
 - [ ] Tactile processing implementation
 - [ ] Mock hardware feedback implementation
 - [ ] Physical hardware driver
-- [ ] Trajectory tracking
+- [ ] Performance-verified real-time trajectory tracking
 - [ ] Shape tracking
 - [ ] Obstacle avoidance
 - [ ] Tactile simulation
 
 ## Test results in current Ubuntu audit
 
-- `git diff --check`: clean during Milestone 4 shutdown verification.
-- Focused package-local tests passed during Milestone 4 verification:
-  - `ctr_bringup`: 19 passed.
-  - `ctr_mppi_controller`: 14 passed.
+- `git diff --check`: clean during Milestone 5C verification.
+- Focused package-local tests passed during Milestone 5C verification:
+  - `ctr_bringup`: 25 passed.
+  - `ctr_mppi_controller`: 77 passed.
   - `ctr_sim`: 4 passed.
+  - Total focused tests: 106 passed.
 - Clean isolated build passed:
-  - command used `build_shutdown_final`, `install_shutdown_final`, and
-    `log_shutdown_final`;
+  - command used `build_m5c_verify`, `install_m5c_verify`, and
+    `log_m5c_verify`;
   - result: 11 packages finished successfully.
-- Foreground PTY ROS2 runtime smoke test passed:
+- Milestone 4 foreground PTY ROS2 fixed-target runtime smoke test passed:
   - nodes verified: `/parameter_validator`, `/ctr_simulator`,
     `/mppi_controller`;
   - hardware nodes: none started;
@@ -205,14 +223,48 @@ assets unless it has been verified in the current Ubuntu environment.
   - no project process or zombie remained;
   - no `KeyboardInterrupt` traceback, `rcl_shutdown already called`, rclpy
     exception, process death, or signal escalation occurred.
+- Milestone 5 bounded simulation-only trajectory smoke tests passed for runtime
+  integration:
+  - circle, ellipse, and helix each ran for 12 seconds;
+  - `/ctr/reference/path`, `/ctr/reference/horizon`, `/ctr/reference/tip`, and
+    `/ctr/controller/trajectory_metrics` were observed;
+  - commands were finite and remained within configured limits;
+  - no hardware node started;
+  - launch exited with code 0;
+  - no residual project process or zombie remained.
+- Milestone 5 runtime smoke-test metrics, not rigorous performance-validation
+  results:
+  - circle: MPPI observer RMSE approximately `4.9999495e-4 m`, zero-command
+    baseline RMSE approximately `5.0000000e-4 m`, improvement approximately
+    `0.0010%`, mean solve time approximately `1.141 s`, maximum solve time
+    approximately `1.186 s`;
+  - ellipse: MPPI observer RMSE approximately `4.6773663e-4 m`, zero-command
+    baseline RMSE approximately `4.8019163e-4 m`, improvement approximately
+    `2.594%`, mean solve time approximately `1.165 s`, maximum solve time
+    approximately `1.524 s`;
+  - helix: MPPI observer RMSE approximately `5.0390104e-4 m`, zero-command
+    baseline RMSE approximately `5.0694540e-4 m`, improvement approximately
+    `0.601%`, mean solve time approximately `1.230 s`, maximum solve time
+    approximately `1.542 s`.
+- Milestone 5 performance limitation:
+  - configured MPPI control period is `0.05 s`;
+  - observed effective MPPI command publication rate is approximately
+    `0.78-0.85 Hz`;
+  - reference-manager publication rate is approximately `20 Hz`;
+  - long solve time causes delayed state processing, delayed horizon
+    processing, stale state/reference data at command publication, and an
+    effective command rate below 1 Hz.
 - Historical test-discovery finding retained: top-level
   `python3 -B -m unittest discover -s src` previously discovered zero tests.
 
 ## Current priority
 
-Milestone 5 trajectory tracking is the next milestone after the verified
-Milestone 4 minimum fixed-target reaching controller. Keep hardware execution
-disabled until the hardware TODOs are resolved and separately commissioned.
+Milestone 5 is functionally integrated and runtime smoke verified, but it is
+not performance verified, real-time capable, physically validated, or hardware
+validated. The next safe step is to record and resolve the Milestone 5 timing,
+metrics-alignment, and experiment-design follow-ups before claiming trajectory
+tracking performance. Keep hardware execution disabled until the hardware TODOs
+are resolved and separately commissioned.
 
 ## Current blockers
 
@@ -230,6 +282,12 @@ disabled until the hardware TODOs are resolved and separately commissioned.
   transform into `world` or `base_link` is not defined.
 - High: config YAML files contain placeholder values without all required
   structured TODO IDs in the parameter files themselves.
+- High: Milestone 5 trajectory-mode MPPI solve time significantly overruns the
+  configured 0.05 s control period and publishes commands below 1 Hz.
+- High: Milestone 5 trajectory metrics are not timestamp-synchronized strongly
+  enough for rigorous state-reference-command performance claims.
+- Medium: Milestone 5 zero-command baseline comparisons are smoke-test evidence
+  only; the tested trajectories are very small and near the initial tip.
 - Medium: CRLF line endings remain in documentation, YAML, and selected
   MATLAB/data files.
 - Medium: package maintainer and license metadata remain placeholders.

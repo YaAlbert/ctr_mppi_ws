@@ -45,10 +45,43 @@
 
 ## Milestone 5: Trajectory tracking
 
+Status: functionally integrated and runtime smoke verified for simulation only;
+performance not verified; not real-time capable; not physically or hardware
+validated.
+
+Implemented:
+
 - reference path manager;
 - horizon reference sequence;
-- circle, ellipse and helix;
-- trajectory metrics.
+- circle, ellipse and helix trajectory generation;
+- loop and hold-final horizon extraction;
+- elapsed-time trajectory indexing;
+- MPPI per-step horizon reference consumption;
+- fixed-target compatibility;
+- `/ctr/reference/path`;
+- `/ctr/reference/horizon`;
+- `/ctr/reference/tip`;
+- `/ctr/controller/trajectory_metrics`;
+- bounded simulation-only runtime tests.
+
+Current limitations:
+
+- the configured MPPI control period is 0.05 s, but observed mean solve time is
+  approximately 1.1-1.23 s and observed maximum solve time is approximately
+  1.19-1.54 s;
+- effective MPPI command publication is approximately 0.78-0.85 Hz while the
+  reference manager publishes at approximately 20 Hz;
+- long solves delay state and horizon processing, so commands can be published
+  using stale state/reference data;
+- trajectory metrics are runtime smoke-test evidence only and are not
+  timestamp-synchronized strongly enough for rigorous tracking-performance
+  claims;
+- zero-command baseline comparisons are smoke-test evidence only;
+- the tested trajectories are very small and near the initial tip;
+- the MPPI core is a simplified weighted random-shooting MPPI-style controller,
+  not a theoretically complete or optimized MPPI implementation;
+- the CTR model remains approximate and no physical tracking accuracy is
+  verified.
 
 ## Milestone 6: Whole-body control
 
