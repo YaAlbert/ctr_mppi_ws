@@ -1,11 +1,13 @@
 # Current Project Status
 
-Last updated: 2026-07-21
+Last updated: 2026-07-28
 
 Status source: current Ubuntu 22.04 repository audit, focused test results,
 clean isolated build results, Milestone 4 foreground ROS2 runtime smoke test,
-and Milestone 5 bounded simulation-only trajectory smoke tests. Documentation
-only was updated for this status refresh.
+Milestone 5 bounded simulation-only trajectory smoke tests, committed
+Milestone 5D quantitative evaluation framework, and committed Milestone 5D.1
+deterministic matched-run orchestration. Documentation only was updated for
+this status refresh.
 
 The current Ubuntu repository and runtime environment are the operational
 source of truth. Earlier Windows-created work is treated as historical project
@@ -19,11 +21,17 @@ assets unless it has been verified in the current Ubuntu environment.
 - `ros2`: available at `/opt/ros/humble/bin/ros2`.
 - `colcon`: available at `/usr/bin/colcon`.
 - `pip3` and `python3 -m pip`: not available in the current environment.
-- Latest clean isolated build verification:
-  `build_m5c_verify`, `install_m5c_verify`, and `log_m5c_verify`.
-- Latest clean isolated build result: 11 packages finished successfully.
-- Latest runtime smoke tests used the isolated `install_m5c_verify`
-  workspace, not older `build/` or `install/` directories.
+- Latest Milestone 5D.1 clean isolated build result: 11 packages finished
+  successfully before the final Python-only experiment-group/path-containment
+  fix. The final fix changed only `run_evaluation.py` and
+  `test_run_evaluation.py`; focused tests passed after that fix.
+- Latest focused verification: `git diff --check` passed and 214 focused
+  package tests passed across `ctr_evaluation`, `ctr_mppi_controller`,
+  `ctr_bringup`, and `ctr_sim`.
+- Latest matched runtime evidence: two complete circle baseline/candidate
+  pairs ran through `ctr_run_evaluation` with valid compatibility, strict JSON
+  outputs, clean process cleanup, no hardware node, and no orphan or zombie
+  project process.
 - Conventional ROS2 Humble guarded shutdown is in use for the Milestone 4
   simulation path. No custom SIGINT handler, SIGINT masking, or forced
   `KeyboardInterrupt` remains.
@@ -75,13 +83,18 @@ assets unless it has been verified in the current Ubuntu environment.
 - Known issues:
   - The Python CTR model is an approximate scaffold, not a validated port of
     `Robot.m`, `Tube.m`, and `sample_ctr_centerline.m`.
-  - The safety, tactile, hardware, visualization, state-estimator, and
-    evaluation packages still contain placeholder runtime nodes.
+  - The safety, tactile, hardware, visualization, and state-estimator packages
+    still contain placeholder runtime nodes.
   - Minimum fixed-target MPPI tip reaching is implemented and runtime verified
     against the approximate model.
   - Minimum trajectory-mode reference generation, horizon consumption, ROS2
     reference-manager integration, and trajectory metrics are functionally
     integrated and simulation smoke verified.
+  - The `ctr_evaluation` package implements a reusable observation-only
+    quantitative evaluation framework for software-simulation runs.
+  - The `ctr_run_evaluation` CLI implements deterministic matched
+    zero-command baseline and MPPI candidate orchestration for the verified
+    software-simulation workflow.
   - Milestone 5 trajectory tracking is not performance verified, not real-time
     capable, not physically validated, and not hardware validated.
   - MPPI shape, obstacle, tactile-force, and stability behavior is not
@@ -156,6 +169,8 @@ assets unless it has been verified in the current Ubuntu environment.
 | Milestone 3: ROS2 simulation | Partially complete; Milestone 4 loop runtime verified | `CTRSimulationCore` and `simulator_node.py` exist; simulation core tests pass; foreground runtime smoke verified `/ctr/state`, `/ctr/mppi_command`, `/ctr/safe_command`, and `/ctr/controller/metrics` while `/ctr_simulator` remained alive | Dedicated Milestone 3 acceptance audit for topic frequencies, units, axes, RViz marker visualization, and non-MPPI command paths |
 | Milestone 4: minimum MPPI fixed-target reaching | Runtime verified complete for scoped minimum | Focused tests passed: `ctr_bringup` 19, `ctr_mppi_controller` 14, `ctr_sim` 4; clean isolated build finished all 11 packages; foreground PTY smoke test verified `/parameter_validator`, `/ctr_simulator`, `/mppi_controller`, MPPI command, safe command, state, metrics, clean Ctrl-C shutdown, and no tracebacks | Hardware execution remains disabled and unverified; approximate CTR model remains unresolved by `MODEL-004`; trajectory tracking, shape control, obstacle avoidance, tactile control, and hardware support are not part of Milestone 4 completion |
 | Milestone 5: tip trajectory tracking | Functionally integrated and runtime smoke verified; performance not verified | Focused tests passed: `ctr_mppi_controller` 77, `ctr_bringup` 25, `ctr_sim` 4, total 106; clean isolated build finished all 11 packages; 12 s circle, ellipse, and helix simulation-only runtime paths executed; `/ctr/reference/path`, `/ctr/reference/horizon`, `/ctr/reference/tip`, and `/ctr/controller/trajectory_metrics` published; commands were finite and within configured limits; no hardware node started; launch exited with code 0 and no residual project process or zombie remained | Real-time trajectory control is not verified; controller significantly overruns the configured 0.05 s period; timestamp-aligned metrics, stronger baseline synchronization, nontrivial trajectory experiments, MPPI profiling/optimization, and physical validation remain unresolved |
+| Milestone 5D: quantitative evaluation framework | Functionally complete for software-simulation quantitative evaluation | Commit `59342a3`; observation-only evaluator; Start/Stop lifecycle; timestamped recording; alignment; strict JSON/YAML/CSV/Markdown/plot outputs; baseline comparison; repeated-trial aggregation; lifecycle, finalization, strict JSON, control-effort, and launch-default guards verified | Real-time, physical, and hardware validation remain unresolved; command-application timestamp and individual horizon-point timestamps are not available |
+| Milestone 5D.1: deterministic matched-run orchestration | Functionally complete for software-simulation matched baseline/candidate orchestration | Commit `40c659159b37f49651fa9ea05ae2c6ddf07a2deb`; `ctr_run_evaluation`; 94 `ctr_evaluation`, 82 `ctr_mppi_controller`, 34 `ctr_bringup`, and 4 `ctr_sim` tests passed; two matched circle pairs passed compatibility with initial q/tip differences of `0.0` and clean process cleanup | Meaningful tracking improvement is not verified; MPPI remains non-real-time with 100% deadline overrun; stronger circle/ellipse/helix repeated batches and physical/hardware validation remain required |
 
 ## Current implemented functions
 
@@ -184,6 +199,30 @@ assets unless it has been verified in the current Ubuntu environment.
 - [x] Trajectory metrics publication on `/ctr/controller/trajectory_metrics`
 - [x] Bounded simulation-only runtime smoke tests for circle, ellipse, and
   helix trajectory modes
+- [x] Observation-only `ctr_evaluation` evaluation node with experiment
+  Start/Stop lifecycle
+- [x] Raw timestamped state, tip, reference, command, and timing recording
+- [x] State/reference/command alignment with alignment-gap rejection
+- [x] Tracking, control, timing, and data-quality metrics
+- [x] Strict JSON output, YAML metadata, stable CSV time-series output,
+  Markdown reports, and offline tracking/timing plots
+- [x] Baseline comparison and repeated-trial aggregation support
+- [x] Partial-directory preservation, atomic successful finalization, and
+  automatic pass/fail categories
+- [x] Separate output categories: `functional_pass`,
+  `numerical_safety_pass`, `data_quality_pass`,
+  `baseline_improvement_pass`, `timing_pass`, `real_time_pass`,
+  `physical_validation_pass`, and `hardware_validation_pass`
+- [x] Evaluation disabled by default in simulation, mock-hardware, and
+  physical-hardware launch files
+- [x] `ctr_run_evaluation` CLI for deterministic matched
+  zero-command baseline and MPPI candidate runs
+- [x] Fresh simulator/evaluator process per matched run, unique run identity,
+  initial q/tip stability checks, scheduled reference epoch, formal
+  evaluation window, delayed MPPI controller startup, command guards,
+  command-timing audit, exact result-directory identity, canonical path
+  containment, `experiment_group` validation, owned process-group cleanup,
+  and automatic comparison
 - [x] Ubuntu clean isolated `colcon build` verification for all 11 packages
 - [x] Installed ROS2 simulation launch path verified from `install_m5c_verify`
 - [x] Conventional ROS2 Humble guarded shutdown verified for
@@ -202,6 +241,54 @@ assets unless it has been verified in the current Ubuntu environment.
 ## Test results in current Ubuntu audit
 
 - `git diff --check`: clean during Milestone 5C verification.
+- `git diff --check`: passed during Milestone 5D.1 documentation source
+  verification.
+- Latest focused Milestone 5D.1 tests passed:
+  - `ctr_evaluation`: 94 passed.
+  - `ctr_mppi_controller`: 82 passed.
+  - `ctr_bringup`: 34 passed.
+  - `ctr_sim`: 4 passed.
+  - Total focused tests: 214 passed.
+- Milestone 5D.1 build evidence:
+  - a clean isolated 11-package build passed before the final Python-only
+    experiment-group/path-containment fix;
+  - the final fix changed only `run_evaluation.py` and
+    `test_run_evaluation.py`;
+  - focused tests passed after that fix.
+- Milestone 5D verification evidence:
+  - strict JSON output was verified;
+  - cumulative and summary control effort use the same integration rule;
+  - lifecycle and finalization guards were verified;
+  - failed partial output is preserved;
+  - generated `evaluation_results` are ignored;
+  - simulation, mock-hardware, and physical-hardware launch files keep
+    evaluation disabled by default;
+  - physical hardware was not launched.
+- Milestone 5D generated output structure:
+  - `metadata.yaml`;
+  - `summary.json`;
+  - raw CSV files;
+  - `aligned_samples.csv`;
+  - `report.md`;
+  - `comparison.json`;
+  - `comparison.md`;
+  - tracking and timing plots.
+- Milestone 5D.1 matched circle runtime evidence:
+  - pair 1 baseline RMSE `0.0004999606356 m`, candidate RMSE
+    `0.0004999542515 m`, absolute RMSE difference approximately
+    `-6.3840868e-09 m`, relative RMSE improvement approximately
+    `0.0012769%`;
+  - pair 2 baseline RMSE `0.0004999584685 m`, candidate RMSE
+    `0.0004999552086 m`, absolute RMSE difference approximately
+    `-3.2599509e-09 m`, relative RMSE improvement approximately
+    `0.0006520%`;
+  - both pairs had initial q difference `0.0`, initial tip difference `0.0`,
+    initial state variation `0.0` during the accepted stability window,
+    `scheduled_time` reference start, matching reference phase offset, shared
+    environment compatibility passed, baseline nonzero command count `0`,
+    candidate first command after recording and at or after the reference
+    epoch, `comparison_valid: true`, clean process cleanup, no hardware node,
+    and no orphan or zombie project process.
 - Focused package-local tests passed during Milestone 5C verification:
   - `ctr_bringup`: 25 passed.
   - `ctr_mppi_controller`: 77 passed.
@@ -259,11 +346,19 @@ assets unless it has been verified in the current Ubuntu environment.
 
 ## Current priority
 
-Milestone 5 is functionally integrated and runtime smoke verified, but it is
-not performance verified, real-time capable, physically validated, or hardware
-validated. The next safe step is to record and resolve the Milestone 5 timing,
-metrics-alignment, and experiment-design follow-ups before claiming trajectory
-tracking performance. Keep hardware execution disabled until the hardware TODOs
+Milestone 5D and Milestone 5D.1 are functionally complete for
+software-simulation quantitative evaluation and deterministic matched
+baseline/candidate orchestration. Two matched circle comparisons passed
+compatibility validation. The measured MPPI improvement was negligible,
+deadline overrun remained 100%, and real-time, physical, and hardware
+validation remain unresolved.
+
+The two matched runs demonstrate deterministic evaluation orchestration,
+repeatability, and valid comparison conditions. They do not demonstrate
+meaningful tracking improvement, real-time performance, physical accuracy, or
+hardware readiness. The next safe task is a documentation-only commit for
+Milestone 5D/5D.1, followed by MPPI profiling and stronger nontrivial repeated
+software experiments. Keep hardware execution disabled until the hardware TODOs
 are resolved and separately commissioned.
 
 ## Current blockers
@@ -282,12 +377,19 @@ are resolved and separately commissioned.
   transform into `world` or `base_link` is not defined.
 - High: config YAML files contain placeholder values without all required
   structured TODO IDs in the parameter files themselves.
-- High: Milestone 5 trajectory-mode MPPI solve time significantly overruns the
-  configured 0.05 s control period and publishes commands below 1 Hz.
-- High: Milestone 5 trajectory metrics are not timestamp-synchronized strongly
-  enough for rigorous state-reference-command performance claims.
-- Medium: Milestone 5 zero-command baseline comparisons are smoke-test evidence
-  only; the tested trajectories are very small and near the initial tip.
+- High: MPPI solve time remains far above the configured 0.05 s control period,
+  deadline overrun remains 100%, and the controller is not real-time capable.
+- High: command/state/reference causal timing remains limited because no
+  command-application timestamp exists and horizon points do not have
+  individual timestamps.
+- Medium: deterministic zero-command baseline synchronization is resolved only
+  for the verified software-simulation matched-run workflow; hardware and
+  physical experiment synchronization remain unresolved.
+- Medium: tested matched trajectories are very small and near the initial tip;
+  stronger circle, ellipse, helix, and nontrivial repeated batches are still
+  required.
+- Medium: deterministic cross-process ROS_DOMAIN_ID reservation or locking is
+  not implemented for concurrent `ctr_run_evaluation` invocations.
 - Medium: CRLF line endings remain in documentation, YAML, and selected
   MATLAB/data files.
 - Medium: package maintainer and license metadata remain placeholders.

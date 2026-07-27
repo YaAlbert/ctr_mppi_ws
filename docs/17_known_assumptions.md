@@ -108,3 +108,43 @@
 
 34. Milestone 5 runtime tests verify simulation-only integration. Hardware
     execution remains disabled and unverified.
+
+35. Milestone 5D quantitative evaluation is treated as software-simulation
+    evaluation infrastructure. It is observation-only and must not be used as
+    evidence that actuator command paths or hardware behavior are validated.
+
+36. Milestone 5D evaluator output is strict JSON/YAML/CSV/Markdown/plot
+    evidence for recorded runs. Missing or non-finite values are represented by
+    validity fields, warnings, counters, or JSON nulls rather than by bare NaN
+    or Infinity tokens.
+
+37. Milestone 5D.1 matched-run orchestration is verified for the
+    software-simulation zero-command baseline and MPPI candidate workflow only.
+    Physical and hardware experiment synchronization remain unresolved.
+
+38. Deterministic initial q/tip matching in Milestone 5D.1 is based on the
+    simulator initial state and the accepted stability window from the current
+    Ubuntu ROS2 environment. It does not validate physical reset repeatability.
+
+39. Scheduled reference behavior uses a run-relative phase policy. Absolute
+    scheduled timestamps naturally differ between separate baseline and
+    candidate runs and are not required to be equal for compatibility.
+
+40. Command timing evidence distinguishes command message timestamp and
+    command receive timestamp. Neither is a command-application timestamp.
+
+41. Horizon reference samples do not currently carry individual timestamps, so
+    horizon-level causal timing remains approximate.
+
+42. The two matched circle experiment pairs demonstrate deterministic
+    orchestration, repeatability, valid comparison conditions, and quantitative
+    reporting. They do not demonstrate meaningful tracking improvement,
+    real-time performance, physical accuracy, or hardware readiness.
+
+43. MPPI deadline overrun remains 100% in the verified matched runs, and the
+    controller remains non-real-time relative to the configured 0.05 s control
+    period.
+
+44. Concurrent `ctr_run_evaluation` invocations assume ROS_DOMAIN_ID selection
+    does not collide in practice. A deterministic cross-process reservation or
+    locking mechanism remains unresolved.
