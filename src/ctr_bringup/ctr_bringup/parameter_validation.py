@@ -142,6 +142,8 @@ def validate_project_config(config: dict[str, Any]) -> list[str]:
         errors.extend(_validate_reference(config["reference"]))
     if "tracking_metrics" in config:
         errors.extend(_validate_tracking_metrics(config["tracking_metrics"]))
+    if "evaluation" in config:
+        errors.extend(_validate_evaluation(config["evaluation"]))
     if "hardware" in config:
         errors.extend(_validate_hardware(config["hardware"]))
     if "safety" in config:
@@ -324,6 +326,58 @@ def _validate_tracking_metrics(tracking_metrics: Any) -> list[str]:
     errors.extend(_require_positive_number(tracking_metrics, "stable_cycles", "tracking_metrics", integer=True))
     if not isinstance(tracking_metrics.get("reset_on_new_trajectory"), bool):
         errors.append("`tracking_metrics.reset_on_new_trajectory` must be a boolean.")
+    return errors
+
+
+def _validate_evaluation(evaluation: Any) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(evaluation, dict):
+        return ["`evaluation` must be a map."]
+    for key in (
+        "enabled",
+        "auto_finalize_on_shutdown",
+        "require_command_for_alignment",
+        "plot_generation",
+        "report_generation",
+        "physical_validation",
+        "hardware_validation",
+    ):
+        if not isinstance(evaluation.get(key), bool):
+            errors.append(f"`evaluation.{key}` must be a boolean.")
+    for key in ("output_root", "experiment_group", "controller_label", "baseline_label", "baseline_result_dir"):
+        if key not in evaluation or not isinstance(evaluation[key], str):
+            errors.append(f"`evaluation.{key}` must be a string.")
+    for key in (
+        "configured_duration",
+        "maximum_reference_alignment_gap",
+        "maximum_command_alignment_gap",
+        "maximum_solve_alignment_gap",
+        "steady_state_window",
+        "tracking_tolerance",
+        "duration_compatibility_tolerance",
+        "initial_state_compatibility_tolerance",
+        "near_zero_baseline_epsilon",
+    ):
+        if key == "steady_state_window":
+            errors.extend(_require_number(evaluation, key, "evaluation", nonnegative=True))
+        elif key in ("duration_compatibility_tolerance", "initial_state_compatibility_tolerance"):
+            errors.extend(_require_number(evaluation, key, "evaluation", nonnegative=True))
+        else:
+            errors.extend(_require_positive_number(evaluation, key, "evaluation"))
+    for key in ("max_samples_per_topic", "transient_stable_cycles", "minimum_valid_sample_count"):
+        errors.extend(_require_positive_number(evaluation, key, "evaluation", integer=True))
+    for key in (
+        "steady_state_fraction",
+        "maximum_invalid_sample_percentage",
+        "maximum_saturation_percentage",
+        "maximum_deadline_overrun_percentage",
+    ):
+        errors.extend(_require_number(evaluation, key, "evaluation", nonnegative=True))
+        numeric = _as_finite_number(evaluation.get(key))
+        if numeric is not None and numeric > (1.0 if key == "steady_state_fraction" else 100.0):
+            limit = 1.0 if key == "steady_state_fraction" else 100.0
+            errors.append(f"`evaluation.{key}` must be <= {limit}.")
+    errors.extend(_require_number(evaluation, "required_minimum_baseline_improvement", "evaluation"))
     return errors
 
 

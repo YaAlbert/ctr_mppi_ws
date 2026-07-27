@@ -27,10 +27,33 @@ CONFIG_FILES = [
     REPO_ROOT / "config" / "model_params.yaml",
     REPO_ROOT / "config" / "mppi_params.yaml",
     REPO_ROOT / "config" / "simulation_params.yaml",
+    REPO_ROOT / "config" / "evaluation_params.yaml",
     REPO_ROOT / "config" / "safety_params.yaml",
     REPO_ROOT / "config" / "tactile_params.yaml",
     REPO_ROOT / "config" / "hardware_params.yaml",
 ]
+
+
+def load_launch_module(file_name: str, module_name: str):
+    launch_path = REPO_ROOT / "src" / "ctr_bringup" / "launch" / file_name
+    spec = importlib.util.spec_from_file_location(module_name, launch_path)
+    module = importlib.util.module_from_spec(spec)
+    if spec.loader is None:
+        raise AssertionError(f"could not load launch module {file_name}")
+    spec.loader.exec_module(module)
+    return module
+
+
+def temporary_config_paths(module):
+    with tempfile.TemporaryDirectory() as temp_dir:
+        package_share = Path(temp_dir)
+        config_dir = package_share / "config"
+        config_dir.mkdir()
+        for source_path in CONFIG_FILES:
+            (config_dir / source_path.name).write_text("placeholder: true\n", encoding="utf-8")
+        module.get_package_share_directory = lambda package_name: str(package_share)
+        paths = module._config_paths()
+    return paths
 
 
 class ParameterValidationTest(unittest.TestCase):
@@ -52,35 +75,26 @@ class ParameterValidationTest(unittest.TestCase):
         self.assertEqual(3, len(validated))
 
     def test_simulation_launch_config_paths_are_separate_string_entries(self):
-        launch_path = REPO_ROOT / "src" / "ctr_bringup" / "launch" / "simulation.launch.py"
-        spec = importlib.util.spec_from_file_location("simulation_launch_under_test", launch_path)
-        module = importlib.util.module_from_spec(spec)
-        self.assertIsNotNone(spec.loader)
-        spec.loader.exec_module(module)
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            package_share = Path(temp_dir)
-            config_dir = package_share / "config"
-            config_dir.mkdir()
-            for source_path in CONFIG_FILES:
-                (config_dir / source_path.name).write_text("placeholder: true\n", encoding="utf-8")
-
-            module.get_package_share_directory = lambda package_name: str(package_share)
-            paths = module._config_paths()
-
-        self.assertEqual([str((config_dir / path.name).resolve()) for path in CONFIG_FILES], paths)
+        module = load_launch_module("simulation.launch.py", "simulation_launch_under_test")
+        paths = temporary_config_paths(module)
+        self.assertEqual([path.name for path in CONFIG_FILES], [Path(path).name for path in paths])
         self.assertTrue(all(isinstance(path, str) for path in paths))
         self.assertEqual(len(CONFIG_FILES), len(paths))
+
+    def test_all_launch_config_paths_include_evaluation_params_in_order(self):
+        for file_name in ("simulation.launch.py", "mock_hardware.launch.py", "physical_hardware.launch.py"):
+            with self.subTest(file_name=file_name):
+                module = load_launch_module(file_name, f"{file_name.replace('.', '_')}_config_paths_under_test")
+                paths = temporary_config_paths(module)
+                self.assertEqual([path.name for path in CONFIG_FILES], [Path(path).name for path in paths])
+                self.assertIn("evaluation_params.yaml", [Path(path).name for path in paths])
+                self.assertTrue(all(isinstance(path, str) for path in paths))
 
     def test_simulation_launch_declares_reference_manager_arguments(self):
         from launch.actions import DeclareLaunchArgument
         from launch_ros.actions import Node
 
-        launch_path = REPO_ROOT / "src" / "ctr_bringup" / "launch" / "simulation.launch.py"
-        spec = importlib.util.spec_from_file_location("simulation_launch_reference_args_under_test", launch_path)
-        module = importlib.util.module_from_spec(spec)
-        self.assertIsNotNone(spec.loader)
-        spec.loader.exec_module(module)
+        module = load_launch_module("simulation.launch.py", "simulation_launch_reference_args_under_test")
 
         with tempfile.TemporaryDirectory() as temp_dir:
             package_share = Path(temp_dir)
@@ -108,10 +122,63 @@ class ParameterValidationTest(unittest.TestCase):
         self.assertIn("start_reference_manager", launch_arguments)
         self.assertIn("reference_mode", launch_arguments)
         self.assertIn("reference_type", launch_arguments)
+        self.assertIn("start_evaluation", launch_arguments)
+        self.assertIn("evaluation_experiment_group", launch_arguments)
+        self.assertIn("evaluation_controller_label", launch_arguments)
+        self.assertIn("evaluation_baseline_result_dir", launch_arguments)
 
         node_actions = [entity for entity in launch_description.entities if isinstance(entity, Node)]
         executables = {getattr(node, "_Node__node_executable", None) for node in node_actions}
         self.assertIn("reference_manager_node", executables)
+        self.assertIn("evaluation_node", executables)
+
+    def test_evaluation_nodes_are_disabled_by_default_in_launch_files(self):
+        from launch.actions import DeclareLaunchArgument
+        from launch_ros.actions import Node
+
+        for file_name in ("simulation.launch.py", "mock_hardware.launch.py", "physical_hardware.launch.py"):
+            with self.subTest(file_name=file_name):
+                launch_path = REPO_ROOT / "src" / "ctr_bringup" / "launch" / file_name
+                source = launch_path.read_text(encoding="utf-8")
+                self.assertRegex(
+                    source,
+                    r'(?s)DeclareLaunchArgument\(\s*"start_evaluation",\s*default_value="false"',
+                )
+                module = load_launch_module(file_name, f"{file_name.replace('.', '_')}_eval_disabled_under_test")
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    package_share = Path(temp_dir)
+                    previous_ros_log_dir = os.environ.get("ROS_LOG_DIR")
+                    os.environ["ROS_LOG_DIR"] = str(package_share / "ros_log")
+                    config_dir = package_share / "config"
+                    config_dir.mkdir()
+                    for source_path in CONFIG_FILES:
+                        (config_dir / source_path.name).write_text("placeholder: true\n", encoding="utf-8")
+                    module.get_package_share_directory = lambda package_name: str(package_share)
+                    try:
+                        launch_description = module.generate_launch_description()
+                    finally:
+                        if previous_ros_log_dir is None:
+                            os.environ.pop("ROS_LOG_DIR", None)
+                        else:
+                            os.environ["ROS_LOG_DIR"] = previous_ros_log_dir
+
+                launch_arguments = {
+                    entity.name
+                    for entity in launch_description.entities
+                    if isinstance(entity, DeclareLaunchArgument)
+                }
+                self.assertIn("start_evaluation", launch_arguments)
+                eval_nodes = [
+                    entity
+                    for entity in launch_description.entities
+                    if isinstance(entity, Node)
+                    and getattr(entity, "_Node__node_executable", None) == "evaluation_node"
+                ]
+                self.assertEqual(1, len(eval_nodes))
+                condition = getattr(eval_nodes[0], "condition", None)
+                if condition is None:
+                    condition = getattr(eval_nodes[0], "_Action__condition", None)
+                self.assertIsNotNone(condition)
 
     def test_config_paths_reject_empty_required_array(self):
         with self.assertRaises(ParameterValidationError) as context:
@@ -165,6 +232,17 @@ class ParameterValidationTest(unittest.TestCase):
         config["tracking_metrics"]["stable_cycles"] = 0
         errors = validate_project_config(config)
         self.assertTrue(any("tracking_metrics.stable_cycles" in error for error in errors))
+
+    def test_evaluation_yaml_section_validates(self):
+        config = load_parameter_files(CONFIG_FILES)
+        self.assertEqual([], [error for error in validate_project_config(config) if "evaluation" in error])
+
+    def test_evaluation_invalid_alignment_gap_is_rejected(self):
+        config = load_parameter_files(CONFIG_FILES)
+        config = copy.deepcopy(config)
+        config["evaluation"]["maximum_reference_alignment_gap"] = 0.0
+        errors = validate_project_config(config)
+        self.assertTrue(any("evaluation.maximum_reference_alignment_gap" in error for error in errors))
 
     def test_invalid_robot_tube_count_is_rejected(self):
         config = load_parameter_files(CONFIG_FILES)
