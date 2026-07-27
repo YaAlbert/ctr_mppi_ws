@@ -28,3 +28,23 @@ evaluation:
   report_generation: true
   physical_validation: false
   hardware_validation: false
+  orchestration:
+    enabled: true
+    startup_timeout: 20.0
+    service_timeout: 10.0
+    topic_ready_timeout: 10.0
+    reference_ready_timeout: 10.0
+    finalization_timeout: 20.0
+    initial_stability_duration: 0.5
+    initial_stability_samples: 10
+    initial_q_stability_tolerance: 5.0e-5
+    initial_tip_stability_tolerance: 5.0e-5
+    baseline_candidate_q_tolerance: 5.0e-5
+    baseline_candidate_tip_tolerance: 5.0e-5
+    reference_lead_time: 1.0
+    command_zero_tolerance: 1.0e-12
+    shutdown_sigint_timeout: 8.0
+    shutdown_sigterm_timeout: 4.0
+    allow_sigkill_cleanup: false
+    require_no_baseline_command: true
+    require_recording_before_candidate_command: true

@@ -253,6 +253,16 @@ class ExperimentRecorder:
         self.horizon_records: list[dict[str, Any]] = []
         self.path_records: list[dict[str, Any]] = []
         self.initial_state_q: list[float] | None = None
+        self.initial_tip_position: list[float] | None = None
+
+    def _reject_existing_run_id(self, run_id: str) -> None:
+        group_dir = self.config.output_root / self.config.experiment_group
+        partial_dir = group_dir / f"{run_id}.partial"
+        final_dir = group_dir / run_id
+        if partial_dir.exists():
+            raise FileExistsError(f"partial result directory already exists: {partial_dir}")
+        if final_dir.exists():
+            raise FileExistsError(f"final result directory already exists: {final_dir}")
 
     def start(
         self,
@@ -270,8 +280,13 @@ class ExperimentRecorder:
         self.reset_buffers()
         self.finalization_result = None
         safe_name = sanitize_name(experiment_name or self.config.controller_label)
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        self.run_id = f"{timestamp}_{safe_name}_{uuid.uuid4().hex[:8]}"
+        requested_run_id = requested_run_id_from_metadata(metadata or {})
+        if requested_run_id:
+            self.run_id = requested_run_id
+            self._reject_existing_run_id(self.run_id)
+        else:
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            self.run_id = f"{timestamp}_{safe_name}_{uuid.uuid4().hex[:8]}"
         self.experiment_name = experiment_name or safe_name
         self.start_wall_time = datetime.now(timezone.utc)
         self.stop_wall_time = None
@@ -315,16 +330,29 @@ class ExperimentRecorder:
             raise FileExistsError(f"final result directory already exists: {final_dir}")
         partial_dir.mkdir(parents=True)
         try:
+            metadata = self._metadata(interrupted=interrupted)
+            metadata["initial_state_q"] = self.initial_state_q
+            metadata["initial_tip_position"] = self.initial_tip_position
             selected_commands = self.safe_commands if self.safe_commands else self.raw_commands
+            alignment_states = self._states_for_evaluation_window(metadata)
             alignment = align_samples(
-                states=self.states,
+                states=alignment_states,
                 references=self.references,
                 commands=selected_commands,
                 solves=self.solves,
                 config=self.config.alignment,
             )
-            metadata = self._metadata(interrupted=interrupted)
-            metadata["initial_state_q"] = self.initial_state_q
+            metadata["alignment_window"] = {
+                "state_samples_recorded": len(self.states),
+                "state_samples_evaluated": len(alignment_states),
+                "reference_samples_recorded": len(self.references),
+                "command_samples_recorded": len(selected_commands),
+            }
+            metadata["actual_evaluation_window_duration_s"] = (
+                max(0.0, alignment.samples[-1].timestamp - alignment.samples[0].timestamp)
+                if alignment.samples
+                else 0.0
+            )
             self._write_raw_files(partial_dir)
             summary = self._summary(alignment=alignment, metadata=metadata)
             write_yaml(partial_dir / "metadata.yaml", metadata)
@@ -394,6 +422,8 @@ class ExperimentRecorder:
             self.states.append(sample)
             if self.initial_state_q is None:
                 self.initial_state_q = [float(value) for value in sample.q]
+            if self.initial_tip_position is None:
+                self.initial_tip_position = [float(value) for value in sample.tip_position]
             if np.any(sample.q < self.config.state_min) or np.any(sample.q > self.config.state_max):
                 self.invalid_counts["state_limit"] += 1
         except ValueError:
@@ -490,7 +520,7 @@ class ExperimentRecorder:
         if self.start_monotonic_time is not None and self.stop_monotonic_time is not None:
             actual_duration = max(0.0, self.stop_monotonic_time - self.start_monotonic_time)
         git = git_metadata(Path.cwd())
-        return {
+        metadata: dict[str, Any] = {
             "run_id": self.run_id,
             "experiment_group": self.config.experiment_group,
             "experiment_name": self.experiment_name,
@@ -500,6 +530,8 @@ class ExperimentRecorder:
             "stopped_at": self.stop_wall_time.isoformat() if self.stop_wall_time else "",
             "configured_duration": self.config.configured_duration,
             "actual_duration": actual_duration,
+            "total_recording_duration_s": actual_duration,
+            "recording_stop_time_s": self.stop_monotonic_time,
             "interrupted": bool(interrupted),
             "ros_domain_id": os.environ.get("ROS_DOMAIN_ID", ""),
             "git": git,
@@ -529,6 +561,97 @@ class ExperimentRecorder:
             ],
             "topics": self._topic_status(),
         }
+        metadata.update(self._configuration_hash_metadata())
+        metadata.update(promoted_orchestration_metadata(self.metadata_override))
+        metadata.update(self._command_guard_metadata(metadata))
+        return metadata
+
+    def _configuration_hash_metadata(self) -> dict[str, Any]:
+        reference = self.project_config.get("reference", {})
+        robot = self.project_config.get("robot", {})
+        shared_environment = {
+            "model_parameters": self.config.model_parameters,
+            "simulation_parameters": self.project_config.get("simulation", {}),
+            "reference": {
+                "trajectory_type": self.config.trajectory_type,
+                "trajectory_parameters": self.config.trajectory_parameters,
+                "frame_id": self.config.frame_id,
+                "sample_period": self.config.reference_sample_period,
+                "loop": reference.get("loop"),
+                "completion_behavior": reference.get("completion_behavior"),
+                "duration": reference.get("duration"),
+            },
+            "frames": robot.get("frames", {}),
+            "software_mode": self.config.software_mode,
+        }
+        controller_configuration = {
+            "controller_label": self.config.controller_label,
+            "mppi_parameters": self.config.mppi_parameters,
+        }
+        orchestration_policy = self.metadata_override.get("orchestration_policy", {})
+        return {
+            "shared_environment_hash": self.metadata_override.get(
+                "shared_environment_hash",
+                stable_hash(shared_environment),
+            ),
+            "controller_configuration_hash": self.metadata_override.get(
+                "controller_configuration_hash",
+                stable_hash(controller_configuration),
+            ),
+            "orchestration_hash": self.metadata_override.get(
+                "orchestration_hash",
+                stable_hash(orchestration_policy),
+            ),
+        }
+
+    def _command_guard_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        commands = sorted(self.safe_commands or self.raw_commands, key=lambda sample: sample.timestamp)
+        command_zero_tolerance = float(metadata.get("command_zero_tolerance", 0.0) or 0.0)
+        nonzero_count = sum(1 for sample in commands if float(np.linalg.norm(sample.command)) > command_zero_tolerance)
+        result: dict[str, Any] = {
+            "recorded_command_message_count": len(commands),
+            "recorded_nonzero_command_count": nonzero_count,
+        }
+        run_role = metadata.get("run_role")
+        if run_role == "baseline":
+            result["baseline_command_message_count"] = len(commands)
+            result["baseline_nonzero_command_count"] = nonzero_count
+        if run_role == "candidate":
+            first = commands[0] if commands else None
+            recording_start = _optional_float(metadata.get("recording_start_time_s"))
+            reference_epoch = _optional_float(metadata.get("scheduled_reference_epoch_s"))
+            first_timestamp = None if first is None else float(first.timestamp)
+            result.update(
+                {
+                    "candidate_first_command_timestamp": first_timestamp,
+                    "candidate_first_command_timestamp_type": "command_message_timestamp" if first is not None else "",
+                    "candidate_command_after_recording": (
+                        False
+                        if first_timestamp is None or recording_start is None
+                        else first_timestamp >= recording_start
+                    ),
+                    "candidate_command_before_reference_epoch": (
+                        False
+                        if first_timestamp is None or reference_epoch is None
+                        else first_timestamp < reference_epoch
+                    ),
+                    "candidate_command_at_or_after_reference_epoch": (
+                        False
+                        if first_timestamp is None or reference_epoch is None
+                        else first_timestamp >= reference_epoch
+                    ),
+                }
+            )
+        return result
+
+    def _states_for_evaluation_window(self, metadata: dict[str, Any]) -> list[TimedState]:
+        window_start = _optional_float(metadata.get("evaluation_window_start_time_s"))
+        window_end = _optional_float(metadata.get("evaluation_window_end_time_s"))
+        if window_start is None or window_end is None:
+            return list(self.states)
+        if window_end < window_start:
+            return []
+        return [sample for sample in self.states if window_start <= sample.timestamp <= window_end]
 
     def _summary(self, *, alignment: AlignmentResult, metadata: dict[str, Any]) -> dict[str, Any]:
         arrays = aligned_arrays(alignment.samples)
@@ -839,6 +962,52 @@ def sanitize_name(value: str) -> str:
     return cleaned or "experiment"
 
 
+def requested_run_id_from_metadata(metadata: dict[str, Any]) -> str | None:
+    for key in ("requested_run_id", "run_id"):
+        value = metadata.get(key)
+        if value is None or value == "":
+            continue
+        text = str(value)
+        cleaned = sanitize_name(text)
+        if cleaned != text:
+            raise ValueError("requested run ID may contain only alphanumeric characters, dashes, and underscores")
+        return cleaned
+    return None
+
+
+def promoted_orchestration_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "orchestration_id",
+        "run_role",
+        "requested_evaluation_duration_s",
+        "total_recording_duration_s",
+        "pre_roll_duration_s",
+        "evaluation_window_start_time_s",
+        "evaluation_window_end_time_s",
+        "evaluation_window_duration_s",
+        "recording_start_time_s",
+        "recording_stop_time_s",
+        "reference_start_policy",
+        "scheduled_reference_epoch_s",
+        "reference_lead_duration_s",
+        "reference_phase_offset_s",
+        "reference_pre_epoch_behavior",
+        "shared_environment_hash",
+        "controller_configuration_hash",
+        "orchestration_hash",
+        "initial_state_stability",
+        "initial_tip_stability",
+        "baseline_command_publisher_count",
+        "baseline_safe_command_publisher_count",
+        "baseline_mppi_command_publisher_count",
+        "pre_roll_command_message_count",
+        "pre_roll_nonzero_command_count",
+        "unexpected_command_publishers",
+        "command_zero_tolerance",
+    )
+    return {key: metadata[key] for key in keys if key in metadata}
+
+
 def _baseline_rmse_improvement_pass(
     comparison: dict[str, Any],
     *,
@@ -858,6 +1027,16 @@ def _baseline_rmse_improvement_pass(
             return False, "RMSE baseline improvement is below threshold"
         return True, "ok"
     return False, "RMSE baseline comparison is missing"
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
 
 
 def git_metadata(workspace: Path) -> dict[str, Any]:

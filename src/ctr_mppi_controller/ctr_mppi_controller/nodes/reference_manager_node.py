@@ -25,6 +25,7 @@ from rclpy.parameter import Parameter
 REFERENCE_MODES = ("fixed_target", "trajectory")
 TRAJECTORY_TYPES = ("circle", "ellipse", "helix")
 COMPLETION_BEHAVIORS = ("loop", "hold_final")
+TRAJECTORY_START_POLICIES = ("node_start", "scheduled_time")
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,8 @@ class ReferenceManagerNode(Node):
         self.declare_parameter("runtime_mode", "simulation")
         self.declare_parameter("reference_mode", "")
         self.declare_parameter("reference_type", "")
+        self.declare_parameter("trajectory_start_policy", "node_start")
+        self.declare_parameter("scheduled_reference_epoch", 0.0)
 
         config_paths = validate_config_paths(self.get_parameter("config_paths").value)
         self.config = load_parameter_files(config_paths)
@@ -71,12 +74,31 @@ class ReferenceManagerNode(Node):
         self.tip_pub = self.create_publisher(PoseStamped, "/ctr/reference/tip", 10)
 
         now_s = ros_time_seconds(self.get_clock().now())
-        self.trajectory_start_time_s = now_s
+        self.trajectory_start_policy = _choice(
+            self.get_parameter("trajectory_start_policy").value,
+            "trajectory_start_policy",
+            TRAJECTORY_START_POLICIES,
+        )
+        self.scheduled_reference_epoch_s = _number(
+            self.get_parameter("scheduled_reference_epoch").value,
+            "scheduled_reference_epoch",
+        )
+        self.trajectory_start_time_s = trajectory_start_time_from_policy(
+            policy=self.trajectory_start_policy,
+            now_s=now_s,
+            scheduled_reference_epoch_s=self.scheduled_reference_epoch_s,
+        )
+        if self.trajectory_start_policy == "scheduled_time" and self.trajectory_start_time_s < now_s:
+            self.get_logger().warn(
+                "scheduled_reference_epoch is in the past; reference trajectory will start from elapsed scheduled time."
+            )
         self.last_time_s = now_s
         self.timer = self.create_timer(1.0 / self.settings.publish_frequency, self._on_timer)
         self.get_logger().info(
             f"Reference manager started in {self.settings.mode} mode; "
-            f"trajectory_type={self.settings.trajectory_type}."
+            f"trajectory_type={self.settings.trajectory_type}; "
+            f"trajectory_start_policy={self.trajectory_start_policy}; "
+            f"trajectory_start_time_s={self.trajectory_start_time_s:.9f}."
         )
 
     def _on_timer(self) -> None:
@@ -86,6 +108,8 @@ class ReferenceManagerNode(Node):
             previous_time_s=self.last_time_s,
             current_time_s=now_s,
             start_time_s=self.trajectory_start_time_s,
+            policy=self.trajectory_start_policy,
+            scheduled_reference_epoch_s=self.scheduled_reference_epoch_s,
         )
         if next_start_time_s != self.trajectory_start_time_s:
             self.trajectory_start_time_s = next_start_time_s
@@ -244,11 +268,37 @@ def ros_time_seconds(time_value: Any) -> float:
     return seconds
 
 
-def adjusted_trajectory_start_time(*, previous_time_s: float, current_time_s: float, start_time_s: float) -> float:
+def trajectory_start_time_from_policy(
+    *,
+    policy: str,
+    now_s: float,
+    scheduled_reference_epoch_s: float,
+) -> float:
+    selected_policy = _choice(policy, "trajectory_start_policy", TRAJECTORY_START_POLICIES)
+    now = _number(now_s, "now_s")
+    scheduled = _number(scheduled_reference_epoch_s, "scheduled_reference_epoch_s")
+    if selected_policy == "node_start":
+        return now
+    return scheduled
+
+
+def adjusted_trajectory_start_time(
+    *,
+    previous_time_s: float,
+    current_time_s: float,
+    start_time_s: float,
+    policy: str = "node_start",
+    scheduled_reference_epoch_s: float | None = None,
+) -> float:
     previous = _number(previous_time_s, "previous_time_s")
     current = _number(current_time_s, "current_time_s")
     start = _number(start_time_s, "start_time_s")
+    selected_policy = _choice(policy, "trajectory_start_policy", TRAJECTORY_START_POLICIES)
     if current < previous:
+        if selected_policy == "scheduled_time" and scheduled_reference_epoch_s is not None:
+            scheduled = _number(scheduled_reference_epoch_s, "scheduled_reference_epoch_s")
+            if current <= scheduled:
+                return scheduled
         return current
     return start
 

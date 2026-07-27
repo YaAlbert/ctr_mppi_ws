@@ -378,6 +378,50 @@ def _validate_evaluation(evaluation: Any) -> list[str]:
             limit = 1.0 if key == "steady_state_fraction" else 100.0
             errors.append(f"`evaluation.{key}` must be <= {limit}.")
     errors.extend(_require_number(evaluation, "required_minimum_baseline_improvement", "evaluation"))
+    errors.extend(_validate_evaluation_orchestration(evaluation.get("orchestration", {})))
+    return errors
+
+
+def _validate_evaluation_orchestration(orchestration: Any) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(orchestration, dict):
+        return ["`evaluation.orchestration` must be a map."]
+    for key in (
+        "enabled",
+        "allow_sigkill_cleanup",
+        "require_no_baseline_command",
+        "require_recording_before_candidate_command",
+    ):
+        if not isinstance(orchestration.get(key), bool):
+            errors.append(f"`evaluation.orchestration.{key}` must be a boolean.")
+    for key in (
+        "startup_timeout",
+        "service_timeout",
+        "topic_ready_timeout",
+        "reference_ready_timeout",
+        "finalization_timeout",
+        "initial_stability_duration",
+        "reference_lead_time",
+        "shutdown_sigint_timeout",
+        "shutdown_sigterm_timeout",
+    ):
+        errors.extend(_require_positive_number(orchestration, key, "evaluation.orchestration"))
+    for key in (
+        "initial_q_stability_tolerance",
+        "initial_tip_stability_tolerance",
+        "baseline_candidate_q_tolerance",
+        "baseline_candidate_tip_tolerance",
+        "command_zero_tolerance",
+    ):
+        errors.extend(_require_number(orchestration, key, "evaluation.orchestration", nonnegative=True))
+    errors.extend(
+        _require_positive_number(
+            orchestration,
+            "initial_stability_samples",
+            "evaluation.orchestration",
+            integer=True,
+        )
+    )
     return errors
 
 

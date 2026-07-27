@@ -94,6 +94,11 @@ def generate_report(
             lines.append("Comparison is not compatibility-valid.")
             for reason in comparison.get("compatibility_reasons", []):
                 lines.append(f"- {reason}")
+        details = comparison.get("compatibility_details", {})
+        if details:
+            lines.extend(["", "Compatibility details:"])
+            for key, value in sorted(details.items()):
+                lines.append(f"- {key}: `{_fmt(value)}`")
         lines.extend(["", "| Metric | Candidate | Baseline | Difference | Relative improvement % | Valid |", "| --- | ---: | ---: | ---: | ---: | --- |"])
         for item in comparison.get("metric_comparisons", []):
             lines.append(

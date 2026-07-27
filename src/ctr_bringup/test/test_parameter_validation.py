@@ -56,6 +56,25 @@ def temporary_config_paths(module):
     return paths
 
 
+def launch_description_with_temp_share(module):
+    with tempfile.TemporaryDirectory() as temp_dir:
+        package_share = Path(temp_dir)
+        previous_ros_log_dir = os.environ.get("ROS_LOG_DIR")
+        os.environ["ROS_LOG_DIR"] = str(package_share / "ros_log")
+        config_dir = package_share / "config"
+        config_dir.mkdir()
+        for source_path in CONFIG_FILES:
+            (config_dir / source_path.name).write_text("placeholder: true\n", encoding="utf-8")
+        module.get_package_share_directory = lambda package_name: str(package_share)
+        try:
+            return module.generate_launch_description()
+        finally:
+            if previous_ros_log_dir is None:
+                os.environ.pop("ROS_LOG_DIR", None)
+            else:
+                os.environ["ROS_LOG_DIR"] = previous_ros_log_dir
+
+
 class ParameterValidationTest(unittest.TestCase):
     def test_current_project_config_validates(self):
         config = load_parameter_files(CONFIG_FILES)
@@ -82,7 +101,13 @@ class ParameterValidationTest(unittest.TestCase):
         self.assertEqual(len(CONFIG_FILES), len(paths))
 
     def test_all_launch_config_paths_include_evaluation_params_in_order(self):
-        for file_name in ("simulation.launch.py", "mock_hardware.launch.py", "physical_hardware.launch.py"):
+        for file_name in (
+            "simulation.launch.py",
+            "mock_hardware.launch.py",
+            "physical_hardware.launch.py",
+            "evaluation_reference.launch.py",
+            "evaluation_mppi_controller.launch.py",
+        ):
             with self.subTest(file_name=file_name):
                 module = load_launch_module(file_name, f"{file_name.replace('.', '_')}_config_paths_under_test")
                 paths = temporary_config_paths(module)
@@ -131,6 +156,58 @@ class ParameterValidationTest(unittest.TestCase):
         executables = {getattr(node, "_Node__node_executable", None) for node in node_actions}
         self.assertIn("reference_manager_node", executables)
         self.assertIn("evaluation_node", executables)
+
+    def test_evaluation_reference_launch_static_compatibility(self):
+        from launch.actions import DeclareLaunchArgument
+        from launch_ros.actions import Node
+
+        module = load_launch_module("evaluation_reference.launch.py", "evaluation_reference_launch_under_test")
+        paths = temporary_config_paths(module)
+        self.assertEqual([path.name for path in CONFIG_FILES], [Path(path).name for path in paths])
+
+        launch_description = launch_description_with_temp_share(module)
+        launch_arguments = {
+            entity.name
+            for entity in launch_description.entities
+            if isinstance(entity, DeclareLaunchArgument)
+        }
+        self.assertIn("trajectory_start_policy", launch_arguments)
+        self.assertIn("scheduled_reference_epoch", launch_arguments)
+        nodes = [entity for entity in launch_description.entities if isinstance(entity, Node)]
+        self.assertEqual(["reference_manager_node"], [getattr(node, "_Node__node_executable", None) for node in nodes])
+
+    def test_evaluation_mppi_controller_launch_static_compatibility(self):
+        from launch.actions import DeclareLaunchArgument
+        from launch_ros.actions import Node
+
+        module = load_launch_module("evaluation_mppi_controller.launch.py", "evaluation_mppi_controller_launch_under_test")
+        paths = temporary_config_paths(module)
+        self.assertEqual([path.name for path in CONFIG_FILES], [Path(path).name for path in paths])
+
+        launch_description = launch_description_with_temp_share(module)
+        launch_arguments = {
+            entity.name
+            for entity in launch_description.entities
+            if isinstance(entity, DeclareLaunchArgument)
+        }
+        self.assertIn("publish_safe_command_for_simulation", launch_arguments)
+        nodes = [entity for entity in launch_description.entities if isinstance(entity, Node)]
+        self.assertEqual(["mppi_controller_node"], [getattr(node, "_Node__node_executable", None) for node in nodes])
+
+    def test_evaluation_launch_helpers_start_no_hardware(self):
+        from launch_ros.actions import Node
+
+        for file_name in ("evaluation_reference.launch.py", "evaluation_mppi_controller.launch.py"):
+            with self.subTest(file_name=file_name):
+                module = load_launch_module(file_name, f"{file_name.replace('.', '_')}_no_hw_under_test")
+                launch_description = launch_description_with_temp_share(module)
+                executables = {
+                    getattr(entity, "_Node__node_executable", None)
+                    for entity in launch_description.entities
+                    if isinstance(entity, Node)
+                }
+                self.assertNotIn("physical_hardware_node", executables)
+                self.assertNotIn("mock_hardware_node", executables)
 
     def test_evaluation_nodes_are_disabled_by_default_in_launch_files(self):
         from launch.actions import DeclareLaunchArgument
@@ -243,6 +320,18 @@ class ParameterValidationTest(unittest.TestCase):
         config["evaluation"]["maximum_reference_alignment_gap"] = 0.0
         errors = validate_project_config(config)
         self.assertTrue(any("evaluation.maximum_reference_alignment_gap" in error for error in errors))
+
+    def test_evaluation_orchestration_yaml_section_validates(self):
+        config = load_parameter_files(CONFIG_FILES)
+        errors = validate_project_config(config)
+        self.assertEqual([], [error for error in errors if "evaluation.orchestration" in error])
+
+    def test_evaluation_invalid_orchestration_timeout_is_rejected(self):
+        config = load_parameter_files(CONFIG_FILES)
+        config = copy.deepcopy(config)
+        config["evaluation"]["orchestration"]["startup_timeout"] = 0.0
+        errors = validate_project_config(config)
+        self.assertTrue(any("evaluation.orchestration.startup_timeout" in error for error in errors))
 
     def test_invalid_robot_tube_count_is_rejected(self):
         config = load_parameter_files(CONFIG_FILES)

@@ -18,6 +18,7 @@ from ctr_mppi_controller.nodes.reference_manager_node import (  # noqa: E402
     path_from_points,
     pose_from_point,
     reference_settings_from_config,
+    trajectory_start_time_from_policy,
 )
 
 
@@ -77,6 +78,70 @@ class ReferenceManagerNodeHelpersTest(unittest.TestCase):
         self.assertAlmostEqual(
             1.0,
             adjusted_trajectory_start_time(previous_time_s=5.0, current_time_s=6.0, start_time_s=1.0),
+        )
+
+    def test_scheduled_start_policy_uses_configured_epoch(self):
+        self.assertAlmostEqual(
+            10.0,
+            trajectory_start_time_from_policy(
+                policy="scheduled_time",
+                now_s=2.0,
+                scheduled_reference_epoch_s=10.0,
+            ),
+        )
+        self.assertAlmostEqual(
+            2.0,
+            trajectory_start_time_from_policy(
+                policy="node_start",
+                now_s=2.0,
+                scheduled_reference_epoch_s=10.0,
+            ),
+        )
+
+    def test_scheduled_start_rejects_nonfinite_epoch(self):
+        with self.assertRaises(ValueError):
+            trajectory_start_time_from_policy(
+                policy="scheduled_time",
+                now_s=2.0,
+                scheduled_reference_epoch_s=float("nan"),
+            )
+
+    def test_scheduled_pre_epoch_behavior_keeps_first_horizon_point(self):
+        config = make_config()
+        settings = reference_settings_from_config(config, mode_override="trajectory", type_override="circle")
+        trajectory = build_reference_trajectory(config, settings=settings)
+        horizon = trajectory.horizon_at_time(
+            current_time=9.0,
+            start_time=10.0,
+            horizon_length=settings.horizon,
+        )
+        self.assertEqual(0, horizon.start_index)
+        self.assertEqual(0, horizon.current_index)
+        self.assertTrue(np.allclose(trajectory.points[0], horizon.current_point))
+
+    def test_scheduled_transition_at_epoch_uses_elapsed_sample_period(self):
+        config = make_config()
+        settings = reference_settings_from_config(config, mode_override="trajectory", type_override="circle")
+        trajectory = build_reference_trajectory(config, settings=settings)
+        at_epoch = trajectory.horizon_at_time(current_time=10.0, start_time=10.0, horizon_length=settings.horizon)
+        after_epoch = trajectory.horizon_at_time(
+            current_time=10.0 + 2.0 * settings.sample_period,
+            start_time=10.0,
+            horizon_length=settings.horizon,
+        )
+        self.assertEqual(0, at_epoch.start_index)
+        self.assertEqual(2, after_epoch.start_index)
+
+    def test_scheduled_time_backward_before_epoch_keeps_scheduled_epoch(self):
+        self.assertAlmostEqual(
+            10.0,
+            adjusted_trajectory_start_time(
+                previous_time_s=9.0,
+                current_time_s=2.0,
+                start_time_s=10.0,
+                policy="scheduled_time",
+                scheduled_reference_epoch_s=10.0,
+            ),
         )
 
     def test_loop_behavior_wraps_horizon_indices(self):

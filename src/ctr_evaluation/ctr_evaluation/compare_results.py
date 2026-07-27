@@ -22,8 +22,8 @@ def compare_result_dirs(
 ) -> dict[str, Any]:
     candidate_summary = read_json(candidate_dir / "summary.json")
     baseline_summary = read_json(baseline_dir / "summary.json")
-    candidate_metadata = read_yaml(candidate_dir / "metadata.yaml")
-    baseline_metadata = read_yaml(baseline_dir / "metadata.yaml")
+    candidate_metadata = read_result_metadata(candidate_dir)
+    baseline_metadata = read_result_metadata(baseline_dir)
     result = compare_summaries(
         candidate_summary=candidate_summary,
         baseline_summary=baseline_summary,
@@ -47,6 +47,12 @@ def write_comparison_markdown(path: Path, comparison: dict[str, Any], candidate_
         f"- compatibility_valid: `{comparison.get('compatibility_valid', False)}`",
         "",
     ]
+    details = comparison.get("compatibility_details", {})
+    if details:
+        lines.extend(["Compatibility details:"])
+        for key, value in sorted(details.items()):
+            lines.append(f"- {key}: `{_optional_any(value)}`")
+        lines.append("")
     reasons = comparison.get("compatibility_reasons", [])
     if reasons:
         lines.append("Compatibility reasons:")
@@ -79,6 +85,19 @@ def read_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
+def read_result_metadata(run_dir: Path) -> dict[str, Any]:
+    metadata = read_yaml(run_dir / "metadata.yaml")
+    orchestration_path = run_dir / "orchestration.json"
+    if orchestration_path.is_file():
+        orchestration = read_json(orchestration_path)
+        if not isinstance(orchestration, dict):
+            raise ValueError(f"orchestration JSON must contain a map: {orchestration_path}")
+        metadata["orchestration_runtime"] = orchestration
+        for key, value in orchestration.items():
+            metadata.setdefault(key, value)
+    return metadata
+
+
 def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(sanitize_for_json(data), indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
@@ -105,6 +124,14 @@ def _optional_number(value) -> str:
     if value is None:
         return "n/a"
     return f"{float(value):.6g}"
+
+
+def _optional_any(value) -> str:
+    if value is None:
+        return "n/a"
+    if isinstance(value, float):
+        return _optional_number(value)
+    return str(value)
 
 
 if __name__ == "__main__":

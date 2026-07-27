@@ -192,6 +192,7 @@ class MetricComparison:
 class ComparisonResult:
     compatibility_valid: bool
     compatibility_reasons: list[str]
+    compatibility_details: dict[str, Any]
     metric_comparisons: list[MetricComparison]
 
     def to_dict(self) -> dict[str, Any]:
@@ -440,12 +441,13 @@ def compare_summaries(
     duration_tolerance: float,
     initial_state_tolerance: float,
 ) -> ComparisonResult:
-    compatibility_reasons = compatibility_reasons_for(
+    compatibility = compatibility_report_for(
         candidate_metadata=candidate_metadata,
         baseline_metadata=baseline_metadata,
         duration_tolerance=duration_tolerance,
         initial_state_tolerance=initial_state_tolerance,
     )
+    compatibility_reasons = compatibility["reasons"]
     compatibility_valid = not compatibility_reasons
     metric_pairs = _flatten_numeric_metrics(candidate_summary)
     baseline_pairs = _flatten_numeric_metrics(baseline_summary)
@@ -464,6 +466,7 @@ def compare_summaries(
         if not compatibility_valid:
             valid = False
             reason = "; ".join(compatibility_reasons)
+            improvement = None
         comparisons.append(
             MetricComparison(
                 metric=name,
@@ -480,6 +483,7 @@ def compare_summaries(
     return ComparisonResult(
         compatibility_valid=compatibility_valid,
         compatibility_reasons=compatibility_reasons,
+        compatibility_details=compatibility["details"],
         metric_comparisons=comparisons,
     )
 
@@ -510,7 +514,23 @@ def compatibility_reasons_for(
     duration_tolerance: float,
     initial_state_tolerance: float,
 ) -> list[str]:
+    return compatibility_report_for(
+        candidate_metadata=candidate_metadata,
+        baseline_metadata=baseline_metadata,
+        duration_tolerance=duration_tolerance,
+        initial_state_tolerance=initial_state_tolerance,
+    )["reasons"]
+
+
+def compatibility_report_for(
+    *,
+    candidate_metadata: dict[str, Any],
+    baseline_metadata: dict[str, Any],
+    duration_tolerance: float,
+    initial_state_tolerance: float,
+) -> dict[str, Any]:
     reasons: list[str] = []
+    details: dict[str, Any] = {}
     candidate_config = candidate_metadata.get("configuration", {})
     baseline_config = baseline_metadata.get("configuration", {})
     for key in (
@@ -524,6 +544,15 @@ def compatibility_reasons_for(
     ):
         if candidate_config.get(key) != baseline_config.get(key):
             reasons.append(f"incompatible {key}")
+    details["candidate_shared_environment_hash"] = candidate_metadata.get("shared_environment_hash")
+    details["baseline_shared_environment_hash"] = baseline_metadata.get("shared_environment_hash")
+    if (
+        candidate_metadata.get("shared_environment_hash") is not None
+        or baseline_metadata.get("shared_environment_hash") is not None
+    ) and candidate_metadata.get("shared_environment_hash") != baseline_metadata.get("shared_environment_hash"):
+        reasons.append("incompatible shared_environment_hash")
+    details["candidate_controller_configuration_hash"] = candidate_metadata.get("controller_configuration_hash")
+    details["baseline_controller_configuration_hash"] = baseline_metadata.get("controller_configuration_hash")
     duration_tol = _nonnegative_number(duration_tolerance, "duration_tolerance")
     candidate_duration = _optional_float(candidate_config.get("configured_duration"))
     baseline_duration = _optional_float(baseline_config.get("configured_duration"))
@@ -535,6 +564,20 @@ def compatibility_reasons_for(
     if candidate_actual_duration is not None and baseline_actual_duration is not None:
         if abs(candidate_actual_duration - baseline_actual_duration) > duration_tol:
             reasons.append("actual duration differs beyond tolerance")
+    candidate_window_duration = _optional_float(candidate_metadata.get("evaluation_window_duration_s"))
+    baseline_window_duration = _optional_float(baseline_metadata.get("evaluation_window_duration_s"))
+    details["candidate_evaluation_window_duration_s"] = candidate_window_duration
+    details["baseline_evaluation_window_duration_s"] = baseline_window_duration
+    if candidate_window_duration is not None and baseline_window_duration is not None:
+        if abs(candidate_window_duration - baseline_window_duration) > duration_tol:
+            reasons.append("evaluation-window duration differs beyond tolerance")
+    candidate_actual_window_duration = _optional_float(candidate_metadata.get("actual_evaluation_window_duration_s"))
+    baseline_actual_window_duration = _optional_float(baseline_metadata.get("actual_evaluation_window_duration_s"))
+    details["candidate_actual_evaluation_window_duration_s"] = candidate_actual_window_duration
+    details["baseline_actual_evaluation_window_duration_s"] = baseline_actual_window_duration
+    if candidate_actual_window_duration is not None and baseline_actual_window_duration is not None:
+        if abs(candidate_actual_window_duration - baseline_actual_window_duration) > duration_tol:
+            reasons.append("actual evaluation-window duration differs beyond tolerance")
     initial_tol = _nonnegative_number(initial_state_tolerance, "initial_state_tolerance")
     candidate_initial = candidate_metadata.get("initial_state_q")
     baseline_initial = baseline_metadata.get("initial_state_q")
@@ -545,11 +588,128 @@ def compatibility_reasons_for(
                 "baseline_initial_state_q",
                 (6,),
             ))
+            details["initial_q_difference"] = float(delta)
             if delta > initial_tol:
                 reasons.append("initial state differs beyond tolerance")
         except ValueError:
             reasons.append("initial state is malformed")
+    orchestrated = _is_orchestrated_comparison(candidate_metadata, baseline_metadata)
+    if orchestrated:
+        reasons.extend(
+            _orchestration_compatibility_reasons(
+                candidate_metadata,
+                baseline_metadata,
+                details,
+                duration_tolerance=duration_tol,
+                initial_state_tolerance=initial_tol,
+            )
+        )
+    return {"reasons": reasons, "details": details}
+
+
+def _is_orchestrated_comparison(candidate_metadata: dict[str, Any], baseline_metadata: dict[str, Any]) -> bool:
+    return bool(
+        candidate_metadata.get("orchestration_id")
+        or baseline_metadata.get("orchestration_id")
+        or candidate_metadata.get("run_role")
+        or baseline_metadata.get("run_role")
+    )
+
+
+def _orchestration_compatibility_reasons(
+    candidate_metadata: dict[str, Any],
+    baseline_metadata: dict[str, Any],
+    details: dict[str, Any],
+    *,
+    duration_tolerance: float,
+    initial_state_tolerance: float,
+) -> list[str]:
+    reasons: list[str] = []
+    for key in (
+        "shared_environment_hash",
+        "reference_start_policy",
+        "reference_lead_duration_s",
+        "reference_phase_offset_s",
+        "reference_pre_epoch_behavior",
+        "evaluation_window_duration_s",
+        "initial_state_q",
+        "initial_tip_position",
+        "baseline_nonzero_command_count",
+        "candidate_command_after_recording",
+    ):
+        owner = baseline_metadata if key.startswith("baseline_") else candidate_metadata
+        if key == "initial_tip_position":
+            if candidate_metadata.get(key) is None or baseline_metadata.get(key) is None:
+                reasons.append("required orchestration metadata missing: initial_tip_position")
+            continue
+        if key == "initial_state_q":
+            if candidate_metadata.get(key) is None or baseline_metadata.get(key) is None:
+                reasons.append("required orchestration metadata missing: initial_state_q")
+            continue
+        if key == "candidate_command_after_recording":
+            if candidate_metadata.get(key) is None:
+                reasons.append("required orchestration metadata missing: candidate_command_after_recording")
+            continue
+        if owner.get(key) is None:
+            reasons.append(f"required orchestration metadata missing: {key}")
+
+    for key in ("reference_start_policy", "reference_pre_epoch_behavior"):
+        details[f"candidate_{key}"] = candidate_metadata.get(key)
+        details[f"baseline_{key}"] = baseline_metadata.get(key)
+        if candidate_metadata.get(key) != baseline_metadata.get(key):
+            reasons.append(f"incompatible {key}")
+
+    for key in ("reference_lead_duration_s", "reference_phase_offset_s", "requested_evaluation_duration_s"):
+        candidate_value = _optional_float(candidate_metadata.get(key))
+        baseline_value = _optional_float(baseline_metadata.get(key))
+        details[f"candidate_{key}"] = candidate_value
+        details[f"baseline_{key}"] = baseline_value
+        if candidate_value is not None and baseline_value is not None:
+            if abs(candidate_value - baseline_value) > duration_tolerance:
+                reasons.append(f"incompatible {key}")
+
+    candidate_tip = candidate_metadata.get("initial_tip_position")
+    baseline_tip = baseline_metadata.get("initial_tip_position")
+    if candidate_tip is not None and baseline_tip is not None:
+        try:
+            tip_delta = np.linalg.norm(
+                _array_shape(candidate_tip, "candidate_initial_tip_position", (3,))
+                - _array_shape(baseline_tip, "baseline_initial_tip_position", (3,))
+            )
+            details["initial_tip_difference"] = float(tip_delta)
+            tip_tol = _orchestration_tip_tolerance(candidate_metadata, baseline_metadata, initial_state_tolerance)
+            details["initial_tip_tolerance"] = tip_tol
+            if tip_delta > tip_tol:
+                reasons.append("initial tip differs beyond tolerance")
+        except ValueError:
+            reasons.append("initial tip is malformed")
+
+    baseline_nonzero = _optional_float(baseline_metadata.get("baseline_nonzero_command_count"))
+    details["baseline_nonzero_command_count"] = baseline_nonzero
+    if baseline_nonzero is not None and baseline_nonzero > 0.0:
+        reasons.append("baseline received prohibited nonzero command")
+    pre_roll_nonzero = _optional_float(baseline_metadata.get("pre_roll_nonzero_command_count"))
+    details["baseline_pre_roll_nonzero_command_count"] = pre_roll_nonzero
+    if pre_roll_nonzero is not None and pre_roll_nonzero > 0.0:
+        reasons.append("baseline pre-roll received prohibited nonzero command")
+
+    candidate_after_recording = candidate_metadata.get("candidate_command_after_recording")
+    details["candidate_command_after_recording"] = candidate_after_recording
+    if candidate_after_recording is not True:
+        reasons.append("candidate command occurred before recording or is missing")
     return reasons
+
+
+def _orchestration_tip_tolerance(
+    candidate_metadata: dict[str, Any],
+    baseline_metadata: dict[str, Any],
+    fallback: float,
+) -> float:
+    for metadata in (candidate_metadata, baseline_metadata):
+        value = _optional_float(metadata.get("baseline_candidate_tip_tolerance"))
+        if value is not None:
+            return _nonnegative_number(value, "baseline_candidate_tip_tolerance")
+    return fallback
 
 
 def aggregate_trial_summaries(summaries: Iterable[dict[str, Any]]) -> dict[str, Any]:

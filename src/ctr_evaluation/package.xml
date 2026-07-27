@@ -7,6 +7,7 @@
   <maintainer email="todo@example.com">TODO-OWNER-001</maintainer>
   <license>TODO-LICENSE-001</license>
   <buildtool_depend>ament_python</buildtool_depend>
+  <exec_depend>ament_index_python</exec_depend>
   <exec_depend>ctr_bringup</exec_depend>
   <exec_depend>ctr_interfaces</exec_depend>
   <exec_depend>diagnostic_msgs</exec_depend>

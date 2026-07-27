@@ -20,6 +20,7 @@ setup(
         "console_scripts": [
             "evaluation_node = ctr_evaluation.nodes.evaluation_node:main",
             "compare_results = ctr_evaluation.compare_results:main",
+            "ctr_run_evaluation = ctr_evaluation.run_evaluation:main",
         ]
     },
 )
