@@ -224,8 +224,10 @@ Current limitations:
 
 ### Milestone 6A: Straight cylindrical-lumen point-goal navigation
 
-Status: functionally integrated and runtime verified for the default
-software-simulation target. Broad multi-target robustness, real-time behavior,
+Status: functionally integrated and runtime verified for straight-cylinder
+software-simulation point-goal navigation. Milestone 6A verified the default
+target; Milestone 6A.1 verified repeatability for the default, axial, and
+lateral exact targets with unchanged `cylinder_fast`. Real-time behavior,
 physical accuracy, anatomical navigation, and hardware deployment are not
 verified.
 
@@ -308,21 +310,56 @@ Aggregate default-target results:
 - worst minimum clearance: `0.002732 m`;
 - total collisions: `0`.
 
-Additional target results:
+Historical additional-target diagnostics:
 
-- axial target `[0.019, 0.000, 0.105] m`: valid, deterministic sampled-
-  reachability check passed, collision-free, final error `0.003776 m`, did not
-  meet the `0.003 m` goal tolerance within `20 s`;
-- lateral target `[0.010, 0.012, 0.095] m`: valid, deterministic sampled-
-  reachability check passed, collision-free, final error `0.004218 m`, did not
-  meet the `0.003 m` goal tolerance within `20 s`.
+- pre-6A.1 axial and lateral 20 s diagnostics were collision-free but did not
+  satisfy the `0.003 m` goal tolerance;
+- those diagnostics predate the target-identity hardening and are superseded by
+  the exact-target Milestone 6A.1 matrix below.
 
-Milestone 6A demonstrates functional integration, default-target simulation
-runtime verification, quantitative evaluation, and collision-free behavior for
-the tested cases only. Sampled reachability is a deterministic simulation sanity
-check, not a proof of reachability. Deadline overrun remains `100%`, real-time
-capability is false, physical accuracy is not verified, and hardware deployment
-is not verified.
+Milestone 6A.1 exact-target repeatability results:
+
+- commit `8288fce6ec443f45ab3e264b82b15efa2e1d6f75` fixes target identity so
+  requested targets are never silently replaced;
+- sampled reachability remains diagnostic only;
+- published reference targets are verified against the requested target;
+- unchanged `cylinder_fast` was used with a `25.0 s` formal evaluation window;
+- no new robust profile was required;
+- parameter tuning was not justified;
+- default, axial, and lateral targets each ran seeds 11, 22, and 33;
+- 9/9 candidate runs reached the goal;
+- 9/9 baseline comparisons were valid;
+- radial collisions: `0`;
+- inlet/outlet collisions: `0`;
+- cleanup failures: `0`;
+- strict JSON parsing passed for all generated JSON files.
+
+Milestone 6A.1 aggregate results:
+
+| Target | Success | Mean final error (m) | Mean RMSE (m) | Worst physical clearance (m) | Safety-margin status |
+|---|---:|---:|---:|---:|---|
+| Default `[0.015, 0.005, 0.100]` | 3/3 | 0.000328 | 0.011158 | 0.002683 | full margin maintained |
+| Axial `[0.019, 0.000, 0.105]` | 3/3 | 0.000453 | 0.012965 | 0.001707 | full margin not maintained in 3/3 runs; total violation duration 5.60 s |
+| Lateral `[0.010, 0.012, 0.095]` | 3/3 | 0.001744 | 0.012276 | 0.003712 | full margin maintained |
+
+Overall Milestone 6A.1 results:
+
+- success `9/9`;
+- mean final error `0.000842 m`;
+- mean RMSE `0.012133 m`;
+- mean time to goal `20.40 s`;
+- mean solve time `0.1339 s`;
+- mean command rate `7.38 Hz`;
+- no collision, invalid comparison, or process-cleanup failure.
+
+Milestone 6A.1 demonstrates repeatable straight-cylinder software-simulation
+navigation for the tested exact target/seed matrix. Sampled reachability is a
+deterministic simulation sanity check, not a proof of reachability. Timing
+measurements remain descriptive performance output and should continue to be
+reported, but real-time execution is not a prerequisite for current
+software-simulation navigation acceptance. Deadline overrun remains about
+`100%`, real-time capability is false, physical accuracy is not verified, and
+hardware deployment is not verified.
 
 - reference backbone;
 - backbone resampling;

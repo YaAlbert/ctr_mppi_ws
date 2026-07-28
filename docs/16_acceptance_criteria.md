@@ -346,10 +346,12 @@ Scope exclusions still apply:
 
 ### Milestone 6A: Straight cylindrical-lumen point-goal navigation
 
-Acceptance status: satisfied for the default straight-cylinder
-software-simulation target. Multi-target robustness, real-time capability,
-physical accuracy, anatomical navigation, and hardware deployment are not
-accepted as complete.
+Acceptance status: satisfied for the verified straight-cylinder
+software-simulation target matrix. Milestone 6A accepted the default target;
+Milestone 6A.1 accepted repeatability for the default, axial, and lateral exact
+targets with unchanged `cylinder_fast` and a `25.0 s` formal evaluation
+duration. Real-time capability, physical accuracy, anatomical navigation, and
+hardware deployment are not accepted as complete.
 
 Accepted implemented functions:
 
@@ -429,24 +431,70 @@ Accepted aggregate default-target evidence:
 - worst minimum clearance: `0.002732 m`;
 - total collisions: `0`.
 
-Additional-target evidence is not accepted as goal-success completion:
+Historical additional-target diagnostics are not accepted as goal-success
+completion:
 
-- axial target `[0.019, 0.000, 0.105] m` was valid, sampled reachable, and
-  collision-free, but final error was `0.003776 m` and the target did not meet
-  the `0.003 m` goal tolerance within `20 s`;
-- lateral target `[0.010, 0.012, 0.095] m` was valid, sampled reachable, and
-  collision-free, but final error was `0.004218 m` and the target did not meet
-  the `0.003 m` goal tolerance within `20 s`.
+- pre-6A.1 axial and lateral 20 s diagnostics were collision-free but did not
+  satisfy the `0.003 m` goal tolerance;
+- those diagnostics predate the target-identity hardening and are superseded by
+  the accepted exact-target Milestone 6A.1 matrix below.
+
+Accepted Milestone 6A.1 exact-target identity behavior:
+
+- requested targets are never silently replaced;
+- sampled reachability is diagnostic only;
+- published reference targets are verified against requested targets;
+- requested and executed targets match before evidence is accepted;
+- baseline and candidate targets match;
+- target identity participates in comparison compatibility.
+
+Accepted Milestone 6A.1 repeatability evidence:
+
+- commit `8288fce6ec443f45ab3e264b82b15efa2e1d6f75`;
+- unchanged `cylinder_fast`;
+- no new robust profile;
+- no MPPI parameter tuning;
+- formal evaluation duration `25.0 s`;
+- 3 targets by 3 deterministic seeds;
+- 9/9 target-reaching success;
+- 9/9 valid baseline comparisons;
+- 0 radial collisions;
+- 0 inlet/outlet collisions;
+- 0 process-cleanup failures;
+- all generated JSON files strict-parsed successfully.
+
+Accepted Milestone 6A.1 target aggregates:
+
+| Target | Success | Mean final error (m) | Mean RMSE (m) | Worst physical clearance (m) | Safety-margin acceptance |
+|---|---:|---:|---:|---:|---|
+| Default `[0.015, 0.005, 0.100]` | 3/3 | 0.000328 | 0.011158 | 0.002683 | pass |
+| Axial `[0.019, 0.000, 0.105]` | 3/3 | 0.000453 | 0.012965 | 0.001707 | follow-up; full margin failed in 3/3 runs |
+| Lateral `[0.010, 0.012, 0.095]` | 3/3 | 0.001744 | 0.012276 | 0.003712 | pass |
+
+Overall accepted Milestone 6A.1 evidence:
+
+- success `9/9`;
+- mean final error `0.000842 m`;
+- mean RMSE `0.012133 m`;
+- mean time to goal `20.40 s`;
+- mean solve time `0.1339 s`;
+- mean command rate `7.38 Hz`;
+- no collision, invalid comparison, or process-cleanup failure.
 
 Acceptance caveats:
 
 - Milestone 6A is functionally integrated;
-- default-target simulation runtime is verified;
-- collision-free behavior is verified only for the tested cases;
+- straight-cylinder default, axial, and lateral simulation runtime is verified
+  for seeds 11, 22, and 33;
+- collision-free behavior is verified only for the tested target/seed matrix;
 - quantitative evaluation is verified;
-- broad multi-target robustness is not verified;
+- axial safety-margin robustness is not accepted as complete;
 - sampled reachability is only a simulation sanity check;
-- deadline overrun remains `100%`;
+- timing measurements remain descriptive performance output and should continue
+  to be reported;
+- real-time execution is not a prerequisite for current software-simulation
+  navigation acceptance;
+- deadline overrun remains about `100%`;
 - real-time capability is false;
 - physical accuracy is not verified;
 - hardware deployment is not verified.

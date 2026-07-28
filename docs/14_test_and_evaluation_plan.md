@@ -227,10 +227,12 @@ software experiments are still required.
 
 ## Milestone 6A cylindrical-lumen navigation evaluation
 
-Status: implemented and verified for the default straight-cylinder
-software-simulation point-goal target. Broad multi-target robustness, real-time
-capability, physical accuracy, anatomical navigation, and hardware deployment
-are not verified.
+Status: implemented for straight-cylinder software-simulation point-goal
+navigation. Milestone 6A verified the default target; Milestone 6A.1 verified
+the default, axial, and lateral exact-target repeatability matrix with the
+unchanged `cylinder_fast` profile at a `25.0 s` formal evaluation duration.
+Real-time capability, physical accuracy, anatomical navigation, and hardware
+deployment are not verified.
 
 Implemented evaluation coverage:
 
@@ -317,23 +319,57 @@ Aggregate default-target evidence:
 - worst minimum clearance: `0.002732 m`;
 - total collisions: `0`.
 
-Additional target evidence:
+Historical additional-target diagnostics:
 
-- axial target `[0.019, 0.000, 0.105] m`: valid, deterministic sampled-
-  reachability check passed, collision-free, final error `0.003776 m`, did not
-  meet the `0.003 m` goal tolerance within `20 s`;
-- lateral target `[0.010, 0.012, 0.095] m`: valid, deterministic sampled-
-  reachability check passed, collision-free, final error `0.004218 m`, did not
-  meet the `0.003 m` goal tolerance within `20 s`.
+- pre-6A.1 axial and lateral 20 s diagnostics were collision-free but did not
+  satisfy the `0.003 m` goal tolerance;
+- those diagnostics predate the target-identity hardening and are superseded by
+  the exact-target Milestone 6A.1 matrix below.
+
+Milestone 6A.1 exact-target repeatability evidence:
+
+- target-identity fix commit:
+  `8288fce6ec443f45ab3e264b82b15efa2e1d6f75`;
+- requested targets are never silently replaced;
+- sampled reachability is diagnostic only and does not alter the executed
+  target;
+- published reference targets are verified against requested targets;
+- no new robust profile was required and parameter tuning was not justified;
+- unchanged `cylinder_fast`, formal duration `25.0 s`, seeds 11, 22, and 33;
+- 9 MPPI candidate runs across three targets;
+- 9/9 target-reaching success;
+- 9/9 valid zero-command baseline comparisons;
+- 0 radial collisions;
+- 0 inlet/outlet collisions;
+- 0 cleanup failures;
+- all generated JSON files strict-parsed successfully.
+
+Milestone 6A.1 target aggregates:
+
+| Target | Success | Mean final error (m) | Mean RMSE (m) | Worst physical clearance (m) | Full safety margin | Collisions |
+|---|---:|---:|---:|---:|---|---:|
+| Default `[0.015, 0.005, 0.100]` | 3/3 | 0.000328 | 0.011158 | 0.002683 | maintained in all runs | 0 |
+| Axial `[0.019, 0.000, 0.105]` | 3/3 | 0.000453 | 0.012965 | 0.001707 | not maintained in 3/3 runs; violation duration 5.60 s | 0 |
+| Lateral `[0.010, 0.012, 0.095]` | 3/3 | 0.001744 | 0.012276 | 0.003712 | maintained in all runs | 0 |
+
+Overall Milestone 6A.1 aggregate:
+
+- success: `9/9`;
+- mean final error: `0.000842 m`;
+- mean RMSE: `0.012133 m`;
+- mean time to goal: `20.40 s`;
+- mean solve time: `0.1339 s`;
+- mean command rate: `7.38 Hz`;
+- no collision, invalid comparison, or process-cleanup failure.
 
 Milestone 6A test interpretation:
 
 - deterministic software-simulation orchestration is verified;
 - quantitative baseline/candidate comparison is verified;
-- default-target collision-free point-goal behavior is verified for the tested
-  seeds;
-- broad target robustness is not verified;
+- collision-free point-goal behavior is repeatably verified for the tested
+  straight-cylinder target/seed matrix;
 - sampled reachability is only a simulation sanity check;
+- axial safety-margin robustness remains a follow-up;
 - deadline overrun remains `100%`;
 - real-time capability, physical validation, and hardware validation remain
   false.

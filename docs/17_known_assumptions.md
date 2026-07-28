@@ -164,19 +164,32 @@
     `15000`, control weight `0.005`, and smoothness weight `0.01`. It is not a
     real-time or optimal-control certification profile.
 
-48. Milestone 6A sampled reachability is a deterministic approximate-model
-    sanity check. It does not prove formal kinematic reachability or guarantee
-    that the controller will reach every sampled-reachable target.
+48. Milestone 6A/6A.1 sampled reachability is a deterministic approximate-
+    model sanity check. It does not prove formal kinematic reachability or
+    guarantee that the controller will reach every sampled-reachable target.
+    The Milestone 6A.1 target-identity fix makes this diagnostic non-mutating:
+    requested targets are never silently replaced by a sampled or suggested
+    target.
 
 49. Milestone 6A verifies whole-backbone cylinder containment for an analytical
     straight lumen in simulation. It does not verify curved-lumen, obstacle-map,
     anatomical-mesh, tactile-contact, safety-retreat, physical-validation, or
     hardware behavior.
 
-50. Milestone 6A default-target runs demonstrate functional integration,
-    quantitative evaluation, and collision-free behavior for the tested seeds
-    only. They do not demonstrate broad target robustness.
+50. Milestone 6A.1 runs demonstrate functional integration, quantitative
+    evaluation, exact-target identity, and collision-free behavior for the
+    tested straight-cylinder target/seed matrix: default, axial, and lateral
+    targets with seeds 11, 22, and 33. They do not demonstrate curved-lumen,
+    obstacle, anatomical, physical, or hardware robustness.
 
-51. Milestone 6A timing remains non-real-time. The default-target runs measured
-    mean solve time around `0.133-0.139 s` against a `0.10 s` controller period,
-    and deadline overrun remained `100%`.
+51. Milestone 6A.1 timing remains non-real-time. The repeatability matrix
+    measured mean solve time around `0.1339 s` against a `0.10 s` controller
+    period, mean command rate around `7.38 Hz`, and deadline overrun remained
+    about `100%`. Timing measurements remain descriptive performance output;
+    real-time execution is not a prerequisite for current software-simulation
+    navigation acceptance.
+
+52. The verified axial target runs are physically collision-free but do not
+    maintain the full configured `0.002 m` safety margin. Axial safety-margin
+    robustness remains a simulation follow-up separate from target-reaching
+    success and collision-free acceptance.
