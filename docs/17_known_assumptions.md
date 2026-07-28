@@ -148,3 +148,35 @@
 44. Concurrent `ctr_run_evaluation` invocations assume ROS_DOMAIN_ID selection
     does not collide in practice. A deterministic cross-process reservation or
     locking mechanism remains unresolved.
+
+45. Milestone 6A straight-cylinder parameters are provisional
+    software-simulation defaults: radius `0.030 m`, length `0.120 m`, CTR outer
+    radius `0.0015 m`, and safety margin `0.0020 m`. They are not measured
+    physical CTR, tube, anatomical, or hardware parameters.
+
+46. The Milestone 6A default point goal `[0.015, 0.005, 0.100] m`, tolerance
+    `0.003 m`, and required hold duration `0.5 s` are software-simulation
+    acceptance values, not physical task requirements.
+
+47. The `cylinder_fast` profile is a bounded software-simulation profile with
+    36 samples, horizon 7, rollout `dt` `0.55 s`, controller period `0.10 s`,
+    insertion noise `0.003`, rotation noise `0.100`, tip and terminal weights
+    `15000`, control weight `0.005`, and smoothness weight `0.01`. It is not a
+    real-time or optimal-control certification profile.
+
+48. Milestone 6A sampled reachability is a deterministic approximate-model
+    sanity check. It does not prove formal kinematic reachability or guarantee
+    that the controller will reach every sampled-reachable target.
+
+49. Milestone 6A verifies whole-backbone cylinder containment for an analytical
+    straight lumen in simulation. It does not verify curved-lumen, obstacle-map,
+    anatomical-mesh, tactile-contact, safety-retreat, physical-validation, or
+    hardware behavior.
+
+50. Milestone 6A default-target runs demonstrate functional integration,
+    quantitative evaluation, and collision-free behavior for the tested seeds
+    only. They do not demonstrate broad target robustness.
+
+51. Milestone 6A timing remains non-real-time. The default-target runs measured
+    mean solve time around `0.133-0.139 s` against a `0.10 s` controller period,
+    and deadline overrun remained `100%`.

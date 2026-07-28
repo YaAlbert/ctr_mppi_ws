@@ -344,6 +344,113 @@ Scope exclusions still apply:
 - shape weight changes behavior;
 - full backbone can be controlled, not only the tip.
 
+### Milestone 6A: Straight cylindrical-lumen point-goal navigation
+
+Acceptance status: satisfied for the default straight-cylinder
+software-simulation target. Multi-target robustness, real-time capability,
+physical accuracy, anatomical navigation, and hardware deployment are not
+accepted as complete.
+
+Accepted implemented functions:
+
+- straight analytical cylindrical lumen;
+- arbitrary normalized cylinder axis;
+- complete-backbone radial and inlet/outlet end-cap validation;
+- CTR outer-radius-aware clearance;
+- safety-margin evaluation;
+- invalid target rejection without silent clamping;
+- whole-backbone MPPI running cost;
+- whole-final-backbone terminal collision surcharge;
+- cylinder visualization;
+- target and closest-point visualization;
+- cylinder-navigation metrics;
+- automatic baseline/candidate evaluation;
+- automatic CSV, strict JSON, Markdown, and plot outputs.
+
+Accepted provisional software-simulation defaults:
+
+- radius: `0.030 m`;
+- length: `0.120 m`;
+- CTR outer radius: `0.0015 m`;
+- safety margin: `0.0020 m`;
+- default target: `[0.015, 0.005, 0.100] m`;
+- goal tolerance: `0.003 m`;
+- required hold duration: `0.5 s`.
+
+These defaults are not measured physical or anatomical parameters.
+
+Accepted `cylinder_fast` software-simulation profile:
+
+- samples: `36`;
+- horizon: `7`;
+- rollout `dt`: `0.55 s`;
+- controller period: `0.10 s`;
+- insertion noise: `0.003`;
+- rotation noise: `0.100`;
+- tip and terminal weights: `15000`;
+- control weight: `0.005`;
+- smoothness weight: `0.01`.
+
+This profile is not accepted as a real-time or optimal-control certification
+profile.
+
+Accepted verification evidence:
+
+- `git diff --check` passed;
+- `ctr_mppi_controller`: 121 tests passed;
+- `ctr_model`: 3 tests passed;
+- `ctr_sim`: 4 tests passed;
+- `ctr_evaluation`: 107 tests passed;
+- `ctr_bringup`: 44 tests passed;
+- total focused tests: 279 passed;
+- direct cylindrical-lumen tests: 28 passed;
+- clean isolated 11-package build passed before the final Python-only terminal
+  whole-backbone collision-cost correction;
+- terminal whole-backbone correction passed focused tests and an offline
+  deterministic verification;
+- strict JSON passed;
+- no hardware node started;
+- process cleanup was clean.
+
+Accepted default-target runtime evidence for `[0.015, 0.005, 0.100] m`:
+
+| Seed | Success | Final error (m) | RMSE (m) | Time to goal (s) | Hold (s) | Min clearance (m) | Collisions | Mean solve (s) | Command rate (Hz) | RMSE improvement |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 11 | true | 0.001902 | 0.012120 | 18.91 | 1.08 | 0.003319 | 0 | 0.133 | 7.41 | 42.39% |
+| 22 | true | 0.002263 | 0.013147 | 19.45 | 0.54 | 0.002732 | 0 | 0.138 | 7.14 | 37.51% |
+| 33 | true | 0.000222 | 0.011970 | 17.31 | 2.68 | 0.003442 | 0 | 0.139 | 7.10 | 43.11% |
+
+Accepted aggregate default-target evidence:
+
+- success rate: `3/3`;
+- mean final error: `0.001462 m`;
+- final-error standard deviation: `0.001089 m`;
+- mean RMSE: `0.012412 m`;
+- worst minimum clearance: `0.002732 m`;
+- total collisions: `0`.
+
+Additional-target evidence is not accepted as goal-success completion:
+
+- axial target `[0.019, 0.000, 0.105] m` was valid, sampled reachable, and
+  collision-free, but final error was `0.003776 m` and the target did not meet
+  the `0.003 m` goal tolerance within `20 s`;
+- lateral target `[0.010, 0.012, 0.095] m` was valid, sampled reachable, and
+  collision-free, but final error was `0.004218 m` and the target did not meet
+  the `0.003 m` goal tolerance within `20 s`.
+
+Acceptance caveats:
+
+- Milestone 6A is functionally integrated;
+- default-target simulation runtime is verified;
+- collision-free behavior is verified only for the tested cases;
+- quantitative evaluation is verified;
+- broad multi-target robustness is not verified;
+- sampled reachability is only a simulation sanity check;
+- deadline overrun remains `100%`;
+- real-time capability is false;
+- physical accuracy is not verified;
+- hardware deployment is not verified.
+
 ## Milestone 7
 
 - minimum distance is calculated;

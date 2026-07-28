@@ -222,6 +222,108 @@ Current limitations:
 
 ## Milestone 6: Whole-body control
 
+### Milestone 6A: Straight cylindrical-lumen point-goal navigation
+
+Status: functionally integrated and runtime verified for the default
+software-simulation target. Broad multi-target robustness, real-time behavior,
+physical accuracy, anatomical navigation, and hardware deployment are not
+verified.
+
+Milestone 6A implements:
+
+- straight analytical cylindrical lumen geometry;
+- arbitrary normalized cylinder axis;
+- complete-backbone radial and inlet/outlet end-cap validation;
+- CTR outer-radius-aware clearance;
+- safety-margin evaluation;
+- target validation with rejection of invalid targets rather than silent
+  clamping;
+- whole-backbone MPPI running cost;
+- whole-final-backbone terminal collision surcharge;
+- cylinder visualization;
+- target and closest-backbone-point visualization;
+- cylinder-navigation goal, lumen-safety, motion, timing, and data-quality
+  metrics;
+- automatic zero-command baseline and MPPI candidate evaluation;
+- automatic CSV, strict JSON, Markdown, and plot outputs.
+
+Provisional software-simulation defaults:
+
+- cylinder radius: `0.030 m`;
+- cylinder length: `0.120 m`;
+- CTR outer radius: `0.0015 m`;
+- safety margin: `0.0020 m`;
+- default target: `[0.015, 0.005, 0.100] m`;
+- goal tolerance: `0.003 m`;
+- required hold duration: `0.5 s`.
+
+These defaults are not measured physical CTR, anatomical, or hardware
+parameters.
+
+The `cylinder_fast` profile is a bounded software-simulation profile, not a
+real-time or optimal-control certification profile:
+
+- samples: `36`;
+- horizon: `7`;
+- rollout `dt`: `0.55 s`;
+- controller period: `0.10 s`;
+- insertion noise: `0.003`;
+- rotation noise: `0.100`;
+- tip and terminal weights: `15000`;
+- control weight: `0.005`;
+- smoothness weight: `0.01`.
+
+Verification evidence:
+
+- `git diff --check` passed;
+- `ctr_mppi_controller`: 121 tests passed;
+- `ctr_model`: 3 tests passed;
+- `ctr_sim`: 4 tests passed;
+- `ctr_evaluation`: 107 tests passed;
+- `ctr_bringup`: 44 tests passed;
+- total focused tests: 279 passed;
+- direct cylindrical-lumen tests: 28 passed;
+- a clean isolated 11-package build passed before the final Python-only
+  terminal whole-backbone collision-cost correction;
+- the terminal whole-backbone correction passed focused tests and an offline
+  deterministic verification;
+- strict JSON verification passed;
+- no hardware node started;
+- process cleanup was clean.
+
+Default target `[0.015, 0.005, 0.100] m` runtime results:
+
+| Seed | Success | Final error (m) | RMSE (m) | Time to goal (s) | Hold (s) | Min clearance (m) | Collisions | Mean solve (s) | Command rate (Hz) | RMSE improvement |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 11 | true | 0.001902 | 0.012120 | 18.91 | 1.08 | 0.003319 | 0 | 0.133 | 7.41 | 42.39% |
+| 22 | true | 0.002263 | 0.013147 | 19.45 | 0.54 | 0.002732 | 0 | 0.138 | 7.14 | 37.51% |
+| 33 | true | 0.000222 | 0.011970 | 17.31 | 2.68 | 0.003442 | 0 | 0.139 | 7.10 | 43.11% |
+
+Aggregate default-target results:
+
+- success rate: `3/3`;
+- mean final error: `0.001462 m`;
+- final-error standard deviation: `0.001089 m`;
+- mean RMSE: `0.012412 m`;
+- worst minimum clearance: `0.002732 m`;
+- total collisions: `0`.
+
+Additional target results:
+
+- axial target `[0.019, 0.000, 0.105] m`: valid, deterministic sampled-
+  reachability check passed, collision-free, final error `0.003776 m`, did not
+  meet the `0.003 m` goal tolerance within `20 s`;
+- lateral target `[0.010, 0.012, 0.095] m`: valid, deterministic sampled-
+  reachability check passed, collision-free, final error `0.004218 m`, did not
+  meet the `0.003 m` goal tolerance within `20 s`.
+
+Milestone 6A demonstrates functional integration, default-target simulation
+runtime verification, quantitative evaluation, and collision-free behavior for
+the tested cases only. Sampled reachability is a deterministic simulation sanity
+check, not a proof of reachability. Deadline overrun remains `100%`, real-time
+capability is false, physical accuracy is not verified, and hardware deployment
+is not verified.
+
 - reference backbone;
 - backbone resampling;
 - shape cost;

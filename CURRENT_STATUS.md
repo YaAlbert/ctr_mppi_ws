@@ -5,9 +5,10 @@ Last updated: 2026-07-28
 Status source: current Ubuntu 22.04 repository audit, focused test results,
 clean isolated build results, Milestone 4 foreground ROS2 runtime smoke test,
 Milestone 5 bounded simulation-only trajectory smoke tests, committed
-Milestone 5D quantitative evaluation framework, and committed Milestone 5D.1
-deterministic matched-run orchestration. Documentation only was updated for
-this status refresh.
+Milestone 5D quantitative evaluation framework, committed Milestone 5D.1
+deterministic matched-run orchestration, and Milestone 6A straight cylindrical
+lumen navigation verification. Documentation only was updated for this status
+refresh.
 
 The current Ubuntu repository and runtime environment are the operational
 source of truth. Earlier Windows-created work is treated as historical project
@@ -21,17 +22,18 @@ assets unless it has been verified in the current Ubuntu environment.
 - `ros2`: available at `/opt/ros/humble/bin/ros2`.
 - `colcon`: available at `/usr/bin/colcon`.
 - `pip3` and `python3 -m pip`: not available in the current environment.
-- Latest Milestone 5D.1 clean isolated build result: 11 packages finished
-  successfully before the final Python-only experiment-group/path-containment
-  fix. The final fix changed only `run_evaluation.py` and
-  `test_run_evaluation.py`; focused tests passed after that fix.
-- Latest focused verification: `git diff --check` passed and 214 focused
-  package tests passed across `ctr_evaluation`, `ctr_mppi_controller`,
-  `ctr_bringup`, and `ctr_sim`.
-- Latest matched runtime evidence: two complete circle baseline/candidate
-  pairs ran through `ctr_run_evaluation` with valid compatibility, strict JSON
-  outputs, clean process cleanup, no hardware node, and no orphan or zombie
-  project process.
+- Latest Milestone 6A clean isolated build result: 11 packages finished
+  successfully before the final Python-only terminal whole-backbone
+  collision-cost correction. The final correction changed only
+  `cylindrical_lumen.py` and `test_cylindrical_lumen.py`; focused tests passed
+  after that correction.
+- Latest focused verification: `git diff --check` passed and 279 focused
+  package tests passed across `ctr_mppi_controller`, `ctr_model`, `ctr_sim`,
+  `ctr_evaluation`, and `ctr_bringup`.
+- Latest matched runtime evidence: Milestone 6A default-target cylinder
+  navigation ran three deterministic baseline/candidate pairs with valid
+  comparisons, strict JSON outputs, clean process cleanup, no hardware node,
+  and no orphan or zombie project process.
 - Conventional ROS2 Humble guarded shutdown is in use for the Milestone 4
   simulation path. No custom SIGINT handler, SIGINT masking, or forced
   `KeyboardInterrupt` remains.
@@ -95,6 +97,10 @@ assets unless it has been verified in the current Ubuntu environment.
   - The `ctr_run_evaluation` CLI implements deterministic matched
     zero-command baseline and MPPI candidate orchestration for the verified
     software-simulation workflow.
+  - Milestone 6A implements straight analytical cylindrical-lumen point-goal
+    navigation in simulation with whole-backbone MPPI lumen costs,
+    whole-final-backbone terminal collision surcharge, cylinder visualization,
+    and cylinder-navigation evaluation metrics.
   - Milestone 5 trajectory tracking is not performance verified, not real-time
     capable, not physically validated, and not hardware validated.
   - MPPI shape, obstacle, tactile-force, and stability behavior is not
@@ -171,6 +177,7 @@ assets unless it has been verified in the current Ubuntu environment.
 | Milestone 5: tip trajectory tracking | Functionally integrated and runtime smoke verified; performance not verified | Focused tests passed: `ctr_mppi_controller` 77, `ctr_bringup` 25, `ctr_sim` 4, total 106; clean isolated build finished all 11 packages; 12 s circle, ellipse, and helix simulation-only runtime paths executed; `/ctr/reference/path`, `/ctr/reference/horizon`, `/ctr/reference/tip`, and `/ctr/controller/trajectory_metrics` published; commands were finite and within configured limits; no hardware node started; launch exited with code 0 and no residual project process or zombie remained | Real-time trajectory control is not verified; controller significantly overruns the configured 0.05 s period; timestamp-aligned metrics, stronger baseline synchronization, nontrivial trajectory experiments, MPPI profiling/optimization, and physical validation remain unresolved |
 | Milestone 5D: quantitative evaluation framework | Functionally complete for software-simulation quantitative evaluation | Commit `59342a3`; observation-only evaluator; Start/Stop lifecycle; timestamped recording; alignment; strict JSON/YAML/CSV/Markdown/plot outputs; baseline comparison; repeated-trial aggregation; lifecycle, finalization, strict JSON, control-effort, and launch-default guards verified | Real-time, physical, and hardware validation remain unresolved; command-application timestamp and individual horizon-point timestamps are not available |
 | Milestone 5D.1: deterministic matched-run orchestration | Functionally complete for software-simulation matched baseline/candidate orchestration | Commit `40c659159b37f49651fa9ea05ae2c6ddf07a2deb`; `ctr_run_evaluation`; 94 `ctr_evaluation`, 82 `ctr_mppi_controller`, 34 `ctr_bringup`, and 4 `ctr_sim` tests passed; two matched circle pairs passed compatibility with initial q/tip differences of `0.0` and clean process cleanup | Meaningful tracking improvement is not verified; MPPI remains non-real-time with 100% deadline overrun; stronger circle/ellipse/helix repeated batches and physical/hardware validation remain required |
+| Milestone 6A: straight cylindrical-lumen point-goal navigation | Functionally integrated and runtime verified for the default software-simulation target | Straight analytical cylindrical lumen with arbitrary normalized axis, CTR outer-radius-aware clearance, complete-backbone radial/end-cap validation, safety-margin evaluation, whole-backbone MPPI running cost, whole-final-backbone terminal collision surcharge, cylinder/target/closest-point visualization, cylinder-navigation metrics, and automatic baseline/candidate evaluation; latest focused tests passed: `ctr_mppi_controller` 121, `ctr_model` 3, `ctr_sim` 4, `ctr_evaluation` 107, `ctr_bringup` 44, total 279; direct cylindrical-lumen tests 28; default target succeeded for seeds 11, 22, and 33 with zero collisions and valid comparisons | Broad multi-target robustness is not verified; axial and lateral tested targets remained collision-free but did not meet the 0.003 m goal tolerance within 20 s; deadline overrun remains 100%; real-time, physical accuracy, anatomical navigation, and hardware deployment remain unverified |
 
 ## Current implemented functions
 
@@ -223,6 +230,18 @@ assets unless it has been verified in the current Ubuntu environment.
   command-timing audit, exact result-directory identity, canonical path
   containment, `experiment_group` validation, owned process-group cleanup,
   and automatic comparison
+- [x] Straight analytical cylindrical-lumen geometry with arbitrary normalized
+  axis, CTR outer-radius-aware clearance, safety-margin evaluation, and valid
+  target rejection without silent clamping
+- [x] Complete-backbone radial and end-cap validation for cylinder navigation
+- [x] Whole-backbone MPPI running lumen cost and whole-final-backbone terminal
+  collision surcharge
+- [x] Cylinder, target, current backbone, closest-to-wall point, and collision
+  status visualization
+- [x] Cylinder-navigation goal, lumen-safety, motion, timing, and data-quality
+  metrics with automatic CSV, strict JSON, Markdown, and plot outputs
+- [x] Automatic zero-command baseline versus MPPI candidate evaluation for
+  cylinder-navigation simulation runs
 - [x] Ubuntu clean isolated `colcon build` verification for all 11 packages
 - [x] Installed ROS2 simulation launch path verified from `install_m5c_verify`
 - [x] Conventional ROS2 Humble guarded shutdown verified for
@@ -249,6 +268,69 @@ assets unless it has been verified in the current Ubuntu environment.
   - `ctr_bringup`: 34 passed.
   - `ctr_sim`: 4 passed.
   - Total focused tests: 214 passed.
+- Latest focused Milestone 6A tests passed:
+  - `ctr_mppi_controller`: 121 passed.
+  - `ctr_model`: 3 passed.
+  - `ctr_sim`: 4 passed.
+  - `ctr_evaluation`: 107 passed.
+  - `ctr_bringup`: 44 passed.
+  - Total focused tests: 279 passed.
+  - Direct cylindrical-lumen tests: 28 passed.
+  - `git diff --check`: passed.
+- Milestone 6A build and safety evidence:
+  - a clean isolated 11-package build passed before the final Python-only
+    terminal whole-backbone collision-cost correction;
+  - the terminal whole-backbone correction passed focused tests and an offline
+    deterministic verification;
+  - strict JSON verification passed;
+  - no hardware node started;
+  - process cleanup was clean.
+- Milestone 6A provisional software-simulation defaults:
+  - straight-cylinder radius `0.030 m`;
+  - length `0.120 m`;
+  - CTR outer radius `0.0015 m`;
+  - safety margin `0.0020 m`;
+  - default target `[0.015, 0.005, 0.100] m`;
+  - goal tolerance `0.003 m`;
+  - required hold duration `0.5 s`.
+  These values are not measured physical CTR, anatomical, or hardware
+  parameters.
+- Milestone 6A `cylinder_fast` software-simulation profile:
+  - samples `36`;
+  - horizon `7`;
+  - rollout `dt` `0.55 s`;
+  - controller period `0.10 s`;
+  - insertion noise `0.003`;
+  - rotation noise `0.100`;
+  - tip and terminal weights `15000`;
+  - control weight `0.005`;
+  - smoothness weight `0.01`.
+  This profile is for bounded software-simulation testing, not real-time or
+  optimal-control certification.
+- Milestone 6A default-target runtime evidence for target
+  `[0.015, 0.005, 0.100] m`:
+  - seed 11: success `true`, final error `0.001902 m`, RMSE `0.012120 m`,
+    time to goal `18.91 s`, hold duration `1.08 s`, minimum clearance
+    `0.003319 m`, collision count `0`, mean solve time `0.133 s`, command rate
+    `7.41 Hz`, RMSE improvement `42.39%`;
+  - seed 22: success `true`, final error `0.002263 m`, RMSE `0.013147 m`,
+    time to goal `19.45 s`, hold duration `0.54 s`, minimum clearance
+    `0.002732 m`, collision count `0`, mean solve time `0.138 s`, command rate
+    `7.14 Hz`, RMSE improvement `37.51%`;
+  - seed 33: success `true`, final error `0.000222 m`, RMSE `0.011970 m`,
+    time to goal `17.31 s`, hold duration `2.68 s`, minimum clearance
+    `0.003442 m`, collision count `0`, mean solve time `0.139 s`, command rate
+    `7.10 Hz`, RMSE improvement `43.11%`;
+  - aggregate: success rate `3/3`, mean final error `0.001462 m`, final-error
+    standard deviation `0.001089 m`, mean RMSE `0.012412 m`, worst minimum
+    clearance `0.002732 m`, total collisions `0`.
+- Milestone 6A additional-target runtime evidence:
+  - axial target `[0.019, 0.000, 0.105] m`: valid, deterministic sampled-
+    reachability check passed, collision-free, final error `0.003776 m`, did
+    not meet the `0.003 m` goal tolerance within `20 s`;
+  - lateral target `[0.010, 0.012, 0.095] m`: valid, deterministic sampled-
+    reachability check passed, collision-free, final error `0.004218 m`, did
+    not meet the `0.003 m` goal tolerance within `20 s`.
 - Milestone 5D.1 build evidence:
   - a clean isolated 11-package build passed before the final Python-only
     experiment-group/path-containment fix;
@@ -346,20 +428,20 @@ assets unless it has been verified in the current Ubuntu environment.
 
 ## Current priority
 
-Milestone 5D and Milestone 5D.1 are functionally complete for
-software-simulation quantitative evaluation and deterministic matched
-baseline/candidate orchestration. Two matched circle comparisons passed
-compatibility validation. The measured MPPI improvement was negligible,
-deadline overrun remained 100%, and real-time, physical, and hardware
-validation remain unresolved.
+Milestone 6A is functionally integrated for straight cylindrical-lumen
+point-goal navigation in software simulation. The default target passed three
+deterministic matched baseline/candidate evaluations with valid comparisons,
+zero collisions, strict JSON outputs, and clean process cleanup. Collision-free
+behavior is verified only for the tested cases.
 
-The two matched runs demonstrate deterministic evaluation orchestration,
-repeatability, and valid comparison conditions. They do not demonstrate
-meaningful tracking improvement, real-time performance, physical accuracy, or
-hardware readiness. The next safe task is a documentation-only commit for
-Milestone 5D/5D.1, followed by MPPI profiling and stronger nontrivial repeated
-software experiments. Keep hardware execution disabled until the hardware TODOs
-are resolved and separately commissioned.
+Broad multi-target robustness is not verified. The axial and lateral additional
+targets were valid, sampled reachable, and collision-free, but did not reach the
+`0.003 m` goal tolerance within `20 s`. MPPI remains non-real-time: mean solve
+time was approximately `0.133-0.139 s` against a `0.10 s` cylinder profile
+period, and deadline overrun remained `100%`. Physical accuracy, anatomical
+navigation, and hardware deployment remain unverified. The next safe technical
+task after documentation review is Milestone 6A.1 multi-target robustness, not
+hardware work.
 
 ## Current blockers
 
@@ -378,7 +460,14 @@ are resolved and separately commissioned.
 - High: config YAML files contain placeholder values without all required
   structured TODO IDs in the parameter files themselves.
 - High: MPPI solve time remains far above the configured 0.05 s control period,
-  deadline overrun remains 100%, and the controller is not real-time capable.
+  and Milestone 6A still has 100% deadline overrun against its 0.10 s cylinder
+  profile period; the controller is not real-time capable.
+- High: Milestone 6A broad multi-target robustness is not verified; the axial
+  and lateral tested targets did not satisfy the 0.003 m goal tolerance within
+  20 s.
+- High: straight-cylinder dimensions, CTR outer radius, safety margin, and
+  point-goal defaults are provisional software-simulation values, not measured
+  physical or anatomical parameters.
 - High: command/state/reference causal timing remains limited because no
   command-application timestamp exists and horizon points do not have
   individual timestamps.
