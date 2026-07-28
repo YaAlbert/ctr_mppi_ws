@@ -21,6 +21,7 @@ from ctr_mppi_controller.cylindrical_lumen import CylindricalLumen
 
 
 NO_TRANSIENT_REACHED = -1.0
+TARGET_IDENTITY_ATOL = 1.0e-9
 METRIC_DIRECTIONS = {
     "rmse": "lower",
     "mean_error": "lower",
@@ -924,7 +925,88 @@ def _orchestration_compatibility_reasons(
     details["candidate_command_after_recording"] = candidate_after_recording
     if candidate_after_recording is not True:
         reasons.append("candidate command occurred before recording or is missing")
+    if _requires_target_identity(candidate_metadata, baseline_metadata):
+        reasons.extend(_target_identity_compatibility_reasons(candidate_metadata, baseline_metadata, details))
     return reasons
+
+
+def _requires_target_identity(candidate_metadata: dict[str, Any], baseline_metadata: dict[str, Any]) -> bool:
+    for metadata in (candidate_metadata, baseline_metadata):
+        config = metadata.get("configuration", {})
+        if isinstance(config, dict):
+            goal = config.get("goal", {})
+            if config.get("cylindrical_lumen") is not None:
+                return True
+            if isinstance(goal, dict) and goal.get("position") is not None:
+                return True
+        if any(_metadata_value(metadata, key) is not None for key in ("requested_target", "executed_target", "target_replaced")):
+            return True
+    return False
+
+
+def _target_identity_compatibility_reasons(
+    candidate_metadata: dict[str, Any],
+    baseline_metadata: dict[str, Any],
+    details: dict[str, Any],
+) -> list[str]:
+    reasons: list[str] = []
+    for role, metadata in (("candidate", candidate_metadata), ("baseline", baseline_metadata)):
+        requested = _metadata_value(metadata, "requested_target")
+        executed = _metadata_value(metadata, "executed_target")
+        replaced = _metadata_value(metadata, "target_replaced")
+        identity_valid = _metadata_value(metadata, "target_identity_valid")
+        reference_matches = _metadata_value(metadata, "reference_matches_requested_target")
+        details[f"{role}_requested_target"] = requested
+        details[f"{role}_executed_target"] = executed
+        details[f"{role}_target_replaced"] = replaced
+        details[f"{role}_target_identity_valid"] = identity_valid
+        details[f"{role}_reference_matches_requested_target"] = reference_matches
+        if requested is None or executed is None or replaced is None or identity_valid is None:
+            reasons.append(f"required target identity metadata missing: {role}")
+            continue
+        if replaced is not False:
+            reasons.append(f"{role} target was replaced")
+        if identity_valid is not True:
+            reasons.append(f"{role} target identity is invalid")
+        try:
+            requested_array = _array_shape(requested, f"{role}_requested_target", (3,))
+            executed_array = _array_shape(executed, f"{role}_executed_target", (3,))
+            requested_executed_delta = float(np.linalg.norm(requested_array - executed_array))
+            details[f"{role}_requested_executed_target_difference"] = requested_executed_delta
+            if not np.allclose(requested_array, executed_array, atol=TARGET_IDENTITY_ATOL, rtol=0.0):
+                reasons.append(f"{role} requested_target differs from executed_target")
+        except ValueError:
+            reasons.append(f"{role} target identity is malformed")
+        if reference_matches is not True:
+            reasons.append(f"{role} published reference target does not match requested_target")
+
+    for key in ("requested_target", "executed_target"):
+        candidate_value = _metadata_value(candidate_metadata, key)
+        baseline_value = _metadata_value(baseline_metadata, key)
+        if candidate_value is None or baseline_value is None:
+            continue
+        try:
+            candidate_array = _array_shape(candidate_value, f"candidate_{key}", (3,))
+            baseline_array = _array_shape(baseline_value, f"baseline_{key}", (3,))
+            delta = float(np.linalg.norm(candidate_array - baseline_array))
+            details[f"baseline_candidate_{key}_difference"] = delta
+            if not np.allclose(candidate_array, baseline_array, atol=TARGET_IDENTITY_ATOL, rtol=0.0):
+                reasons.append(f"baseline and candidate {key} differ")
+        except ValueError:
+            reasons.append(f"baseline/candidate {key} is malformed")
+    return reasons
+
+
+def _metadata_value(metadata: dict[str, Any], key: str) -> Any:
+    if key in metadata:
+        return metadata[key]
+    override = metadata.get("metadata_override", {})
+    if isinstance(override, dict) and key in override:
+        return override[key]
+    runtime = metadata.get("orchestration_runtime", {})
+    if isinstance(runtime, dict) and key in runtime:
+        return runtime[key]
+    return None
 
 
 def _orchestration_tip_tolerance(

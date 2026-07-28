@@ -1156,6 +1156,16 @@ def promoted_orchestration_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "pre_roll_nonzero_command_count",
         "unexpected_command_publishers",
         "command_zero_tolerance",
+        "requested_target",
+        "executed_target",
+        "target_replaced",
+        "target_identity_valid",
+        "target_identity_tolerance",
+        "sampled_reachability_confirmed",
+        "sampled_reachability_method",
+        "sampled_reachability_seed",
+        "sampled_reachability_sample_count",
+        "suggested_target",
     )
     return {key: metadata[key] for key in keys if key in metadata}
 

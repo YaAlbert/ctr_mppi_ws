@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import signal
 import subprocess
+import sys
 import time
 import traceback
 from typing import Any, Callable
@@ -46,6 +47,7 @@ CONFIG_NAMES = (
 COMMAND_TOPICS = ("/ctr/mppi_command", "/ctr/safe_command")
 EXPERIMENT_GROUP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 MAX_EXPERIMENT_GROUP_LENGTH = 128
+TARGET_IDENTITY_ATOL = 1.0e-9
 RUN_STARTED_RE = re.compile(r"started evaluation run (?P<run_id>[A-Za-z0-9_-]+)")
 RUN_COMPLETED_RE = re.compile(r"completed evaluation run (?P<run_id>[A-Za-z0-9_-]+): (?P<path>.+)$")
 
@@ -193,6 +195,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--duration", type=float, required=True)
     parser.add_argument("--runtime-mode", default="simulation")
     parser.add_argument("--require-improvement", action="store_true")
+    parser.add_argument("--require-sampled-reachable", action="store_true")
     parser.add_argument("--output-root", default="")
     parser.add_argument("--config-path", action="append", default=[])
     return parser.parse_args(argv)
@@ -253,7 +256,19 @@ class EvaluationOrchestrator:
 
     def run_pair(self) -> dict[str, Any]:
         baseline = self._run_one(role="baseline", controller_label=self.args.baseline, baseline_dir=None)
+        if self.args.task == "cylinder_navigation":
+            validate_target_identity_metadata(
+                {**baseline.metadata, **baseline.orchestration},
+                expected_target=self._target_position_for_launch(),
+                label="baseline",
+            )
         candidate = self._run_one(role="candidate", controller_label=self.args.candidate, baseline_dir=baseline.run_dir)
+        if self.args.task == "cylinder_navigation":
+            validate_target_identity_metadata(
+                {**candidate.metadata, **candidate.orchestration},
+                expected_target=self._target_position_for_launch(),
+                label="candidate",
+            )
         comparison = compare_result_dirs(
             candidate_dir=candidate.run_dir,
             baseline_dir=baseline.run_dir,
@@ -365,6 +380,8 @@ class EvaluationOrchestrator:
                 reference_command.extend(self._cylinder_launch_arguments())
             records.append(self.process_manager.start(role=f"{role}_reference", command=reference_command, env=env))
             monitor.wait_for_reference(self.settings.reference_ready_timeout, require_horizon=self.args.task == "trajectory")
+            if self.args.task == "cylinder_navigation":
+                monitor.verify_fixed_reference_target(self._target_position_for_launch(), TARGET_IDENTITY_ATOL)
             if role == "baseline" and self.args.task == "trajectory":
                 monitor.verify_pre_epoch_reference(
                     reference_epoch,
@@ -492,6 +509,7 @@ class EvaluationOrchestrator:
         controller_hash = build_controller_configuration_hash(self.project_config, controller_label)
         reference_start_policy = "fixed_target_window_epoch" if self.args.task == "cylinder_navigation" else "scheduled_time"
         reference_pre_epoch_behavior = "fixed_target_ready" if self.args.task == "cylinder_navigation" else "first_trajectory_point"
+        target_identity = self._target_identity_metadata()
         return {
             "requested_run_id": run_id,
             "orchestration_id": self.orchestration_id,
@@ -526,6 +544,7 @@ class EvaluationOrchestrator:
             "pre_roll_command_message_count": len(audit.events),
             "pre_roll_nonzero_command_count": audit.nonzero_count(self.settings.command_zero_tolerance),
             "unexpected_command_publishers": unexpected_command_publishers(publisher_counts),
+            **target_identity,
             "reference_configuration": {
                 "task": self.args.task,
                 "reference_mode": "fixed_target" if self.args.task == "cylinder_navigation" else "trajectory",
@@ -547,6 +566,30 @@ class EvaluationOrchestrator:
         if self.args.task != "cylinder_navigation":
             return []
         return [float(value) for value in goal_position_from_config(self.project_config)]
+
+    def _target_identity_metadata(self) -> dict[str, Any]:
+        if self.args.task != "cylinder_navigation":
+            return {}
+        requested = self.cylinder_setup.get("requested_target", self._target_position_for_launch())
+        executed = self.cylinder_setup.get("executed_target", self._target_position_for_launch())
+        identity = {
+            "requested_target": [float(value) for value in requested],
+            "executed_target": [float(value) for value in executed],
+            "target_replaced": bool(self.cylinder_setup.get("target_replaced", False)),
+            "target_identity_valid": bool(self.cylinder_setup.get("target_identity_valid", False)),
+            "target_identity_tolerance": TARGET_IDENTITY_ATOL,
+        }
+        reachability = self.cylinder_setup.get("reachability", {})
+        for key in (
+            "sampled_reachability_confirmed",
+            "sampled_reachability_method",
+            "sampled_reachability_seed",
+            "sampled_reachability_sample_count",
+            "suggested_target",
+        ):
+            if key in reachability:
+                identity[key] = reachability[key]
+        return identity
 
     def _cylinder_launch_arguments(self) -> list[str]:
         target = self._target_position_for_launch()
@@ -583,26 +626,35 @@ class EvaluationOrchestrator:
             target=target,
             tolerance=goal_tolerance_from_config(self.project_config),
         )
+        reachability["sampled_reachability_confirmed"] = bool(reachability["reachable"])
+        reachability["sampled_reachability_method"] = "deterministic_sampling"
+        reachability["sampled_reachability_seed"] = reachability.get("random_seed")
+        reachability["sampled_reachability_sample_count"] = reachability.get("random_sample_count")
         if not reachability["reachable"]:
-            replacement = lumen.nearest_valid_target(reachability["best_tip"])
-            replacement_validation = lumen.validate_target(replacement, frame_id=self.project_config["goal"].get("frame_id"))
-            if not replacement_validation.valid:
-                raise OrchestrationError(f"configured cylinder target is unreachable: {reachability}")
-            self.project_config = config_with_cylinder_overrides(
-                self.project_config,
-                enabled=True,
-                target_position=replacement,
-                mppi_profile=self.args.mppi_profile,
-                random_seed="" if self.args.seed is None else self.args.seed,
+            if self.args.require_sampled_reachable:
+                raise OrchestrationError(
+                    "sampled reachability was not confirmed for the requested cylinder target; "
+                    "strict mode refuses to launch without replacing the target"
+                )
+            suggested = lumen.nearest_valid_target(reachability["best_tip"]) if reachability.get("best_tip") else target
+            reachability["suggested_target"] = [float(value) for value in suggested]
+            print(
+                "WARNING: sampled reachability was not confirmed for the requested cylinder target; "
+                "continuing with the exact requested target because sampled reachability is a sanity check only.",
+                file=sys.stderr,
             )
-            reachability["requested_target_replaced"] = True
-            reachability["replacement_target"] = [float(value) for value in replacement]
         else:
-            reachability["requested_target_replaced"] = False
-            reachability["replacement_target"] = None
+            reachability["suggested_target"] = None
+        reachability["requested_target_replaced"] = False
+        reachability["replacement_target"] = None
+        target_list = [float(value) for value in target]
         return {
             "initial_backbone_minimum_clearance": initial_clearance.minimum_radial_clearance,
             "initial_tip": [float(value) for value in initial.tip_position],
+            "requested_target": target_list,
+            "executed_target": list(target_list),
+            "target_replaced": False,
+            "target_identity_valid": True,
             "target_validation": {"valid": validation.valid, "reasons": validation.reasons},
             "reachability": reachability,
         }
@@ -625,7 +677,7 @@ class EvaluationOrchestrator:
         if metadata_path.is_file():
             metadata = read_yaml(metadata_path)
             reference_epoch = metadata.get("scheduled_reference_epoch_s")
-        return {
+        runtime_metadata = {
             "orchestration_success": True,
             "orchestration_id": self.orchestration_id,
             "run_id": run_id,
@@ -649,6 +701,10 @@ class EvaluationOrchestrator:
             ),
             "processes": [record.to_dict() for record in records],
         }
+        runtime_metadata.update(self._target_identity_metadata())
+        if self.args.task == "cylinder_navigation":
+            runtime_metadata.update(monitor.fixed_reference_target_identity(self._target_position_for_launch(), TARGET_IDENTITY_ATOL))
+        return runtime_metadata
 
 
 class RosRunMonitor:
@@ -679,6 +735,9 @@ class RosRunMonitor:
         self.reference_horizon_seen = False
         self.reference_path_seen = False
         self.latest_reference_tip_position: list[float] | None = None
+        self.latest_reference_tip_timestamp: float | None = None
+        self.first_reference_tip_position: list[float] | None = None
+        self.first_reference_tip_timestamp: float | None = None
         self.latest_reference_horizon_first: list[float] | None = None
         self.command_events: list[CommandEvent] = []
         self.state_sub = self.node.create_subscription(CtrState, "/ctr/state", self._on_state, 10)
@@ -740,6 +799,22 @@ class RosRunMonitor:
                 raise OrchestrationError(f"missing pre-epoch {label}")
             if not np.allclose(np.asarray(value, dtype=float), expected, atol=1.0e-12, rtol=0.0):
                 raise OrchestrationError(f"pre-epoch {label} does not match the first trajectory point")
+
+    def fixed_reference_target_identity(self, expected_target: Any, atol: float) -> dict[str, Any]:
+        return reference_target_identity(
+            expected_target=expected_target,
+            observed_target=self.first_reference_tip_position,
+            observed_timestamp=self.first_reference_tip_timestamp,
+            atol=atol,
+        )
+
+    def verify_fixed_reference_target(self, expected_target: Any, atol: float) -> None:
+        identity = self.fixed_reference_target_identity(expected_target, atol)
+        if identity["reference_matches_requested_target"] is not True:
+            raise OrchestrationError(
+                "published fixed reference target does not match requested cylinder target: "
+                f"{identity}"
+            )
 
     def collect_stability_samples(self, *, duration_s: float, timeout_s: float) -> list[StateTipSample]:
         samples: list[StateTipSample] = []
@@ -848,11 +923,17 @@ class RosRunMonitor:
     def _on_reference(self, kind: str, msg) -> None:
         if kind == "tip":
             self.reference_tip_seen = True
-            self.latest_reference_tip_position = [
+            position = [
                 float(msg.pose.position.x),
                 float(msg.pose.position.y),
                 float(msg.pose.position.z),
             ]
+            timestamp = stamp_seconds(msg.header.stamp)
+            self.latest_reference_tip_position = position
+            self.latest_reference_tip_timestamp = timestamp
+            if self.first_reference_tip_position is None:
+                self.first_reference_tip_position = list(position)
+                self.first_reference_tip_timestamp = timestamp
         elif kind == "horizon":
             self.reference_horizon_seen = True
             if msg.poses:
@@ -1095,6 +1176,71 @@ def candidate_after_recording(run_dir: Path, first: CommandEvent | None) -> bool
     metadata = read_yaml(run_dir / "metadata.yaml")
     start = float(metadata.get("recording_start_time_s", math.inf))
     return first.timestamp >= start
+
+
+def target_vector(value: Any, label: str) -> np.ndarray:
+    target = np.asarray(value, dtype=float)
+    if target.shape != (3,) or not np.all(np.isfinite(target)):
+        raise OrchestrationError(f"{label} must be a finite 3D target")
+    return target
+
+
+def target_vectors_equal(first: Any, second: Any, *, atol: float = TARGET_IDENTITY_ATOL) -> bool:
+    return bool(np.allclose(target_vector(first, "first target"), target_vector(second, "second target"), atol=atol, rtol=0.0))
+
+
+def reference_target_identity(*, expected_target: Any, observed_target: Any, observed_timestamp: float | None, atol: float) -> dict[str, Any]:
+    expected = target_vector(expected_target, "expected target")
+    if observed_target is None:
+        return {
+            "first_observed_reference_target": None,
+            "reference_target_timestamp": None,
+            "reference_matches_requested_target": False,
+            "reference_target_difference": math.inf,
+            "reference_target_identity_tolerance": float(atol),
+            "reference_target_identity_reason": "missing reference target",
+        }
+    observed = target_vector(observed_target, "observed reference target")
+    difference = float(np.linalg.norm(observed - expected))
+    matches = bool(np.allclose(observed, expected, atol=float(atol), rtol=0.0))
+    return {
+        "first_observed_reference_target": [float(value) for value in observed],
+        "reference_target_timestamp": None if observed_timestamp is None else float(observed_timestamp),
+        "reference_matches_requested_target": matches,
+        "reference_target_difference": difference,
+        "reference_target_identity_tolerance": float(atol),
+        "reference_target_identity_reason": "ok" if matches else "reference target differs from requested target",
+    }
+
+
+def validate_target_identity_metadata(metadata: dict[str, Any], *, expected_target: Any, label: str) -> None:
+    requested = target_identity_value(metadata, "requested_target")
+    executed = target_identity_value(metadata, "executed_target")
+    if requested is None or executed is None:
+        raise OrchestrationError(f"{label} target identity metadata is missing")
+    if target_identity_value(metadata, "target_replaced") is not False:
+        raise OrchestrationError(f"{label} target identity reports target_replaced=true")
+    if target_identity_value(metadata, "target_identity_valid") is not True:
+        raise OrchestrationError(f"{label} target identity is not valid")
+    if not target_vectors_equal(requested, executed):
+        raise OrchestrationError(f"{label} requested_target differs from executed_target")
+    if not target_vectors_equal(requested, expected_target):
+        raise OrchestrationError(f"{label} requested_target differs from the orchestrator target")
+    reference_matches = target_identity_value(metadata, "reference_matches_requested_target")
+    if reference_matches is not None and reference_matches is not True:
+        raise OrchestrationError(f"{label} published reference target did not match requested_target")
+
+
+def target_identity_value(metadata: dict[str, Any], key: str) -> Any:
+    if key in metadata:
+        return metadata[key]
+    override = metadata.get("metadata_override", {})
+    if isinstance(override, dict) and key in override:
+        return override[key]
+    runtime = metadata.get("orchestration_runtime", {})
+    if isinstance(runtime, dict) and key in runtime:
+        return runtime[key]
+    return None
 
 
 def strict_json_file(path: Path) -> dict[str, Any]:

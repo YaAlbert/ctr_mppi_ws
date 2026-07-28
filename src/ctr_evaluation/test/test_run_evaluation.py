@@ -1,3 +1,5 @@
+import contextlib
+import io
 import math
 import os
 import signal
@@ -41,8 +43,11 @@ from ctr_evaluation.run_evaluation import (  # noqa: E402
     parse_completed_result,
     parse_started_run_id,
     process_matches,
+    reference_target_identity,
     resolve_result_dir,
     strict_json_file,
+    target_vectors_equal,
+    validate_target_identity_metadata,
     unexpected_command_publishers,
     validate_experiment_group,
     write_orchestration_failure,
@@ -139,6 +144,26 @@ def orchestrated_meta(**overrides):
     return values
 
 
+def cylinder_orchestrated_meta(**overrides):
+    target = [0.015, 0.005, 0.1]
+    values = orchestrated_meta(
+        reference_start_policy="fixed_target_window_epoch",
+        reference_pre_epoch_behavior="fixed_target_ready",
+        requested_target=list(target),
+        executed_target=list(target),
+        target_replaced=False,
+        target_identity_valid=True,
+        reference_matches_requested_target=True,
+    )
+    values["configuration"] = {
+        **values["configuration"],
+        "goal": {"position": list(target), "tolerance": 0.003, "required_hold_duration": 0.5},
+        "cylindrical_lumen": {"enabled": True},
+    }
+    values.update(overrides)
+    return values
+
+
 def write_metadata(run_dir, *, orchestration_id="orch", run_role="baseline"):
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "metadata.yaml").write_text(
@@ -190,6 +215,244 @@ class RunEvaluationHelpersTest(unittest.TestCase):
         self.assertEqual([0.015, 0.005, 0.1], args.target)
         self.assertEqual("cylinder_fast", args.mppi_profile)
         self.assertEqual(11, args.seed)
+
+    def test_require_sampled_reachable_cli_argument_parsing(self):
+        args = parse_args(
+            [
+                "--experiment-group",
+                "m6a1",
+                "--task",
+                "cylinder_navigation",
+                "--duration",
+                "8.0",
+                "--require-sampled-reachable",
+            ]
+        )
+        self.assertTrue(args.require_sampled_reachable)
+
+    def test_valid_target_is_preserved_exactly(self):
+        original = patch_reachability(
+            {
+                "reachable": True,
+                "best_error": 0.0,
+                "best_q": [0.0] * 6,
+                "best_tip": [0.015, 0.005, 0.1],
+                "tolerance": 0.003,
+                "evaluated_candidates": 1,
+                "random_sample_count": 1,
+                "random_seed": 4,
+            }
+        )
+        try:
+            orchestrator = EvaluationOrchestrator(
+                parse_args(
+                    [
+                        "--experiment-group",
+                        "target_identity",
+                        "--task",
+                        "cylinder_navigation",
+                        "--target",
+                        "0.015",
+                        "0.005",
+                        "0.100",
+                        "--duration",
+                        "8.0",
+                    ]
+                )
+            )
+        finally:
+            restore_reachability(original)
+        self.assertEqual([0.015, 0.005, 0.1], orchestrator.cylinder_setup["requested_target"])
+        self.assertEqual([0.015, 0.005, 0.1], orchestrator.cylinder_setup["executed_target"])
+        self.assertTrue(target_vectors_equal(orchestrator.cylinder_setup["requested_target"], orchestrator.cylinder_setup["executed_target"]))
+        self.assertFalse(orchestrator.cylinder_setup["target_replaced"])
+
+    def test_axial_target_is_preserved_exactly_when_sampled_check_fails(self):
+        target = [0.019, 0.0, 0.105]
+        orchestrator, stderr = make_orchestrator_with_sampled_failure(target)
+        self.assertEqual(target, orchestrator.cylinder_setup["requested_target"])
+        self.assertEqual(target, orchestrator.cylinder_setup["executed_target"])
+        self.assertEqual(target, orchestrator._target_position_for_launch())
+        self.assertFalse(orchestrator.cylinder_setup["target_replaced"])
+        self.assertIn("sampled reachability was not confirmed", stderr)
+
+    def test_lateral_target_is_preserved_exactly_when_sampled_check_fails(self):
+        target = [0.010, 0.012, 0.095]
+        orchestrator, stderr = make_orchestrator_with_sampled_failure(target)
+        self.assertEqual(target, orchestrator.cylinder_setup["requested_target"])
+        self.assertEqual(target, orchestrator.cylinder_setup["executed_target"])
+        self.assertEqual(target, orchestrator._target_position_for_launch())
+        self.assertFalse(orchestrator.cylinder_setup["target_replaced"])
+        self.assertIn("sampled reachability was not confirmed", stderr)
+
+    def test_geometry_invalid_target_fails_before_subprocess_started(self):
+        import ctr_evaluation.run_evaluation as module
+
+        calls = []
+        original_start = module.ProcessManager.start
+        module.ProcessManager.start = lambda *args, **kwargs: calls.append((args, kwargs))
+        try:
+            code = main(
+                [
+                    "--experiment-group",
+                    "invalid_target",
+                    "--task",
+                    "cylinder_navigation",
+                    "--target",
+                    "0.040",
+                    "0.000",
+                    "0.100",
+                    "--duration",
+                    "8.0",
+                ]
+            )
+        finally:
+            module.ProcessManager.start = original_start
+        self.assertEqual(2, code)
+        self.assertEqual([], calls)
+
+    def test_sampled_check_failure_records_false_by_default(self):
+        orchestrator, _stderr = make_orchestrator_with_sampled_failure([0.019, 0.0, 0.105])
+        reachability = orchestrator.cylinder_setup["reachability"]
+        self.assertFalse(reachability["sampled_reachability_confirmed"])
+        self.assertEqual("deterministic_sampling", reachability["sampled_reachability_method"])
+        self.assertEqual(4, reachability["sampled_reachability_seed"])
+        self.assertEqual(2048, reachability["sampled_reachability_sample_count"])
+
+    def test_require_sampled_reachable_rejects_before_launch_without_replacement(self):
+        import ctr_evaluation.run_evaluation as module
+        from ctr_mppi_controller.cylindrical_lumen import CylindricalLumen
+
+        calls = []
+        original_start = module.ProcessManager.start
+        original_nearest = CylindricalLumen.nearest_valid_target
+        reachability = patch_reachability(
+            {
+                "reachable": False,
+                "best_error": 0.004,
+                "best_q": [0.0] * 6,
+                "best_tip": [0.016, 0.0, 0.1],
+                "tolerance": 0.003,
+                "evaluated_candidates": 1,
+                "random_sample_count": 2048,
+                "random_seed": 4,
+            }
+        )
+        module.ProcessManager.start = lambda *args, **kwargs: calls.append((args, kwargs))
+        CylindricalLumen.nearest_valid_target = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("replacement calculated"))
+        try:
+            with self.assertRaisesRegex(OrchestrationError, "sampled reachability"):
+                EvaluationOrchestrator(
+                    parse_args(
+                        [
+                            "--experiment-group",
+                            "strict_target_identity",
+                            "--task",
+                            "cylinder_navigation",
+                            "--target",
+                            "0.019",
+                            "0.000",
+                            "0.105",
+                            "--duration",
+                            "8.0",
+                            "--require-sampled-reachable",
+                        ]
+                    )
+                )
+        finally:
+            restore_reachability(reachability)
+            module.ProcessManager.start = original_start
+            CylindricalLumen.nearest_valid_target = original_nearest
+        self.assertEqual([], calls)
+
+    def test_suggested_target_never_becomes_executed_target(self):
+        orchestrator, _stderr = make_orchestrator_with_sampled_failure([0.019, 0.0, 0.105])
+        suggestion = orchestrator.cylinder_setup["reachability"]["suggested_target"]
+        self.assertIsNotNone(suggestion)
+        self.assertNotEqual(suggestion, orchestrator.cylinder_setup["executed_target"])
+        self.assertEqual(orchestrator.cylinder_setup["requested_target"], orchestrator.cylinder_setup["executed_target"])
+
+    def test_baseline_and_candidate_receive_identical_targets(self):
+        target = [0.010, 0.012, 0.095]
+        baseline = build_base_simulation_command(
+            experiment_group="g",
+            controller_label="zero_command",
+            baseline_dir=None,
+            task="cylinder_navigation",
+            target_position=target,
+        )
+        candidate = build_base_simulation_command(
+            experiment_group="g",
+            controller_label="mppi",
+            baseline_dir=Path("/tmp/baseline"),
+            task="cylinder_navigation",
+            target_position=target,
+        )
+        for arg in ("cylinder_target_x:=0.010000000", "cylinder_target_y:=0.012000000", "cylinder_target_z:=0.095000000"):
+            self.assertIn(arg, baseline)
+            self.assertIn(arg, candidate)
+
+    def test_target_identity_metadata_validation_passes(self):
+        metadata = cylinder_orchestrated_meta(run_role="baseline")
+        validate_target_identity_metadata(metadata, expected_target=[0.015, 0.005, 0.1], label="baseline")
+
+    def test_reference_target_identity_match_and_mismatch(self):
+        matching = reference_target_identity(
+            expected_target=[0.015, 0.005, 0.1],
+            observed_target=[0.015, 0.005, 0.1],
+            observed_timestamp=12.5,
+            atol=1.0e-9,
+        )
+        self.assertTrue(matching["reference_matches_requested_target"])
+        self.assertEqual([0.015, 0.005, 0.1], matching["first_observed_reference_target"])
+        mismatching = reference_target_identity(
+            expected_target=[0.015, 0.005, 0.1],
+            observed_target=[0.015, 0.005001, 0.1],
+            observed_timestamp=12.5,
+            atol=1.0e-9,
+        )
+        self.assertFalse(mismatching["reference_matches_requested_target"])
+
+    def test_shared_hash_changes_when_requested_target_changes(self):
+        from ctr_mppi_controller.cylindrical_lumen import config_with_cylinder_overrides
+
+        config = load_parameter_files(CONFIG_FILES)
+        first = config_with_cylinder_overrides(config, enabled=True, target_position=[0.015, 0.005, 0.1])
+        second = config_with_cylinder_overrides(config, enabled=True, target_position=[0.010, 0.012, 0.095])
+        hash_first = build_shared_environment_hash(
+            first,
+            task="cylinder_navigation",
+            trajectory="circle",
+            duration=8.0,
+            reference_lead_time=1.0,
+        )
+        hash_second = build_shared_environment_hash(
+            second,
+            task="cylinder_navigation",
+            trajectory="circle",
+            duration=8.0,
+            reference_lead_time=1.0,
+        )
+        self.assertNotEqual(hash_first, hash_second)
+
+    def test_suggested_target_does_not_affect_shared_hash(self):
+        orchestrator, _stderr = make_orchestrator_with_sampled_failure([0.019, 0.0, 0.105])
+        first = build_shared_environment_hash(
+            orchestrator.project_config,
+            task="cylinder_navigation",
+            trajectory="circle",
+            duration=8.0,
+            reference_lead_time=orchestrator.settings.reference_lead_time,
+        )
+        orchestrator.cylinder_setup["reachability"]["suggested_target"] = [0.0, 0.0, 0.1]
+        second = build_shared_environment_hash(
+            orchestrator.project_config,
+            task="cylinder_navigation",
+            trajectory="circle",
+            duration=8.0,
+            reference_lead_time=orchestrator.settings.reference_lead_time,
+        )
+        self.assertEqual(first, second)
 
     def test_default_cli_success_allows_worse_performance(self):
         original = patch_fake_orchestrator({"comparison": {"compatibility_valid": True}, "baseline_improvement_pass": False})
@@ -348,6 +611,84 @@ class RunEvaluationHelpersTest(unittest.TestCase):
         self.assertFalse(result.compatibility_valid)
         self.assertTrue(any("candidate command" in reason for reason in result.compatibility_reasons))
         self.assertIsNone(result.metric_comparisons[0].relative_improvement_percent)
+
+    def test_baseline_candidate_target_mismatch_invalidates_comparison(self):
+        candidate = cylinder_orchestrated_meta(requested_target=[0.010, 0.012, 0.095], executed_target=[0.010, 0.012, 0.095])
+        baseline = cylinder_orchestrated_meta(run_role="baseline")
+        result = compare_summaries(
+            candidate_summary=summary(1.0),
+            baseline_summary=summary(2.0),
+            candidate_metadata=candidate,
+            baseline_metadata=baseline,
+            near_zero_epsilon=1.0e-12,
+            duration_tolerance=0.1,
+            initial_state_tolerance=5.0e-5,
+        )
+        self.assertFalse(result.compatibility_valid)
+        self.assertTrue(any("requested_target differ" in reason for reason in result.compatibility_reasons))
+        self.assertIsNone(result.metric_comparisons[0].relative_improvement_percent)
+
+    def test_requested_executed_target_mismatch_invalidates_comparison(self):
+        candidate = cylinder_orchestrated_meta(executed_target=[0.010, 0.012, 0.095])
+        baseline = cylinder_orchestrated_meta(run_role="baseline")
+        result = compare_summaries(
+            candidate_summary=summary(1.0),
+            baseline_summary=summary(2.0),
+            candidate_metadata=candidate,
+            baseline_metadata=baseline,
+            near_zero_epsilon=1.0e-12,
+            duration_tolerance=0.1,
+            initial_state_tolerance=5.0e-5,
+        )
+        self.assertFalse(result.compatibility_valid)
+        self.assertTrue(any("requested_target differs from executed_target" in reason for reason in result.compatibility_reasons))
+
+    def test_target_replaced_invalidates_comparison(self):
+        candidate = cylinder_orchestrated_meta(target_replaced=True)
+        baseline = cylinder_orchestrated_meta(run_role="baseline")
+        result = compare_summaries(
+            candidate_summary=summary(1.0),
+            baseline_summary=summary(2.0),
+            candidate_metadata=candidate,
+            baseline_metadata=baseline,
+            near_zero_epsilon=1.0e-12,
+            duration_tolerance=0.1,
+            initial_state_tolerance=5.0e-5,
+        )
+        self.assertFalse(result.compatibility_valid)
+        self.assertTrue(any("target was replaced" in reason for reason in result.compatibility_reasons))
+
+    def test_missing_target_identity_invalidates_cylinder_comparison(self):
+        candidate = cylinder_orchestrated_meta()
+        baseline = cylinder_orchestrated_meta(run_role="baseline")
+        for key in ("requested_target", "executed_target", "target_replaced", "target_identity_valid"):
+            candidate.pop(key, None)
+        result = compare_summaries(
+            candidate_summary=summary(1.0),
+            baseline_summary=summary(2.0),
+            candidate_metadata=candidate,
+            baseline_metadata=baseline,
+            near_zero_epsilon=1.0e-12,
+            duration_tolerance=0.1,
+            initial_state_tolerance=5.0e-5,
+        )
+        self.assertFalse(result.compatibility_valid)
+        self.assertTrue(any("target identity metadata missing" in reason for reason in result.compatibility_reasons))
+
+    def test_reference_target_mismatch_invalidates_comparison(self):
+        candidate = cylinder_orchestrated_meta(reference_matches_requested_target=False)
+        baseline = cylinder_orchestrated_meta(run_role="baseline")
+        result = compare_summaries(
+            candidate_summary=summary(1.0),
+            baseline_summary=summary(2.0),
+            candidate_metadata=candidate,
+            baseline_metadata=baseline,
+            near_zero_epsilon=1.0e-12,
+            duration_tolerance=0.1,
+            initial_state_tolerance=5.0e-5,
+        )
+        self.assertFalse(result.compatibility_valid)
+        self.assertTrue(any("published reference target" in reason for reason in result.compatibility_reasons))
 
     def test_candidate_command_receive_time_fallback(self):
         event = command_event_from_message(
@@ -811,6 +1152,57 @@ def patch_raising_orchestrator():
 
     module.EvaluationOrchestrator = RaisingOrchestrator
     return original
+
+
+def patch_reachability(result):
+    import ctr_evaluation.run_evaluation as module
+
+    original = module.model_reachability_sanity
+    module.model_reachability_sanity = lambda **kwargs: dict(result)
+    return original
+
+
+def restore_reachability(original):
+    import ctr_evaluation.run_evaluation as module
+
+    module.model_reachability_sanity = original
+
+
+def make_orchestrator_with_sampled_failure(target):
+    reachability = patch_reachability(
+        {
+            "reachable": False,
+            "best_error": 0.004,
+            "best_q": [0.0] * 6,
+            "best_tip": [0.016, -0.002, 0.104],
+            "tolerance": 0.003,
+            "evaluated_candidates": 1,
+            "random_sample_count": 2048,
+            "random_seed": 4,
+        }
+    )
+    stderr = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(stderr):
+            orchestrator = EvaluationOrchestrator(
+                parse_args(
+                    [
+                        "--experiment-group",
+                        "sampled_identity",
+                        "--task",
+                        "cylinder_navigation",
+                        "--target",
+                        f"{target[0]:.9f}",
+                        f"{target[1]:.9f}",
+                        f"{target[2]:.9f}",
+                        "--duration",
+                        "8.0",
+                    ]
+                )
+            )
+    finally:
+        restore_reachability(reachability)
+    return orchestrator, stderr.getvalue()
 
 
 def restore_orchestrator(original):
