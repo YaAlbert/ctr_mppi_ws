@@ -9,6 +9,8 @@ from typing import Any
 
 import numpy as np
 
+from .lumen_geometry import BackboneClearance, PointClearance, TargetValidation, make_backbone_clearance
+
 
 @dataclass(frozen=True)
 class CylindricalLumen:
@@ -74,16 +76,30 @@ class CylindricalLumen:
         radial_distance = float(np.linalg.norm(radial_vector))
         radial_clearance = float(self.usable_radius - radial_distance)
         axial_clearance = float(min(axial, self.length - axial))
+        radial_collision = radial_clearance < 0.0
+        inlet_violation = axial < 0.0
+        outlet_violation = axial > self.length
+        clamped_axial = float(np.clip(axial, 0.0, self.length))
+        maximum_penetration = max(0.0, -radial_clearance, -axial, axial - self.length)
         return PointClearance(
             point=point_array,
-            axial_position=axial,
+            physical_clearance=radial_clearance,
+            safety_margin_clearance=float(radial_clearance - self.safety_margin),
+            collision=bool(radial_collision or inlet_violation or outlet_violation),
+            safety_margin_violation=radial_clearance < self.safety_margin,
+            inlet_violation=inlet_violation,
+            outlet_violation=outlet_violation,
+            maximum_penetration=float(maximum_penetration),
+            centerline_progress=axial,
+            closest_geometry_index=0,
+            closest_geometry_parameter=clamped_axial / self.length,
+            closest_geometry_point=self.axis_origin + clamped_axial * self.axis_direction,
             radial_distance=radial_distance,
+            local_radius=self.radius,
+            axial_position=axial,
             radial_clearance=radial_clearance,
             axial_clearance=axial_clearance,
-            radial_collision=radial_clearance < 0.0,
-            inlet_violation=axial < 0.0,
-            outlet_violation=axial > self.length,
-            safety_margin_violation=radial_clearance < self.safety_margin,
+            radial_collision=radial_collision,
         )
 
     def backbone_clearance(self, backbone_points: Any) -> "BackboneClearance":
@@ -99,29 +115,34 @@ class CylindricalLumen:
         outlet_violation = axial > self.length
         collision = radial_collision | inlet_violation | outlet_violation
         safety_margin_violation = (radial_clearance < self.safety_margin) | inlet_violation | outlet_violation
-        closest_index = int(np.argmin(radial_clearance)) if radial_clearance.size else -1
         radial_penetration = np.maximum(-radial_clearance, 0.0)
         inlet_penetration = np.maximum(-axial, 0.0)
         outlet_penetration = np.maximum(axial - self.length, 0.0)
-        max_penetration = float(np.max(np.maximum.reduce([radial_penetration, inlet_penetration, outlet_penetration])))
-        return BackboneClearance(
+        clamped_axial = np.clip(axial, 0.0, self.length)
+        result = make_backbone_clearance(
             points=points,
-            axial_position=axial,
+            physical_clearances=radial_clearance,
+            safety_margin=self.safety_margin,
             radial_distance=radial_distance,
-            radial_clearance=radial_clearance,
-            axial_clearance=axial_clearance,
-            collision_mask=collision,
-            safety_margin_violation_mask=safety_margin_violation,
-            radial_collision_mask=radial_collision,
+            local_radius=np.full(points.shape[0], self.radius, dtype=float),
+            centerline_progress=axial,
+            closest_geometry_indices=np.zeros(points.shape[0], dtype=int),
+            closest_geometry_parameters=clamped_axial / self.length,
+            closest_geometry_points=self.axis_origin[None, :] + clamped_axial[:, None] * self.axis_direction[None, :],
             inlet_violation_mask=inlet_violation,
             outlet_violation_mask=outlet_violation,
-            closest_backbone_point_index=closest_index,
-            minimum_radial_clearance=float(np.min(radial_clearance)),
-            minimum_axial_clearance=float(np.min(axial_clearance)),
-            collision_count=int(np.sum(collision)),
-            safety_margin_violation_count=int(np.sum(safety_margin_violation)),
-            maximum_penetration_depth=max_penetration,
+            radial_collision_mask=radial_collision,
+            axial_clearance=axial_clearance,
+            radial_penetration=radial_penetration,
+            inlet_penetration=inlet_penetration,
+            outlet_penetration=outlet_penetration,
         )
+        if (
+            not np.array_equal(result.collision_mask, collision)
+            or not np.array_equal(result.safety_margin_violation_mask, safety_margin_violation)
+        ):
+            raise RuntimeError("cylindrical lumen shared clearance conversion changed collision semantics")
+        return result
 
     def validate_target(
         self,
@@ -161,59 +182,6 @@ class CylindricalLumen:
         if radial_distance > allowed_radius and radial_distance > 0.0:
             radial_vector = radial_vector * (allowed_radius / radial_distance)
         return self.axis_origin + axial * self.axis_direction + radial_vector
-
-
-@dataclass(frozen=True)
-class PointClearance:
-    point: np.ndarray
-    axial_position: float
-    radial_distance: float
-    radial_clearance: float
-    axial_clearance: float
-    radial_collision: bool
-    inlet_violation: bool
-    outlet_violation: bool
-    safety_margin_violation: bool
-
-    @property
-    def collision(self) -> bool:
-        return bool(self.radial_collision or self.inlet_violation or self.outlet_violation)
-
-
-@dataclass(frozen=True)
-class BackboneClearance:
-    points: np.ndarray
-    axial_position: np.ndarray
-    radial_distance: np.ndarray
-    radial_clearance: np.ndarray
-    axial_clearance: np.ndarray
-    collision_mask: np.ndarray
-    safety_margin_violation_mask: np.ndarray
-    radial_collision_mask: np.ndarray
-    inlet_violation_mask: np.ndarray
-    outlet_violation_mask: np.ndarray
-    closest_backbone_point_index: int
-    minimum_radial_clearance: float
-    minimum_axial_clearance: float
-    collision_count: int
-    safety_margin_violation_count: int
-    maximum_penetration_depth: float
-
-    @property
-    def collision_free(self) -> bool:
-        return self.collision_count == 0
-
-    @property
-    def safety_margin_clear(self) -> bool:
-        return self.safety_margin_violation_count == 0
-
-
-@dataclass(frozen=True)
-class TargetValidation:
-    valid: bool
-    reasons: list[str]
-    target: np.ndarray
-    clearance: PointClearance | None
 
 
 @dataclass(frozen=True)
