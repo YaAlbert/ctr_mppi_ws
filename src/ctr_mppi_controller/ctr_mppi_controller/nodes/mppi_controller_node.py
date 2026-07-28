@@ -12,9 +12,10 @@ from ctr_bringup.parameter_validation import load_parameter_files, validate_conf
 from ctr_bringup.placeholder_node import run_node_until_shutdown
 from ctr_interfaces.msg import CtrControllerMetrics, CtrJointCommand, CtrState
 from ctr_model.approximate_model import ApproximateCTRModel
-from ctr_mppi_controller.cylindrical_lumen import (
-    config_with_cylinder_overrides,
-    goal_position_from_config,
+from ctr_mppi_controller.cylindrical_lumen import goal_position_from_config
+from ctr_mppi_controller.lumen_factory import (
+    config_with_lumen_overrides,
+    lumen_geometry_fingerprint,
     lumen_cost_weights_from_config,
     lumen_geometry_from_config,
     lumen_mode_from_config,
@@ -48,11 +49,11 @@ class MPPIControllerNode(Node):
 
         raw_config = load_parameter_files(config_paths)
         enable_lumen = _bool_value(self.get_parameter("enable_cylindrical_lumen").value)
-        self.config = config_with_cylinder_overrides(
+        self.config = config_with_lumen_overrides(
             raw_config,
-            enabled=enable_lumen,
-            target_position=_optional_vector3_parameter(self.get_parameter("cylinder_target_position").value),
-            mppi_profile=str(self.get_parameter("cylinder_profile").value or ""),
+            enable_cylindrical_lumen=enable_lumen,
+            target=_optional_vector3_parameter(self.get_parameter("cylinder_target_position").value),
+            cylinder_profile=str(self.get_parameter("cylinder_profile").value or ""),
             random_seed=_optional_seed(self.get_parameter("mppi_random_seed").value),
         )
         validate_or_raise(self.config)
@@ -259,8 +260,12 @@ class MPPIControllerNode(Node):
         )
 
     def _geometry_summary(self, *, target_validation_status: str) -> str:
+        fingerprint = lumen_geometry_fingerprint(self.config)
         if self.lumen_geometry is None:
-            return "MPPI lumen geometry mode: none; target_validation=not_applicable."
+            return (
+                "MPPI lumen geometry mode: none; "
+                f"geometry_fingerprint={fingerprint}; target_validation=not_applicable."
+            )
         parts = [
             f"MPPI lumen geometry mode: {self.lumen_mode}",
             f"frame_id={self.lumen_geometry.frame_id}",
@@ -275,6 +280,7 @@ class MPPIControllerNode(Node):
         if self.lumen_mode == "curved":
             parts.append(f"curved_type={self.config.get('curved_lumen', {}).get('type')}")
             parts.append(f"centerline_samples={len(getattr(self.lumen_geometry, 'centerline_points', []))}")
+        parts.append(f"geometry_fingerprint={fingerprint}")
         parts.append(f"target_validation={target_validation_status}")
         return "; ".join(parts) + "."
 

@@ -142,6 +142,9 @@ def validate_project_config(config: dict[str, Any]) -> list[str]:
         errors.extend(_validate_mppi_profiles(config["mppi_profiles"]))
     if "cylindrical_lumen" in config:
         errors.extend(_validate_cylindrical_lumen(config["cylindrical_lumen"]))
+    if "curved_lumen" in config:
+        errors.extend(_validate_curved_lumen(config["curved_lumen"]))
+    errors.extend(_validate_lumen_mode_and_frames(config))
     if "cylindrical_lumen_cost" in config:
         errors.extend(_validate_cylindrical_lumen_cost(config["cylindrical_lumen_cost"]))
     if "goal" in config:
@@ -326,6 +329,157 @@ def _validate_cylindrical_lumen(lumen: Any) -> list[str]:
         errors.append("`cylindrical_lumen.radius` must exceed `cylindrical_lumen.ctr_outer_radius`.")
     if radius is not None and outer is not None and margin is not None and radius - outer <= margin:
         errors.append("`cylindrical_lumen` usable radius must exceed `safety_margin`.")
+    return errors
+
+
+def _validate_curved_lumen(lumen: Any) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(lumen, dict):
+        return ["`curved_lumen` must be a map."]
+    enabled = lumen.get("enabled")
+    enabled_valid = isinstance(enabled, bool)
+    enabled_required = enabled is True
+    if not enabled_valid:
+        errors.append("`curved_lumen.enabled` must be a boolean.")
+    if "simulation_default" in lumen and not isinstance(lumen["simulation_default"], bool):
+        errors.append("`curved_lumen.simulation_default` must be a boolean when present.")
+    lumen_type = lumen.get("type")
+    if enabled_required or "type" in lumen:
+        if not isinstance(lumen_type, str):
+            errors.append("`curved_lumen.type` must be a string.")
+        elif lumen_type not in {"circular_arc", "s_curve"}:
+            errors.append("`curved_lumen.type` must be `circular_arc` or `s_curve`.")
+    if enabled_required or "frame_id" in lumen:
+        if not isinstance(lumen.get("frame_id"), str) or not lumen["frame_id"]:
+            errors.append("`curved_lumen.frame_id` must be a non-empty string.")
+
+    errors.extend(_require_positive_number_if_present(lumen, "lumen_radius", "curved_lumen", required=enabled_required))
+    errors.extend(_require_number_if_present(lumen, "ctr_outer_radius", "curved_lumen", required=enabled_required, nonnegative=True))
+    errors.extend(_require_number_if_present(lumen, "safety_margin", "curved_lumen", required=enabled_required, nonnegative=True))
+    errors.extend(
+        _require_positive_number_if_present(
+            lumen,
+            "centerline_sample_spacing",
+            "curved_lumen",
+            required=enabled_required,
+        )
+    )
+
+    radius = _as_finite_number(lumen.get("lumen_radius")) if "lumen_radius" in lumen else None
+    outer = _as_finite_number(lumen.get("ctr_outer_radius")) if "ctr_outer_radius" in lumen else None
+    margin = _as_finite_number(lumen.get("safety_margin")) if "safety_margin" in lumen else None
+    if radius is not None and outer is not None and radius - outer <= 0.0:
+        errors.append("`curved_lumen.lumen_radius` must exceed `curved_lumen.ctr_outer_radius`.")
+    if radius is not None and outer is not None and margin is not None and radius - outer - margin <= 0.0:
+        errors.append("`curved_lumen` usable radius after safety margin must be positive.")
+
+    if (enabled_required and lumen_type == "circular_arc") or "circular_arc" in lumen:
+        errors.extend(_validate_curved_lumen_circular_arc(lumen.get("circular_arc", {})))
+    if (enabled_required and lumen_type == "s_curve") or "s_curve" in lumen:
+        errors.extend(_validate_curved_lumen_s_curve(lumen.get("s_curve", {})))
+    return errors
+
+
+def _require_number_if_present(
+    container: Any,
+    key: str,
+    prefix: str,
+    *,
+    required: bool,
+    nonnegative: bool = False,
+) -> list[str]:
+    if required or (isinstance(container, dict) and key in container):
+        return _require_number(container, key, prefix, nonnegative=nonnegative)
+    return []
+
+
+def _require_positive_number_if_present(
+    container: Any,
+    key: str,
+    prefix: str,
+    *,
+    required: bool,
+    integer: bool = False,
+) -> list[str]:
+    if required or (isinstance(container, dict) and key in container):
+        return _require_positive_number(container, key, prefix, integer=integer)
+    return []
+
+
+def _validate_curved_lumen_circular_arc(arc: Any) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(arc, dict):
+        return ["`curved_lumen.circular_arc` must be a map."]
+    errors.extend(_require_numeric_list(arc, "inlet_position", 3, "curved_lumen.circular_arc"))
+    errors.extend(_require_numeric_list(arc, "initial_tangent", 3, "curved_lumen.circular_arc"))
+    errors.extend(_require_numeric_list(arc, "bend_normal", 3, "curved_lumen.circular_arc"))
+    errors.extend(_require_positive_number(arc, "curvature_radius", "curved_lumen.circular_arc"))
+    errors.extend(_require_number(arc, "arc_angle", "curved_lumen.circular_arc"))
+    tangent = _as_finite_vector(arc.get("initial_tangent"), 3)
+    normal = _as_finite_vector(arc.get("bend_normal"), 3)
+    errors.extend(_validate_nonzero_vector(tangent, "curved_lumen.circular_arc.initial_tangent"))
+    errors.extend(_validate_nonzero_vector(normal, "curved_lumen.circular_arc.bend_normal"))
+    errors.extend(
+        _validate_nonparallel_vectors(
+            tangent,
+            normal,
+            "curved_lumen.circular_arc.initial_tangent",
+            "curved_lumen.circular_arc.bend_normal",
+        )
+    )
+    angle = _as_finite_number(arc.get("arc_angle"))
+    if angle == 0.0:
+        errors.append("`curved_lumen.circular_arc.arc_angle` must be non-zero.")
+    return errors
+
+
+def _validate_curved_lumen_s_curve(s_curve: Any) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(s_curve, dict):
+        return ["`curved_lumen.s_curve` must be a map."]
+    errors.extend(_require_numeric_list(s_curve, "inlet_position", 3, "curved_lumen.s_curve"))
+    errors.extend(_require_numeric_list(s_curve, "initial_tangent", 3, "curved_lumen.s_curve"))
+    errors.extend(_require_numeric_list(s_curve, "bend_plane_normal", 3, "curved_lumen.s_curve"))
+    errors.extend(_require_positive_number(s_curve, "total_length", "curved_lumen.s_curve"))
+    errors.extend(_require_number(s_curve, "lateral_amplitude", "curved_lumen.s_curve"))
+    tangent = _as_finite_vector(s_curve.get("initial_tangent"), 3)
+    normal = _as_finite_vector(s_curve.get("bend_plane_normal"), 3)
+    errors.extend(_validate_nonzero_vector(tangent, "curved_lumen.s_curve.initial_tangent"))
+    errors.extend(_validate_nonzero_vector(normal, "curved_lumen.s_curve.bend_plane_normal"))
+    errors.extend(
+        _validate_nonparallel_vectors(
+            tangent,
+            normal,
+            "curved_lumen.s_curve.initial_tangent",
+            "curved_lumen.s_curve.bend_plane_normal",
+        )
+    )
+    return errors
+
+
+def _validate_lumen_mode_and_frames(config: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    cylindrical = config.get("cylindrical_lumen", {})
+    curved = config.get("curved_lumen", {})
+    cylindrical_enabled = isinstance(cylindrical, dict) and cylindrical.get("enabled") is True
+    curved_enabled = isinstance(curved, dict) and curved.get("enabled") is True
+    if cylindrical_enabled and curved_enabled:
+        errors.append("`cylindrical_lumen.enabled` and `curved_lumen.enabled` cannot both be true.")
+        return errors
+    selected = cylindrical if cylindrical_enabled else curved if curved_enabled else None
+    if not isinstance(selected, dict):
+        return errors
+    lumen_frame = selected.get("frame_id")
+    if not isinstance(lumen_frame, str) or not lumen_frame:
+        return errors
+    frame_sources = (
+        ("robot.frames.base", config.get("robot", {}).get("frames", {}).get("base")),
+        ("goal.frame_id", config.get("goal", {}).get("frame_id")),
+        ("reference.frame_id", config.get("reference", {}).get("frame_id")),
+    )
+    for label, frame in frame_sources:
+        if isinstance(frame, str) and frame and frame != lumen_frame:
+            errors.append(f"selected lumen frame `{lumen_frame}` must match `{label}` `{frame}`.")
     return errors
 
 
@@ -747,3 +901,35 @@ def _as_finite_vector(value: Any, length: int) -> list[float] | None:
             return None
         result.append(numeric)
     return result
+
+
+def _validate_nonzero_vector(vector: list[float] | None, label: str) -> list[str]:
+    if vector is None:
+        return []
+    norm = math.sqrt(sum(value * value for value in vector))
+    if norm <= 0.0:
+        return [f"`{label}` must be non-zero."]
+    return []
+
+
+def _validate_nonparallel_vectors(
+    first: list[float] | None,
+    second: list[float] | None,
+    first_label: str,
+    second_label: str,
+) -> list[str]:
+    if first is None or second is None:
+        return []
+    first_norm = math.sqrt(sum(value * value for value in first))
+    second_norm = math.sqrt(sum(value * value for value in second))
+    if first_norm <= 0.0 or second_norm <= 0.0:
+        return []
+    cross = (
+        first[1] * second[2] - first[2] * second[1],
+        first[2] * second[0] - first[0] * second[2],
+        first[0] * second[1] - first[1] * second[0],
+    )
+    cross_norm = math.sqrt(sum(value * value for value in cross))
+    if cross_norm / (first_norm * second_norm) <= 1.0e-12:
+        return [f"`{first_label}` and `{second_label}` must not be parallel."]
+    return []

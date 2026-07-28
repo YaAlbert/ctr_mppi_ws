@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from dataclasses import dataclass
 import math
 from typing import Any
 
 import numpy as np
 
-from .curved_lumen import CurvedLumen, circular_arc_centerline, s_curve_centerline
 from .lumen_geometry import (
     BackboneClearance,
     LumenCostWeights,
@@ -202,85 +200,33 @@ class CylindricalLumen:
 
 
 def cylindrical_lumen_enabled(config: dict[str, Any]) -> bool:
-    section = config.get("cylindrical_lumen", {})
-    if not isinstance(section, dict):
-        raise ValueError("cylindrical_lumen must be a map")
-    return bool(section.get("enabled", False))
+    from .lumen_factory import cylindrical_lumen_enabled as _enabled
+
+    return _enabled(config)
 
 
 def curved_lumen_enabled(config: dict[str, Any]) -> bool:
-    section = config.get("curved_lumen", {})
-    if not isinstance(section, dict):
-        raise ValueError("curved_lumen must be a map")
-    return bool(section.get("enabled", False))
+    from .lumen_factory import curved_lumen_enabled as _enabled
+
+    return _enabled(config)
 
 
 def lumen_mode_from_config(config: dict[str, Any]) -> str:
-    cylindrical_enabled = cylindrical_lumen_enabled(config)
-    curved_enabled = curved_lumen_enabled(config)
-    if cylindrical_enabled and curved_enabled:
-        raise ValueError("exactly one lumen geometry mode may be enabled")
-    if cylindrical_enabled:
-        return "cylindrical"
-    if curved_enabled:
-        return "curved"
-    return "none"
+    from .lumen_factory import lumen_mode_from_config as _mode
+
+    return _mode(config)
 
 
 def lumen_geometry_from_config(config: dict[str, Any]) -> LumenGeometry | None:
-    mode = lumen_mode_from_config(config)
-    if mode == "none":
-        return None
-    if mode == "cylindrical":
-        return CylindricalLumen.from_config(config)
-    return _curved_lumen_from_config(config)
+    from .lumen_factory import lumen_geometry_from_config as _geometry
+
+    return _geometry(config)
 
 
 def lumen_cost_weights_from_config(config: dict[str, Any]) -> LumenCostWeights | None:
-    if lumen_mode_from_config(config) == "none":
-        return None
-    return LumenCostWeights.from_config(config)
+    from .lumen_factory import lumen_cost_weights_from_config as _weights
 
-
-def _curved_lumen_from_config(config: dict[str, Any]) -> CurvedLumen:
-    values = config.get("curved_lumen", {})
-    if not isinstance(values, dict):
-        raise ValueError("curved_lumen must be a map")
-    lumen_type = values.get("type")
-    sample_spacing = values["centerline_sample_spacing"]
-    if lumen_type == "circular_arc":
-        arc = values.get("circular_arc", {})
-        if not isinstance(arc, dict):
-            raise ValueError("curved_lumen.circular_arc must be a map")
-        centerline = circular_arc_centerline(
-            inlet_position=arc["inlet_position"],
-            initial_tangent=arc["initial_tangent"],
-            bend_normal=arc["bend_normal"],
-            curvature_radius=arc["curvature_radius"],
-            arc_angle=arc["arc_angle"],
-            sample_spacing=sample_spacing,
-        )
-    elif lumen_type == "s_curve":
-        s_curve = values.get("s_curve", {})
-        if not isinstance(s_curve, dict):
-            raise ValueError("curved_lumen.s_curve must be a map")
-        centerline = s_curve_centerline(
-            inlet_position=s_curve["inlet_position"],
-            initial_tangent=s_curve["initial_tangent"],
-            bend_plane_normal=s_curve["bend_plane_normal"],
-            total_length=s_curve["total_length"],
-            lateral_amplitude=s_curve["lateral_amplitude"],
-            sample_spacing=sample_spacing,
-        )
-    else:
-        raise ValueError("curved_lumen.type must be `circular_arc` or `s_curve`")
-    return CurvedLumen(
-        frame_id=values["frame_id"],
-        centerline_points=centerline,
-        lumen_radius=values["lumen_radius"],
-        ctr_outer_radius=values["ctr_outer_radius"],
-        safety_margin=values["safety_margin"],
-    )
+    return _weights(config)
 
 
 def goal_position_from_config(config: dict[str, Any]) -> np.ndarray:
@@ -296,33 +242,9 @@ def goal_hold_duration_from_config(config: dict[str, Any]) -> float:
 
 
 def config_with_mppi_profile(config: dict[str, Any], profile_name: str | None) -> dict[str, Any]:
-    if profile_name is None or str(profile_name) == "":
-        return deepcopy(config)
-    name = str(profile_name)
-    profiles = config.get("mppi_profiles", {})
-    if name not in profiles:
-        raise ValueError(f"unknown MPPI profile `{name}`")
-    profile = profiles[name]
-    result = deepcopy(config)
-    result["mppi"]["num_samples"] = _positive_int(profile["samples"], f"mppi_profiles.{name}.samples")
-    result["mppi"]["horizon"] = _positive_int(profile["horizon"], f"mppi_profiles.{name}.horizon")
-    result["mppi"]["dt"] = _positive_number(profile["dt"], f"mppi_profiles.{name}.dt")
-    if "lambda" in profile:
-        result["mppi"]["lambda"] = _positive_number(profile["lambda"], f"mppi_profiles.{name}.lambda")
-    if "noise_std" in profile:
-        result["mppi"]["noise_std"] = deepcopy(profile["noise_std"])
-    if "weights" in profile:
-        result["mppi"].setdefault("weights", {}).update(deepcopy(profile["weights"]))
-    if "control_frequency" in profile:
-        result["mppi"]["control_frequency"] = _positive_number(
-            profile["control_frequency"],
-            f"mppi_profiles.{name}.control_frequency",
-        )
-    else:
-        period = _positive_number(profile["control_period"], f"mppi_profiles.{name}.control_period")
-        result["mppi"]["control_frequency"] = 1.0 / period
-    result.setdefault("mppi", {})["active_profile"] = name
-    return result
+    from .lumen_factory import config_with_mppi_profile as _with_profile
+
+    return _with_profile(config, profile_name)
 
 
 def config_with_cylinder_overrides(
@@ -333,15 +255,15 @@ def config_with_cylinder_overrides(
     mppi_profile: str | None = None,
     random_seed: Any | None = None,
 ) -> dict[str, Any]:
-    result = config_with_mppi_profile(config, mppi_profile)
-    if enabled is not None:
-        result.setdefault("cylindrical_lumen", {})["enabled"] = bool(enabled)
-    if target_position is not None:
-        result.setdefault("goal", {})["position"] = [float(value) for value in _vector3(target_position, "target_position")]
-    if random_seed is not None and str(random_seed) != "":
-        seed = _nonnegative_int(random_seed, "mppi.random_seed")
-        result.setdefault("mppi", {})["random_seed"] = seed
-    return result
+    from .lumen_factory import config_with_lumen_overrides
+
+    return config_with_lumen_overrides(
+        config,
+        enable_cylindrical_lumen=enabled,
+        target=target_position,
+        cylinder_profile=mppi_profile,
+        random_seed=random_seed,
+    )
 
 
 def _points(values: Any, label: str) -> np.ndarray:

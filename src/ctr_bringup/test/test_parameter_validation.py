@@ -34,6 +34,15 @@ CONFIG_FILES = [
 ]
 
 
+def curved_lumen_config(lumen_type: str = "circular_arc"):
+    config = load_parameter_files(CONFIG_FILES)
+    config = copy.deepcopy(config)
+    config["cylindrical_lumen"]["enabled"] = False
+    config["curved_lumen"]["enabled"] = True
+    config["curved_lumen"]["type"] = lumen_type
+    return config
+
+
 def load_launch_module(file_name: str, module_name: str):
     launch_path = REPO_ROOT / "src" / "ctr_bringup" / "launch" / file_name
     spec = importlib.util.spec_from_file_location(module_name, launch_path)
@@ -398,6 +407,194 @@ class ParameterValidationTest(unittest.TestCase):
         config["cylindrical_lumen"]["radius"] = config["cylindrical_lumen"]["ctr_outer_radius"]
         errors = validate_project_config(config)
         self.assertTrue(any("radius" in error for error in errors))
+
+    def test_default_curved_lumen_disabled_schema_validates(self):
+        config = load_parameter_files(CONFIG_FILES)
+        errors = validate_project_config(config)
+        self.assertEqual([], [error for error in errors if "curved_lumen" in error])
+
+    def test_disabled_curved_lumen_minimal_schema_is_accepted(self):
+        config = load_parameter_files(CONFIG_FILES)
+        config = copy.deepcopy(config)
+        config["curved_lumen"] = {"enabled": False}
+        errors = validate_project_config(config)
+        self.assertEqual([], [error for error in errors if "curved_lumen" in error])
+
+    def test_valid_curved_circular_arc_is_accepted(self):
+        self.assertEqual([], [error for error in validate_project_config(curved_lumen_config("circular_arc")) if "curved_lumen" in error])
+
+    def test_valid_curved_s_curve_is_accepted(self):
+        self.assertEqual([], [error for error in validate_project_config(curved_lumen_config("s_curve")) if "curved_lumen" in error])
+
+    def test_curved_lumen_matching_authoritative_frames_is_accepted(self):
+        config = curved_lumen_config()
+        config["curved_lumen"]["frame_id"] = "lumen_frame"
+        config["robot"]["frames"]["base"] = "lumen_frame"
+        config["goal"]["frame_id"] = "lumen_frame"
+        config["reference"]["frame_id"] = "lumen_frame"
+        errors = validate_project_config(config)
+        self.assertEqual([], [error for error in errors if "selected lumen frame" in error])
+
+    def test_curved_lumen_frame_mismatch_is_rejected(self):
+        cases = (
+            ("robot.frames.base", lambda config: config["robot"]["frames"].__setitem__("base", "robot_base")),
+            ("goal.frame_id", lambda config: config["goal"].__setitem__("frame_id", "goal_frame")),
+            ("reference.frame_id", lambda config: config["reference"].__setitem__("frame_id", "reference_frame")),
+        )
+        for label, mutate in cases:
+            with self.subTest(label=label):
+                config = curved_lumen_config()
+                mutate(config)
+                errors = validate_project_config(config)
+                self.assertTrue(
+                    any("selected lumen frame" in error and label in error for error in errors),
+                    errors,
+                )
+
+    def test_zero_amplitude_s_curve_is_accepted(self):
+        config = curved_lumen_config("s_curve")
+        config["curved_lumen"]["s_curve"]["lateral_amplitude"] = 0.0
+        self.assertEqual([], [error for error in validate_project_config(config) if "curved_lumen" in error])
+
+    def test_curved_enabled_must_be_bool(self):
+        config = curved_lumen_config()
+        config["curved_lumen"]["enabled"] = "true"
+        errors = validate_project_config(config)
+        self.assertTrue(any("curved_lumen.enabled" in error for error in errors))
+
+    def test_curved_invalid_type_is_rejected(self):
+        config = curved_lumen_config()
+        config["curved_lumen"]["type"] = "spiral"
+        errors = validate_project_config(config)
+        self.assertTrue(any("curved_lumen.type" in error for error in errors))
+
+    def test_curved_empty_frame_is_rejected(self):
+        config = curved_lumen_config()
+        config["curved_lumen"]["frame_id"] = ""
+        errors = validate_project_config(config)
+        self.assertTrue(any("curved_lumen.frame_id" in error for error in errors))
+
+    def test_curved_invalid_radius_is_rejected(self):
+        config = curved_lumen_config()
+        config["curved_lumen"]["lumen_radius"] = 0.0
+        errors = validate_project_config(config)
+        self.assertTrue(any("curved_lumen.lumen_radius" in error for error in errors))
+
+    def test_curved_invalid_ctr_outer_radius_is_rejected(self):
+        config = curved_lumen_config()
+        config["curved_lumen"]["ctr_outer_radius"] = -0.001
+        errors = validate_project_config(config)
+        self.assertTrue(any("curved_lumen.ctr_outer_radius" in error for error in errors))
+
+    def test_curved_invalid_safety_margin_is_rejected(self):
+        config = curved_lumen_config()
+        config["curved_lumen"]["safety_margin"] = -0.001
+        errors = validate_project_config(config)
+        self.assertTrue(any("curved_lumen.safety_margin" in error for error in errors))
+
+    def test_curved_unusable_physical_radius_is_rejected(self):
+        config = curved_lumen_config()
+        config["curved_lumen"]["lumen_radius"] = config["curved_lumen"]["ctr_outer_radius"]
+        errors = validate_project_config(config)
+        self.assertTrue(any("lumen_radius" in error and "ctr_outer_radius" in error for error in errors))
+
+    def test_curved_unusable_safety_radius_is_rejected(self):
+        config = curved_lumen_config()
+        config["curved_lumen"]["lumen_radius"] = (
+            config["curved_lumen"]["ctr_outer_radius"] + config["curved_lumen"]["safety_margin"]
+        )
+        errors = validate_project_config(config)
+        self.assertTrue(any("usable radius" in error for error in errors))
+
+    def test_curved_invalid_centerline_spacing_is_rejected(self):
+        config = curved_lumen_config()
+        config["curved_lumen"]["centerline_sample_spacing"] = 0.0
+        errors = validate_project_config(config)
+        self.assertTrue(any("centerline_sample_spacing" in error for error in errors))
+
+    def test_curved_malformed_inlet_position_is_rejected(self):
+        config = curved_lumen_config()
+        config["curved_lumen"]["circular_arc"]["inlet_position"] = [0.0, 0.0]
+        errors = validate_project_config(config)
+        self.assertTrue(any("curved_lumen.circular_arc.inlet_position" in error for error in errors))
+
+    def test_curved_non_finite_inlet_position_is_rejected(self):
+        config = curved_lumen_config()
+        config["curved_lumen"]["circular_arc"]["inlet_position"] = [0.0, float("nan"), 0.0]
+        errors = validate_project_config(config)
+        self.assertTrue(any("curved_lumen.circular_arc.inlet_position" in error for error in errors))
+
+    def test_curved_zero_tangent_is_rejected(self):
+        config = curved_lumen_config()
+        config["curved_lumen"]["circular_arc"]["initial_tangent"] = [0.0, 0.0, 0.0]
+        errors = validate_project_config(config)
+        self.assertTrue(any("initial_tangent" in error and "non-zero" in error for error in errors))
+
+    def test_curved_zero_bend_normal_is_rejected(self):
+        config = curved_lumen_config()
+        config["curved_lumen"]["circular_arc"]["bend_normal"] = [0.0, 0.0, 0.0]
+        errors = validate_project_config(config)
+        self.assertTrue(any("bend_normal" in error and "non-zero" in error for error in errors))
+
+    def test_curved_parallel_tangent_normal_is_rejected(self):
+        config = curved_lumen_config()
+        config["curved_lumen"]["circular_arc"]["bend_normal"] = [0.0, 0.0, 2.0]
+        errors = validate_project_config(config)
+        self.assertTrue(any("must not be parallel" in error for error in errors))
+
+    def test_curved_invalid_curvature_radius_is_rejected(self):
+        config = curved_lumen_config()
+        config["curved_lumen"]["circular_arc"]["curvature_radius"] = 0.0
+        errors = validate_project_config(config)
+        self.assertTrue(any("curvature_radius" in error for error in errors))
+
+    def test_curved_zero_arc_angle_is_rejected(self):
+        config = curved_lumen_config()
+        config["curved_lumen"]["circular_arc"]["arc_angle"] = 0.0
+        errors = validate_project_config(config)
+        self.assertTrue(any("arc_angle" in error and "non-zero" in error for error in errors))
+
+    def test_curved_non_finite_arc_angle_is_rejected(self):
+        config = curved_lumen_config()
+        config["curved_lumen"]["circular_arc"]["arc_angle"] = float("inf")
+        errors = validate_project_config(config)
+        self.assertTrue(any("arc_angle" in error for error in errors))
+
+    def test_curved_invalid_s_curve_total_length_is_rejected(self):
+        config = curved_lumen_config("s_curve")
+        config["curved_lumen"]["s_curve"]["total_length"] = 0.0
+        errors = validate_project_config(config)
+        self.assertTrue(any("s_curve.total_length" in error for error in errors))
+
+    def test_curved_non_finite_s_curve_amplitude_is_rejected(self):
+        config = curved_lumen_config("s_curve")
+        config["curved_lumen"]["s_curve"]["lateral_amplitude"] = float("nan")
+        errors = validate_project_config(config)
+        self.assertTrue(any("s_curve.lateral_amplitude" in error for error in errors))
+
+    def test_cylinder_plus_curved_conflict_is_rejected(self):
+        config = curved_lumen_config()
+        config["cylindrical_lumen"]["enabled"] = True
+        errors = validate_project_config(config)
+        self.assertTrue(any("cannot both be true" in error for error in errors))
+
+    def test_curved_generator_basis_failure_is_validation_failure(self):
+        config = curved_lumen_config("s_curve")
+        config["curved_lumen"]["s_curve"]["bend_plane_normal"] = config["curved_lumen"]["s_curve"]["initial_tangent"]
+        errors = validate_project_config(config)
+        self.assertTrue(any("s_curve.initial_tangent" in error and "parallel" in error for error in errors))
+
+    def test_curved_error_message_contains_key_path(self):
+        config = curved_lumen_config()
+        config["curved_lumen"]["centerline_sample_spacing"] = -1.0
+        errors = validate_project_config(config)
+        self.assertTrue(any("`curved_lumen.centerline_sample_spacing`" in error for error in errors))
+
+    def test_curved_validation_does_not_change_hardware_configuration(self):
+        config = curved_lumen_config()
+        original_hardware = copy.deepcopy(config["hardware"])
+        validate_project_config(config)
+        self.assertEqual(original_hardware, config["hardware"])
 
     def test_goal_rejects_bad_position_and_tolerance(self):
         config = load_parameter_files(CONFIG_FILES)
