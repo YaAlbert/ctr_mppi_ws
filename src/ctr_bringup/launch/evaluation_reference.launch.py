@@ -34,6 +34,8 @@ def generate_launch_description():
     trajectory_start_policy = LaunchConfiguration("trajectory_start_policy")
     scheduled_reference_epoch = LaunchConfiguration("scheduled_reference_epoch")
     enable_cylindrical_lumen = LaunchConfiguration("enable_cylindrical_lumen")
+    enable_curved_lumen = LaunchConfiguration("enable_curved_lumen")
+    curved_lumen_type = LaunchConfiguration("curved_lumen_type")
     cylinder_profile = LaunchConfiguration("cylinder_profile")
     cylinder_target_x = LaunchConfiguration("cylinder_target_x")
     cylinder_target_y = LaunchConfiguration("cylinder_target_y")
@@ -77,6 +79,16 @@ def generate_launch_description():
                 description="Enable simulation-only fixed point goal from the cylindrical-lumen config.",
             ),
             DeclareLaunchArgument(
+                "enable_curved_lumen",
+                default_value="false",
+                description="Enable simulation-only fixed point goal from the curved-lumen config.",
+            ),
+            DeclareLaunchArgument(
+                "curved_lumen_type",
+                default_value="",
+                description="Optional curved-lumen type override: circular_arc or s_curve.",
+            ),
+            DeclareLaunchArgument(
                 "cylinder_profile",
                 default_value="",
                 description="Optional MPPI profile name used to size fixed/trajectory horizons.",
@@ -115,6 +127,8 @@ def generate_launch_description():
                         "trajectory_start_policy": trajectory_start_policy,
                         "scheduled_reference_epoch": scheduled_reference_epoch,
                         "enable_cylindrical_lumen": enable_cylindrical_lumen,
+                        "enable_curved_lumen": enable_curved_lumen,
+                        "curved_lumen_type": curved_lumen_type,
                         "cylinder_profile": cylinder_profile,
                         "cylinder_target_position": cylinder_target_position,
                         "mppi_random_seed": mppi_random_seed,

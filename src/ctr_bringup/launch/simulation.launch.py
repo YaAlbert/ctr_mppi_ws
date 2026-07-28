@@ -42,6 +42,8 @@ def generate_launch_description():
     evaluation_baseline_result_dir = LaunchConfiguration("evaluation_baseline_result_dir")
     evaluation_output_root = LaunchConfiguration("evaluation_output_root")
     enable_cylindrical_lumen = LaunchConfiguration("enable_cylindrical_lumen")
+    enable_curved_lumen = LaunchConfiguration("enable_curved_lumen")
+    curved_lumen_type = LaunchConfiguration("curved_lumen_type")
     cylinder_profile = LaunchConfiguration("cylinder_profile")
     cylinder_target_x = LaunchConfiguration("cylinder_target_x")
     cylinder_target_y = LaunchConfiguration("cylinder_target_y")
@@ -57,11 +59,15 @@ def generate_launch_description():
             [
                 "'",
                 start_reference_manager,
-                "' == 'true' or '",
+                "'.lower() == 'true' or '",
                 reference_mode,
                 "' == 'trajectory' or '",
+                reference_mode,
+                "' == 'fixed_target' and ('",
                 enable_cylindrical_lumen,
-                "' == 'true'",
+                "'.lower() == 'true' or '",
+                enable_curved_lumen,
+                "'.lower() == 'true')",
             ]
         )
     )
@@ -134,6 +140,16 @@ def generate_launch_description():
                 description="Enable simulation-only straight cylindrical-lumen point-goal navigation.",
             ),
             DeclareLaunchArgument(
+                "enable_curved_lumen",
+                default_value="false",
+                description="Enable simulation-only curved-lumen point-goal runtime wiring.",
+            ),
+            DeclareLaunchArgument(
+                "curved_lumen_type",
+                default_value="",
+                description="Optional curved-lumen type override: circular_arc or s_curve.",
+            ),
+            DeclareLaunchArgument(
                 "cylinder_profile",
                 default_value="",
                 description="Optional MPPI profile name, for example cylinder_fast.",
@@ -188,6 +204,8 @@ def generate_launch_description():
                         "target_position": [0.0, 0.0, 0.08],
                         "command_timeout": 0.25,
                         "enable_cylindrical_lumen": enable_cylindrical_lumen,
+                        "enable_curved_lumen": enable_curved_lumen,
+                        "curved_lumen_type": curved_lumen_type,
                         "cylinder_target_position": cylinder_target_position,
                     }
                 ],
@@ -222,6 +240,8 @@ def generate_launch_description():
                         "reference_type": reference_type,
                         "publish_safe_command_for_simulation": mppi_publish_safe_for_simulation,
                         "enable_cylindrical_lumen": enable_cylindrical_lumen,
+                        "enable_curved_lumen": enable_curved_lumen,
+                        "curved_lumen_type": curved_lumen_type,
                         "cylinder_profile": cylinder_profile,
                         "cylinder_target_position": cylinder_target_position,
                         "mppi_random_seed": mppi_random_seed,
@@ -241,6 +261,8 @@ def generate_launch_description():
                         "reference_mode": reference_mode,
                         "reference_type": reference_type,
                         "enable_cylindrical_lumen": enable_cylindrical_lumen,
+                        "enable_curved_lumen": enable_curved_lumen,
+                        "curved_lumen_type": curved_lumen_type,
                         "cylinder_profile": cylinder_profile,
                         "cylinder_target_position": cylinder_target_position,
                         "mppi_random_seed": mppi_random_seed,

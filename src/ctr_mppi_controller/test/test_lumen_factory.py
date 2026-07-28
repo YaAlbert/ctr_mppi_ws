@@ -27,6 +27,7 @@ from ctr_mppi_controller.lumen_factory import (  # noqa: E402
     lumen_cost_weights_from_config,
     lumen_geometry_fingerprint,
     lumen_geometry_fingerprint_payload,
+    lumen_geometry_log_line,
     lumen_geometry_from_config,
     lumen_mode_from_config,
 )
@@ -348,6 +349,40 @@ class LumenFactoryTest(unittest.TestCase):
         config["cylindrical_lumen"]["axis_origin"] = [math.nan, 0.0, 0.0]
         with self.assertRaisesRegex(ValueError, "finite"):
             lumen_geometry_fingerprint(config)
+
+    def test_geometry_log_line_is_machine_parseable_for_all_modes(self):
+        cases = (
+            (no_lumen_config(), "controller", "none", "none", 0),
+            (cylinder_config(), "simulator", "cylindrical", "none", 0),
+            (curved_config("circular_arc"), "controller", "curved", "circular_arc", None),
+            (curved_config("s_curve"), "simulator", "curved", "s_curve", None),
+        )
+        for config, role, mode, lumen_type, expected_points in cases:
+            with self.subTest(mode=mode, role=role, lumen_type=lumen_type):
+                line = lumen_geometry_log_line(config, role=role)
+                fields = dict(part.split("=", 1) for part in line.split()[1:])
+                self.assertTrue(line.startswith("LUMEN_GEOMETRY "))
+                self.assertEqual(role, fields["role"])
+                self.assertEqual(mode, fields["mode"])
+                self.assertEqual(lumen_type, fields["type"])
+                self.assertEqual("base_link", fields["frame"])
+                self.assertRegex(fields["fingerprint"], re.compile(r"^[0-9a-f]{64}$"))
+                if expected_points is None:
+                    self.assertGreater(int(fields["points"]), 2)
+                else:
+                    self.assertEqual(expected_points, int(fields["points"]))
+
+    def test_controller_and_simulator_log_lines_share_geometry_identity(self):
+        config = curved_config("circular_arc")
+        controller_fields = dict(part.split("=", 1) for part in lumen_geometry_log_line(config, role="controller").split()[1:])
+        simulator_fields = dict(part.split("=", 1) for part in lumen_geometry_log_line(config, role="simulator").split()[1:])
+        for key in ("mode", "type", "frame", "points", "fingerprint"):
+            self.assertEqual(controller_fields[key], simulator_fields[key])
+        self.assertNotEqual(controller_fields["role"], simulator_fields["role"])
+
+    def test_geometry_log_line_rejects_empty_role(self):
+        with self.assertRaisesRegex(ValueError, "role"):
+            lumen_geometry_log_line(no_lumen_config(), role="")
 
     def test_mppi_profile_override_preserves_cylinder_fast_values(self):
         config = no_lumen_config()

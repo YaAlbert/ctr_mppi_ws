@@ -8,14 +8,19 @@ from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path as NavPath
 
-from ctr_bringup.parameter_validation import load_parameter_files, validate_config_paths, validate_or_raise
+from ctr_bringup.parameter_validation import (
+    load_parameter_files,
+    parse_launch_bool,
+    validate_config_paths,
+    validate_or_raise,
+)
 from ctr_bringup.placeholder_node import run_node_until_shutdown
 from ctr_interfaces.msg import CtrControllerMetrics, CtrJointCommand, CtrState
 from ctr_model.approximate_model import ApproximateCTRModel
 from ctr_mppi_controller.cylindrical_lumen import goal_position_from_config
 from ctr_mppi_controller.lumen_factory import (
     config_with_lumen_overrides,
-    lumen_geometry_fingerprint,
+    lumen_geometry_log_line,
     lumen_cost_weights_from_config,
     lumen_geometry_from_config,
     lumen_mode_from_config,
@@ -41,6 +46,8 @@ class MPPIControllerNode(Node):
         self.declare_parameter("reference_type", "")
         self.declare_parameter("publish_safe_command_for_simulation", False)
         self.declare_parameter("enable_cylindrical_lumen", False)
+        self.declare_parameter("enable_curved_lumen", False)
+        self.declare_parameter("curved_lumen_type", "")
         self.declare_parameter("cylinder_profile", "")
         self.declare_parameter("cylinder_target_position", Parameter.Type.DOUBLE_ARRAY)
         self.declare_parameter("mppi_random_seed", -1)
@@ -48,10 +55,19 @@ class MPPIControllerNode(Node):
         config_paths = validate_config_paths(self.get_parameter("config_paths").value)
 
         raw_config = load_parameter_files(config_paths)
-        enable_lumen = _bool_value(self.get_parameter("enable_cylindrical_lumen").value)
+        enable_lumen = parse_launch_bool(
+            self.get_parameter("enable_cylindrical_lumen").value,
+            "enable_cylindrical_lumen",
+        )
+        enable_curved_lumen = parse_launch_bool(
+            self.get_parameter("enable_curved_lumen").value,
+            "enable_curved_lumen",
+        )
         self.config = config_with_lumen_overrides(
             raw_config,
             enable_cylindrical_lumen=enable_lumen,
+            enable_curved_lumen=enable_curved_lumen,
+            curved_lumen_type=str(self.get_parameter("curved_lumen_type").value or ""),
             target=_optional_vector3_parameter(self.get_parameter("cylinder_target_position").value),
             cylinder_profile=str(self.get_parameter("cylinder_profile").value or ""),
             random_seed=_optional_seed(self.get_parameter("mppi_random_seed").value),
@@ -260,29 +276,7 @@ class MPPIControllerNode(Node):
         )
 
     def _geometry_summary(self, *, target_validation_status: str) -> str:
-        fingerprint = lumen_geometry_fingerprint(self.config)
-        if self.lumen_geometry is None:
-            return (
-                "MPPI lumen geometry mode: none; "
-                f"geometry_fingerprint={fingerprint}; target_validation=not_applicable."
-            )
-        parts = [
-            f"MPPI lumen geometry mode: {self.lumen_mode}",
-            f"frame_id={self.lumen_geometry.frame_id}",
-            f"ctr_outer_radius={self.lumen_geometry.ctr_outer_radius:.6g}",
-            f"safety_margin={self.lumen_geometry.safety_margin:.6g}",
-        ]
-        radius = getattr(self.lumen_geometry, "radius", None)
-        if radius is None:
-            radius = getattr(self.lumen_geometry, "minimum_lumen_radius", None)
-        if radius is not None:
-            parts.append(f"lumen_radius={float(radius):.6g}")
-        if self.lumen_mode == "curved":
-            parts.append(f"curved_type={self.config.get('curved_lumen', {}).get('type')}")
-            parts.append(f"centerline_samples={len(getattr(self.lumen_geometry, 'centerline_points', []))}")
-        parts.append(f"geometry_fingerprint={fingerprint}")
-        parts.append(f"target_validation={target_validation_status}")
-        return "; ".join(parts) + "."
+        return f"{lumen_geometry_log_line(self.config, role='controller')} target_validation={target_validation_status}"
 
 
 def reference_mode_from_config(config: dict, override) -> str:
@@ -471,14 +465,6 @@ def _optional_vector3_parameter(values) -> list[float] | None:
     if isinstance(values, (list, tuple)) and len(values) == 0:
         return None
     return [float(value) for value in _vector3(values, "cylinder_target_position")]
-
-
-def _bool_value(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() == "true"
-    return bool(value)
 
 
 def _optional_seed(value) -> int | None:

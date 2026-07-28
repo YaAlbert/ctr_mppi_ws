@@ -15,6 +15,7 @@ from ctr_bringup.parameter_validation import (  # noqa: E402
     ParameterValidationError,
     UNRESOLVED_TODO_IDS,
     load_parameter_files,
+    parse_launch_bool,
     project_config_with_overrides,
     validate_config_paths,
     validate_project_config,
@@ -162,6 +163,8 @@ class ParameterValidationTest(unittest.TestCase):
         self.assertIn("evaluation_baseline_result_dir", launch_arguments)
         self.assertIn("evaluation_output_root", launch_arguments)
         self.assertIn("enable_cylindrical_lumen", launch_arguments)
+        self.assertIn("enable_curved_lumen", launch_arguments)
+        self.assertIn("curved_lumen_type", launch_arguments)
         self.assertIn("cylinder_profile", launch_arguments)
         self.assertIn("cylinder_target_x", launch_arguments)
         self.assertIn("cylinder_target_y", launch_arguments)
@@ -191,6 +194,8 @@ class ParameterValidationTest(unittest.TestCase):
         self.assertIn("trajectory_start_policy", launch_arguments)
         self.assertIn("scheduled_reference_epoch", launch_arguments)
         self.assertIn("enable_cylindrical_lumen", launch_arguments)
+        self.assertIn("enable_curved_lumen", launch_arguments)
+        self.assertIn("curved_lumen_type", launch_arguments)
         self.assertIn("cylinder_profile", launch_arguments)
         self.assertIn("cylinder_target_x", launch_arguments)
         self.assertIn("cylinder_target_y", launch_arguments)
@@ -215,6 +220,8 @@ class ParameterValidationTest(unittest.TestCase):
         }
         self.assertIn("publish_safe_command_for_simulation", launch_arguments)
         self.assertIn("enable_cylindrical_lumen", launch_arguments)
+        self.assertIn("enable_curved_lumen", launch_arguments)
+        self.assertIn("curved_lumen_type", launch_arguments)
         self.assertIn("cylinder_profile", launch_arguments)
         self.assertIn("cylinder_target_x", launch_arguments)
         self.assertIn("cylinder_target_y", launch_arguments)
@@ -235,6 +242,18 @@ class ParameterValidationTest(unittest.TestCase):
                 source = path.read_text(encoding="utf-8")
                 self.assertIn('declare_parameter("cylinder_target_position", Parameter.Type.DOUBLE_ARRAY)', source)
 
+    def test_curved_lumen_node_parameters_are_declared_for_runtime_nodes(self):
+        node_files = (
+            REPO_ROOT / "src" / "ctr_sim" / "ctr_sim" / "nodes" / "simulator_node.py",
+            REPO_ROOT / "src" / "ctr_mppi_controller" / "ctr_mppi_controller" / "nodes" / "mppi_controller_node.py",
+            REPO_ROOT / "src" / "ctr_mppi_controller" / "ctr_mppi_controller" / "nodes" / "reference_manager_node.py",
+        )
+        for path in node_files:
+            with self.subTest(path=path.name):
+                source = path.read_text(encoding="utf-8")
+                self.assertIn('declare_parameter("enable_curved_lumen", False)', source)
+                self.assertIn('declare_parameter("curved_lumen_type", "")', source)
+
     def test_cylinder_target_launch_parameters_are_typed_double_arrays(self):
         launch_files = (
             REPO_ROOT / "src" / "ctr_bringup" / "launch" / "simulation.launch.py",
@@ -246,6 +265,53 @@ class ParameterValidationTest(unittest.TestCase):
                 source = path.read_text(encoding="utf-8")
                 self.assertIn("ParameterValue", source)
                 self.assertIn("value_type=list[float]", source)
+
+    def test_curved_launch_arguments_are_forwarded_without_scalar_overrides(self):
+        launch_files = (
+            REPO_ROOT / "src" / "ctr_bringup" / "launch" / "simulation.launch.py",
+            REPO_ROOT / "src" / "ctr_bringup" / "launch" / "evaluation_reference.launch.py",
+            REPO_ROOT / "src" / "ctr_bringup" / "launch" / "evaluation_mppi_controller.launch.py",
+        )
+        forbidden_scalar_args = (
+            '"lumen_radius"',
+            '"ctr_outer_radius"',
+            '"safety_margin"',
+            '"centerline_sample_spacing"',
+            '"curvature_radius"',
+            '"arc_angle"',
+            '"lateral_amplitude"',
+        )
+        for path in launch_files:
+            with self.subTest(path=path.name):
+                source = path.read_text(encoding="utf-8")
+                self.assertIn('"enable_curved_lumen"', source)
+                self.assertIn('"curved_lumen_type"', source)
+                for scalar_arg in forbidden_scalar_args:
+                    self.assertNotIn(f"DeclareLaunchArgument(\n                {scalar_arg}", source)
+
+    def test_simulation_launch_reference_manager_condition_handles_curved_fixed_target(self):
+        source = (REPO_ROOT / "src" / "ctr_bringup" / "launch" / "simulation.launch.py").read_text(encoding="utf-8")
+        self.assertIn("reference_manager_condition", source)
+        self.assertIn("enable_curved_lumen", source)
+        self.assertIn("' == 'fixed_target'", source)
+
+    def test_launch_bool_parser_accepts_only_textual_booleans(self):
+        accepted = (
+            (True, True),
+            (False, False),
+            ("true", True),
+            ("false", False),
+            ("True", True),
+            ("False", False),
+        )
+        for value, expected in accepted:
+            with self.subTest(value=value):
+                self.assertIs(expected, parse_launch_bool(value, "enable_curved_lumen"))
+
+        for value in ("1", "0", "", "yes", 1, 0, [], {}):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ParameterValidationError, "enable_curved_lumen"):
+                    parse_launch_bool(value, "enable_curved_lumen")
 
     def test_mppi_seed_node_parameters_are_integer_with_negative_default(self):
         node_files = (

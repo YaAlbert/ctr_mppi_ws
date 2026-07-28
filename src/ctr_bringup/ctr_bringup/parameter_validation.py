@@ -183,6 +183,20 @@ def project_config_with_overrides(
     return result
 
 
+def parse_launch_bool(value: Any, label: str) -> bool:
+    """Parse launch-provided booleans without Python truthiness coercion."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    raise ParameterValidationError(f"`{label}` must be a launch boolean string `true` or `false`.")
+
+
 def _validate_robot(robot: Any) -> list[str]:
     errors: list[str] = []
     if not isinstance(robot, dict):

@@ -136,6 +136,31 @@ def lumen_geometry_fingerprint(config_or_geometry: Mapping[str, Any] | LumenGeom
     return hashlib.sha256(encoded).hexdigest()
 
 
+def lumen_geometry_log_line(config: Mapping[str, Any], *, role: str) -> str:
+    role_value = str(role)
+    if role_value == "":
+        raise ValueError("lumen geometry log role must be non-empty")
+    mode = lumen_mode_from_config(config)
+    geometry = lumen_geometry_from_config(config)
+    lumen_type = "none"
+    frame = _default_frame_id(config)
+    point_count = 0
+    if geometry is not None:
+        frame = geometry.frame_id
+        if mode == "curved":
+            lumen_type = str(config.get("curved_lumen", {}).get("type", "unknown"))
+            point_count = int(getattr(geometry, "centerline_points", np.empty((0, 3))).shape[0])
+    return (
+        "LUMEN_GEOMETRY "
+        f"role={role_value} "
+        f"mode={mode} "
+        f"type={lumen_type} "
+        f"frame={frame} "
+        f"points={point_count} "
+        f"fingerprint={lumen_geometry_fingerprint(config)}"
+    )
+
+
 def lumen_geometry_fingerprint_payload(config_or_geometry: Mapping[str, Any] | LumenGeometry | None) -> dict[str, Any]:
     if config_or_geometry is None:
         return {"mode": "none"}
@@ -238,6 +263,11 @@ def _array_payload(values: Any, label: str) -> list[Any]:
     if not np.all(np.isfinite(array)):
         raise ValueError(f"{label} contains non-finite values")
     return array.tolist()
+
+
+def _default_frame_id(config: Mapping[str, Any]) -> str:
+    frame = config.get("robot", {}).get("frames", {}).get("base", "unknown")
+    return str(frame) if frame is not None else "unknown"
 
 
 def _float_payload(value: Any, label: str) -> float:

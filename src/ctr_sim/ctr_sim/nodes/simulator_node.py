@@ -14,14 +14,21 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
 
-from ctr_bringup.parameter_validation import load_parameter_files, validate_config_paths, validate_or_raise
+from ctr_bringup.parameter_validation import (
+    load_parameter_files,
+    parse_launch_bool,
+    validate_config_paths,
+    validate_or_raise,
+)
 from ctr_bringup.placeholder_node import run_node_until_shutdown
 from ctr_interfaces.msg import CtrBackbone, CtrJointCommand, CtrJointState, CtrState
 from ctr_model.approximate_model import ApproximateCTRModel
-from ctr_mppi_controller.cylindrical_lumen import (
-    CylindricalLumen,
-    config_with_cylinder_overrides,
-    goal_position_from_config,
+from ctr_mppi_controller.cylindrical_lumen import CylindricalLumen, goal_position_from_config
+from ctr_mppi_controller.lumen_factory import (
+    config_with_lumen_overrides,
+    lumen_geometry_log_line,
+    lumen_geometry_from_config,
+    lumen_mode_from_config,
 )
 from ctr_sim.simulation_core import CTRSimulationCore
 from rclpy.node import Node
@@ -38,18 +45,30 @@ class CTRSimulatorNode(Node):
         self.declare_parameter("target_position", [0.0, 0.0, 0.08])
         self.declare_parameter("command_timeout", 0.25)
         self.declare_parameter("enable_cylindrical_lumen", False)
+        self.declare_parameter("enable_curved_lumen", False)
+        self.declare_parameter("curved_lumen_type", "")
         self.declare_parameter("cylinder_target_position", Parameter.Type.DOUBLE_ARRAY)
 
         config_paths = validate_config_paths(self.get_parameter("config_paths").value)
 
         raw_config = load_parameter_files(config_paths)
-        self.enable_lumen = _bool_value(self.get_parameter("enable_cylindrical_lumen").value)
-        self.config = config_with_cylinder_overrides(
+        enable_lumen = parse_launch_bool(
+            self.get_parameter("enable_cylindrical_lumen").value,
+            "enable_cylindrical_lumen",
+        )
+        enable_curved_lumen = parse_launch_bool(
+            self.get_parameter("enable_curved_lumen").value,
+            "enable_curved_lumen",
+        )
+        self.config = config_with_lumen_overrides(
             raw_config,
-            enabled=self.enable_lumen,
-            target_position=_optional_vector3_parameter(self.get_parameter("cylinder_target_position").value),
+            enable_cylindrical_lumen=enable_lumen,
+            enable_curved_lumen=enable_curved_lumen,
+            curved_lumen_type=str(self.get_parameter("curved_lumen_type").value or ""),
+            target=_optional_vector3_parameter(self.get_parameter("cylinder_target_position").value),
         )
         validate_or_raise(self.config)
+        self.lumen_mode = lumen_mode_from_config(self.config)
 
         self.core = CTRSimulationCore(self.config)
         self.model = ApproximateCTRModel(self.config)
@@ -63,10 +82,11 @@ class CTRSimulatorNode(Node):
         self.tip_frame_id = self.config["robot"]["frames"]["tip"]
         self.target_position = (
             goal_position_from_config(self.config)
-            if self.enable_lumen
+            if self.lumen_mode != "none"
             else _vector3(self.get_parameter("target_position").value, "target_position")
         )
-        self.lumen = CylindricalLumen.from_config(self.config) if self.enable_lumen else None
+        self.lumen_geometry = lumen_geometry_from_config(self.config)
+        self.lumen = self.lumen_geometry
 
         self.latest_command = np.zeros(6, dtype=float)
         self.command_valid = False
@@ -99,6 +119,9 @@ class CTRSimulatorNode(Node):
         self.get_logger().info(
             "CTR simulator started: /ctr/safe_command -> /ctr/joint_state, /ctr/backbone, /ctr/tip, /ctr/state."
         )
+        self.get_logger().info(lumen_geometry_log_line(self.config, role="simulator"))
+        if self.lumen_mode == "curved":
+            self.get_logger().info("Curved lumen boundary markers are deferred to Milestone 6B-C3.")
 
     def _on_safe_command(self, msg: CtrJointCommand) -> None:
         try:
@@ -274,7 +297,7 @@ class CTRSimulatorNode(Node):
         target.pose.orientation.w = 1.0
 
         markers = [backbone, tip, target]
-        if self.lumen is not None:
+        if self.lumen_mode == "cylindrical" and isinstance(self.lumen, CylindricalLumen):
             markers.extend(self._lumen_markers(stamp, backbone_array))
         return MarkerArray(markers=markers)
 
@@ -372,14 +395,6 @@ def _optional_vector3_parameter(values) -> list[float] | None:
     if isinstance(values, (list, tuple)) and len(values) == 0:
         return None
     return [float(value) for value in _vector3(values, "cylinder_target_position")]
-
-
-def _bool_value(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() == "true"
-    return bool(value)
 
 
 def _quaternion_from_z_axis(axis: np.ndarray) -> tuple[float, float, float, float]:
