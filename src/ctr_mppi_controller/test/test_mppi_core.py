@@ -16,7 +16,13 @@ sys.path.insert(0, str(REPO_ROOT / "src" / "ctr_sim"))
 
 from ctr_bringup.parameter_validation import load_parameter_files, validate_or_raise  # noqa: E402
 from ctr_model.approximate_model import ApproximateCTRModel  # noqa: E402
-from ctr_mppi_controller.cylindrical_lumen import CylindricalLumen, LumenCostWeights, compute_lumen_cost  # noqa: E402
+from ctr_mppi_controller.cylindrical_lumen import (  # noqa: E402
+    CylindricalLumen,
+    LumenCostWeights,
+    compute_lumen_cost,
+    lumen_cost_weights_from_config,
+    lumen_geometry_from_config,
+)
 from ctr_mppi_controller.mppi_core import MPPICore  # noqa: E402
 from ctr_sim.simulation_core import CTRSimulationCore  # noqa: E402
 
@@ -51,7 +57,16 @@ def make_test_config():
 def make_controller():
     config = make_test_config()
     model = ApproximateCTRModel(config)
-    return config, model, MPPICore(config, model)
+    return config, model, make_core(config, model)
+
+
+def make_core(config, model):
+    return MPPICore(
+        config,
+        model,
+        lumen_geometry=lumen_geometry_from_config(config),
+        lumen_cost_weights=lumen_cost_weights_from_config(config),
+    )
 
 
 class FirstThreeJointTipModel:
@@ -178,7 +193,7 @@ class MPPICoreTest(unittest.TestCase):
 
     def test_fixed_target_matches_equivalent_tiled_sequence(self):
         config, model, fixed_controller = make_controller()
-        sequence_controller = MPPICore(config, model)
+        sequence_controller = make_core(config, model)
         target_q = np.zeros(fixed_controller.control_dimension)
         target_q[: config["robot"]["number_of_tubes"]] = 0.003
         target = model.forward_kinematics(target_q).tip_position
@@ -235,12 +250,12 @@ class MPPICoreTest(unittest.TestCase):
         target_q = np.zeros(control_dimension)
         target_q[: config["robot"]["number_of_tubes"]] = 0.003
         target = model.forward_kinematics(target_q).tip_position
-        first = MPPICore(config, model).solve(
+        first = make_core(config, model).solve(
             q=np.zeros(control_dimension),
             q_dot=np.zeros(control_dimension),
             target_tip=target,
         ).command
-        second = MPPICore(config, model).solve(
+        second = make_core(config, model).solve(
             q=np.zeros(control_dimension),
             q_dot=np.zeros(control_dimension),
             target_tip=target,
@@ -261,8 +276,8 @@ class MPPICoreTest(unittest.TestCase):
         no_lumen_config.pop("cylindrical_lumen_cost")
         model = ApproximateCTRModel(config)
         target = model.forward_kinematics(np.zeros(6)).tip_position
-        disabled = MPPICore(config, model).solve(q=np.zeros(6), q_dot=np.zeros(6), target_tip=target)
-        missing = MPPICore(no_lumen_config, ApproximateCTRModel(no_lumen_config)).solve(
+        disabled = make_core(config, model).solve(q=np.zeros(6), q_dot=np.zeros(6), target_tip=target)
+        missing = make_core(no_lumen_config, ApproximateCTRModel(no_lumen_config)).solve(
             q=np.zeros(6),
             q_dot=np.zeros(6),
             target_tip=target,
@@ -326,8 +341,8 @@ class MPPICoreTest(unittest.TestCase):
         config["mppi"]["weights"]["control"] = 0.0
         config["mppi"]["weights"]["smoothness"] = 0.0
         config["mppi"]["weights"]["terminal"] = 0.0
-        safe = MPPICore(config, BackbonePenaltyModel(colliding_middle=False))
-        colliding = MPPICore(config, BackbonePenaltyModel(colliding_middle=True))
+        safe = make_core(config, BackbonePenaltyModel(colliding_middle=False))
+        colliding = make_core(config, BackbonePenaltyModel(colliding_middle=True))
         sequence = np.zeros((safe.horizon, safe.control_dimension))
         target = [0.010, 0.0, 0.050]
         safe_cost = safe.rollout_candidate(
@@ -347,8 +362,8 @@ class MPPICoreTest(unittest.TestCase):
 
     def test_target_outside_lumen_is_rejected(self):
         config = make_test_config()
-        controller = MPPICore(config, ApproximateCTRModel(config))
-        with self.assertRaisesRegex(ValueError, "outside cylindrical lumen"):
+        controller = make_core(config, ApproximateCTRModel(config))
+        with self.assertRaisesRegex(ValueError, "outside selected lumen geometry"):
             controller.solve(q=np.zeros(6), q_dot=np.zeros(6), target_tip=[0.040, 0.0, 0.050])
 
     def test_offset_valid_target_produces_meaningful_nonzero_command(self):
@@ -385,8 +400,8 @@ class MPPICoreTest(unittest.TestCase):
         config["mppi"]["weights"]["smoothness"] = 0.0
         target = [0.010, 0.0, 0.050]
         sequence = np.zeros((config["mppi"]["horizon"], 6))
-        safe = MPPICore(config, BackbonePenaltyModel(colliding_middle=False))
-        colliding = MPPICore(config, BackbonePenaltyModel(colliding_middle=True))
+        safe = make_core(config, BackbonePenaltyModel(colliding_middle=False))
+        colliding = make_core(config, BackbonePenaltyModel(colliding_middle=True))
         safe_rollout = safe.rollout_candidate(
             q0=np.zeros(6),
             sequence=sequence,
@@ -522,7 +537,7 @@ class ClosedLoopFixedTargetIntegrationTest(unittest.TestCase):
         config = make_test_config()
         model = ApproximateCTRModel(config)
         simulation = CTRSimulationCore(config)
-        controller = MPPICore(config, model)
+        controller = make_core(config, model)
 
         target_q = np.zeros(controller.control_dimension)
         target_q[: config["robot"]["number_of_tubes"]] = 0.004

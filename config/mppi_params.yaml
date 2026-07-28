@@ -68,6 +68,29 @@ cylindrical_lumen:
   safety_margin: 0.0020
   note: provisional straight-cylinder software-simulation defaults only
 
+curved_lumen:
+  enabled: false
+  simulation_default: true
+  type: circular_arc
+  frame_id: base_link
+  lumen_radius: 0.030
+  ctr_outer_radius: 0.0015
+  safety_margin: 0.0020
+  centerline_sample_spacing: 0.002
+  circular_arc:
+    inlet_position: [0.0, 0.0, 0.0]
+    initial_tangent: [0.0, 0.0, 1.0]
+    bend_normal: [1.0, 0.0, 0.0]
+    curvature_radius: 0.180
+    arc_angle: 0.70
+  s_curve:
+    inlet_position: [0.0, 0.0, 0.0]
+    initial_tangent: [0.0, 0.0, 1.0]
+    bend_plane_normal: [1.0, 0.0, 0.0]
+    total_length: 0.120
+    lateral_amplitude: 0.015
+  note: provisional curved-lumen software-simulation defaults only
+
 cylindrical_lumen_cost:
   simulation_default: true
   safety_margin_weight: 100.0

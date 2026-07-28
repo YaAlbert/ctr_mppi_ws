@@ -51,6 +51,10 @@ class PointClearance:
     closest_geometry_point: np.ndarray
     radial_distance: float
     local_radius: float
+    wall_penetration: float
+    inlet_penetration: float
+    outlet_penetration: float
+    end_cap_penetration: float
     axial_position: float
     radial_clearance: float
     axial_clearance: float
@@ -67,6 +71,10 @@ class BackboneClearance:
     radial_collision_mask: np.ndarray
     inlet_violation_mask: np.ndarray
     outlet_violation_mask: np.ndarray
+    wall_penetrations: np.ndarray
+    inlet_penetrations: np.ndarray
+    outlet_penetrations: np.ndarray
+    end_cap_penetrations: np.ndarray
     maximum_penetration_depth: float
     minimum_clearance: float
     mean_clearance: float
@@ -128,6 +136,29 @@ class TargetValidation:
     clearance: PointClearance | None
 
 
+@dataclass(frozen=True)
+class LumenCostWeights:
+    safety_margin_weight: float
+    radial_collision_weight: float
+    end_cap_weight: float
+    terminal_collision_weight: float
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> "LumenCostWeights":
+        values = config.get("lumen_cost", config.get("cylindrical_lumen_cost", config.get("curved_lumen_cost", config)))
+        if not isinstance(values, dict):
+            raise ValueError("lumen cost configuration must be a map")
+        return cls(
+            safety_margin_weight=nonnegative_number(values["safety_margin_weight"], "safety_margin_weight"),
+            radial_collision_weight=nonnegative_number(values["radial_collision_weight"], "radial_collision_weight"),
+            end_cap_weight=nonnegative_number(values["end_cap_weight"], "end_cap_weight"),
+            terminal_collision_weight=nonnegative_number(
+                values["terminal_collision_weight"],
+                "terminal_collision_weight",
+            ),
+        )
+
+
 def make_backbone_clearance(
     *,
     points: np.ndarray,
@@ -147,6 +178,16 @@ def make_backbone_clearance(
     inlet_penetration: np.ndarray,
     outlet_penetration: np.ndarray,
 ) -> BackboneClearance:
+    radial_penetration = np.asarray(radial_penetration, dtype=float)
+    inlet_penetration = np.asarray(inlet_penetration, dtype=float)
+    outlet_penetration = np.asarray(outlet_penetration, dtype=float)
+    end_cap_penetration = np.maximum(inlet_penetration, outlet_penetration)
+    if (
+        radial_penetration.shape != physical_clearances.shape
+        or inlet_penetration.shape != physical_clearances.shape
+        or outlet_penetration.shape != physical_clearances.shape
+    ):
+        raise ValueError("penetration arrays must match physical_clearances shape")
     collision_mask = radial_collision_mask | inlet_violation_mask | outlet_violation_mask
     safety_margin_violation_mask = (
         (physical_clearances < safety_margin) | inlet_violation_mask | outlet_violation_mask
@@ -164,6 +205,10 @@ def make_backbone_clearance(
         radial_collision_mask=radial_collision_mask,
         inlet_violation_mask=inlet_violation_mask,
         outlet_violation_mask=outlet_violation_mask,
+        wall_penetrations=radial_penetration.copy(),
+        inlet_penetrations=inlet_penetration.copy(),
+        outlet_penetrations=outlet_penetration.copy(),
+        end_cap_penetrations=end_cap_penetration,
         maximum_penetration_depth=maximum_penetration_depth,
         minimum_clearance=float(np.min(physical_clearances)),
         mean_clearance=float(np.mean(physical_clearances)),
@@ -184,6 +229,49 @@ def make_backbone_clearance(
         collision_count=int(np.sum(collision_mask)),
         safety_margin_violation_count=int(np.sum(safety_margin_violation_mask)),
     )
+
+
+def compute_lumen_cost(
+    *,
+    lumen: LumenGeometry,
+    weights: LumenCostWeights,
+    backbone_points: Any,
+    terminal: bool = False,
+) -> float:
+    clearance = lumen.backbone_clearance(backbone_points)
+    _validate_clearance_arrays(clearance)
+    denominator = max(float(lumen.safety_margin), 1.0e-12)
+    soft = np.maximum(0.0, float(lumen.safety_margin) - clearance.physical_clearances) / denominator
+    wall = clearance.wall_penetrations / denominator
+    inlet = clearance.inlet_penetrations / denominator
+    outlet = clearance.outlet_penetrations / denominator
+    end_cap = clearance.end_cap_penetrations / denominator
+    cost = (
+        weights.safety_margin_weight * float(np.mean(soft**2))
+        + weights.radial_collision_weight * float(np.mean(wall**2))
+        + weights.end_cap_weight * float(np.mean(end_cap**2))
+    )
+    if terminal and clearance.points.shape[0] > 0:
+        terminal_violation = max(float(np.max(wall)), float(np.max(inlet)), float(np.max(outlet)))
+        if terminal_violation > 0.0:
+            cost += weights.terminal_collision_weight * terminal_violation**2
+    if not math.isfinite(cost):
+        raise ValueError("lumen cost is not finite")
+    return float(cost)
+
+
+def _validate_clearance_arrays(clearance: BackboneClearance) -> None:
+    arrays = (
+        clearance.physical_clearances,
+        clearance.wall_penetrations,
+        clearance.inlet_penetrations,
+        clearance.outlet_penetrations,
+        clearance.end_cap_penetrations,
+    )
+    expected_shape = clearance.physical_clearances.shape
+    for array in arrays:
+        if array.shape != expected_shape or not np.all(np.isfinite(array)):
+            raise ValueError("lumen clearance output contains non-finite or inconsistent arrays")
 
 
 def points_array(values: Any, label: str) -> np.ndarray:

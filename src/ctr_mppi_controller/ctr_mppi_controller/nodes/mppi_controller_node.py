@@ -12,7 +12,13 @@ from ctr_bringup.parameter_validation import load_parameter_files, validate_conf
 from ctr_bringup.placeholder_node import run_node_until_shutdown
 from ctr_interfaces.msg import CtrControllerMetrics, CtrJointCommand, CtrState
 from ctr_model.approximate_model import ApproximateCTRModel
-from ctr_mppi_controller.cylindrical_lumen import config_with_cylinder_overrides, goal_position_from_config
+from ctr_mppi_controller.cylindrical_lumen import (
+    config_with_cylinder_overrides,
+    goal_position_from_config,
+    lumen_cost_weights_from_config,
+    lumen_geometry_from_config,
+    lumen_mode_from_config,
+)
 from ctr_mppi_controller.mppi_core import MPPICore
 from ctr_mppi_controller.trajectory_metrics import TrajectoryMetricsAccumulator, TrajectoryMetricsConfig
 from rclpy.node import Node
@@ -52,11 +58,28 @@ class MPPIControllerNode(Node):
         validate_or_raise(self.config)
 
         self.model = ApproximateCTRModel(self.config)
-        self.core = MPPICore(self.config, self.model)
+        self.lumen_geometry = lumen_geometry_from_config(self.config)
+        self.lumen_mode = lumen_mode_from_config(self.config)
         self.target_tip = (
             goal_position_from_config(self.config)
-            if enable_lumen
+            if self.lumen_geometry is not None
             else _vector3(self.get_parameter("target_position").value, "target_position")
+        )
+        target_validation_status = "not_applicable"
+        if self.lumen_geometry is not None:
+            validation = self.lumen_geometry.validate_target(
+                self.target_tip,
+                frame_id=self.config.get("goal", {}).get("frame_id"),
+                require_safety_margin=True,
+            )
+            target_validation_status = "valid" if validation.valid else "invalid"
+            if not validation.valid:
+                raise ValueError(f"configured target is outside selected lumen geometry: {validation.reasons}")
+        self.core = MPPICore(
+            self.config,
+            self.model,
+            lumen_geometry=self.lumen_geometry,
+            lumen_cost_weights=lumen_cost_weights_from_config(self.config),
         )
         self.reference_mode = reference_mode_from_config(self.config, self.get_parameter("reference_mode").value)
         self.trajectory_type = reference_type_from_config(self.config, self.get_parameter("reference_type").value)
@@ -99,6 +122,7 @@ class MPPIControllerNode(Node):
             "MPPI controller wrapper started. Enabled costs: tip, control, smoothness, terminal; "
             f"advanced costs disabled; reference_mode={self.reference_mode}; trajectory_type={self.trajectory_type}."
         )
+        self.get_logger().info(self._geometry_summary(target_validation_status=target_validation_status))
 
     def _on_state(self, msg: CtrState) -> None:
         if msg.valid:
@@ -233,6 +257,26 @@ class MPPIControllerNode(Node):
                 stamp=stamp,
             )
         )
+
+    def _geometry_summary(self, *, target_validation_status: str) -> str:
+        if self.lumen_geometry is None:
+            return "MPPI lumen geometry mode: none; target_validation=not_applicable."
+        parts = [
+            f"MPPI lumen geometry mode: {self.lumen_mode}",
+            f"frame_id={self.lumen_geometry.frame_id}",
+            f"ctr_outer_radius={self.lumen_geometry.ctr_outer_radius:.6g}",
+            f"safety_margin={self.lumen_geometry.safety_margin:.6g}",
+        ]
+        radius = getattr(self.lumen_geometry, "radius", None)
+        if radius is None:
+            radius = getattr(self.lumen_geometry, "minimum_lumen_radius", None)
+        if radius is not None:
+            parts.append(f"lumen_radius={float(radius):.6g}")
+        if self.lumen_mode == "curved":
+            parts.append(f"curved_type={self.config.get('curved_lumen', {}).get('type')}")
+            parts.append(f"centerline_samples={len(getattr(self.lumen_geometry, 'centerline_points', []))}")
+        parts.append(f"target_validation={target_validation_status}")
+        return "; ".join(parts) + "."
 
 
 def reference_mode_from_config(config: dict, override) -> str:

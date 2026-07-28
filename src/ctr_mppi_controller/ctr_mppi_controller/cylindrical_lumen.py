@@ -9,7 +9,16 @@ from typing import Any
 
 import numpy as np
 
-from .lumen_geometry import BackboneClearance, PointClearance, TargetValidation, make_backbone_clearance
+from .curved_lumen import CurvedLumen, circular_arc_centerline, s_curve_centerline
+from .lumen_geometry import (
+    BackboneClearance,
+    LumenCostWeights,
+    LumenGeometry,
+    PointClearance,
+    TargetValidation,
+    compute_lumen_cost,
+    make_backbone_clearance,
+)
 
 
 @dataclass(frozen=True)
@@ -80,7 +89,11 @@ class CylindricalLumen:
         inlet_violation = axial < 0.0
         outlet_violation = axial > self.length
         clamped_axial = float(np.clip(axial, 0.0, self.length))
-        maximum_penetration = max(0.0, -radial_clearance, -axial, axial - self.length)
+        radial_penetration = max(0.0, -radial_clearance)
+        inlet_penetration = max(0.0, -axial)
+        outlet_penetration = max(0.0, axial - self.length)
+        end_cap_penetration = max(inlet_penetration, outlet_penetration)
+        maximum_penetration = max(radial_penetration, end_cap_penetration)
         return PointClearance(
             point=point_array,
             physical_clearance=radial_clearance,
@@ -96,6 +109,10 @@ class CylindricalLumen:
             closest_geometry_point=self.axis_origin + clamped_axial * self.axis_direction,
             radial_distance=radial_distance,
             local_radius=self.radius,
+            wall_penetration=float(radial_penetration),
+            inlet_penetration=float(inlet_penetration),
+            outlet_penetration=float(outlet_penetration),
+            end_cap_penetration=float(end_cap_penetration),
             axial_position=axial,
             radial_clearance=radial_clearance,
             axial_clearance=axial_clearance,
@@ -184,31 +201,86 @@ class CylindricalLumen:
         return self.axis_origin + axial * self.axis_direction + radial_vector
 
 
-@dataclass(frozen=True)
-class LumenCostWeights:
-    safety_margin_weight: float
-    radial_collision_weight: float
-    end_cap_weight: float
-    terminal_collision_weight: float
-
-    @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "LumenCostWeights":
-        values = config.get("cylindrical_lumen_cost", config)
-        if not isinstance(values, dict):
-            raise ValueError("cylindrical_lumen_cost must be a map")
-        return cls(
-            safety_margin_weight=_nonnegative_number(values["safety_margin_weight"], "safety_margin_weight"),
-            radial_collision_weight=_nonnegative_number(values["radial_collision_weight"], "radial_collision_weight"),
-            end_cap_weight=_nonnegative_number(values["end_cap_weight"], "end_cap_weight"),
-            terminal_collision_weight=_nonnegative_number(
-                values["terminal_collision_weight"],
-                "terminal_collision_weight",
-            ),
-        )
-
-
 def cylindrical_lumen_enabled(config: dict[str, Any]) -> bool:
-    return bool(config.get("cylindrical_lumen", {}).get("enabled", False))
+    section = config.get("cylindrical_lumen", {})
+    if not isinstance(section, dict):
+        raise ValueError("cylindrical_lumen must be a map")
+    return bool(section.get("enabled", False))
+
+
+def curved_lumen_enabled(config: dict[str, Any]) -> bool:
+    section = config.get("curved_lumen", {})
+    if not isinstance(section, dict):
+        raise ValueError("curved_lumen must be a map")
+    return bool(section.get("enabled", False))
+
+
+def lumen_mode_from_config(config: dict[str, Any]) -> str:
+    cylindrical_enabled = cylindrical_lumen_enabled(config)
+    curved_enabled = curved_lumen_enabled(config)
+    if cylindrical_enabled and curved_enabled:
+        raise ValueError("exactly one lumen geometry mode may be enabled")
+    if cylindrical_enabled:
+        return "cylindrical"
+    if curved_enabled:
+        return "curved"
+    return "none"
+
+
+def lumen_geometry_from_config(config: dict[str, Any]) -> LumenGeometry | None:
+    mode = lumen_mode_from_config(config)
+    if mode == "none":
+        return None
+    if mode == "cylindrical":
+        return CylindricalLumen.from_config(config)
+    return _curved_lumen_from_config(config)
+
+
+def lumen_cost_weights_from_config(config: dict[str, Any]) -> LumenCostWeights | None:
+    if lumen_mode_from_config(config) == "none":
+        return None
+    return LumenCostWeights.from_config(config)
+
+
+def _curved_lumen_from_config(config: dict[str, Any]) -> CurvedLumen:
+    values = config.get("curved_lumen", {})
+    if not isinstance(values, dict):
+        raise ValueError("curved_lumen must be a map")
+    lumen_type = values.get("type")
+    sample_spacing = values["centerline_sample_spacing"]
+    if lumen_type == "circular_arc":
+        arc = values.get("circular_arc", {})
+        if not isinstance(arc, dict):
+            raise ValueError("curved_lumen.circular_arc must be a map")
+        centerline = circular_arc_centerline(
+            inlet_position=arc["inlet_position"],
+            initial_tangent=arc["initial_tangent"],
+            bend_normal=arc["bend_normal"],
+            curvature_radius=arc["curvature_radius"],
+            arc_angle=arc["arc_angle"],
+            sample_spacing=sample_spacing,
+        )
+    elif lumen_type == "s_curve":
+        s_curve = values.get("s_curve", {})
+        if not isinstance(s_curve, dict):
+            raise ValueError("curved_lumen.s_curve must be a map")
+        centerline = s_curve_centerline(
+            inlet_position=s_curve["inlet_position"],
+            initial_tangent=s_curve["initial_tangent"],
+            bend_plane_normal=s_curve["bend_plane_normal"],
+            total_length=s_curve["total_length"],
+            lateral_amplitude=s_curve["lateral_amplitude"],
+            sample_spacing=sample_spacing,
+        )
+    else:
+        raise ValueError("curved_lumen.type must be `circular_arc` or `s_curve`")
+    return CurvedLumen(
+        frame_id=values["frame_id"],
+        centerline_points=centerline,
+        lumen_radius=values["lumen_radius"],
+        ctr_outer_radius=values["ctr_outer_radius"],
+        safety_margin=values["safety_margin"],
+    )
 
 
 def goal_position_from_config(config: dict[str, Any]) -> np.ndarray:
@@ -270,34 +342,6 @@ def config_with_cylinder_overrides(
         seed = _nonnegative_int(random_seed, "mppi.random_seed")
         result.setdefault("mppi", {})["random_seed"] = seed
     return result
-
-
-def compute_lumen_cost(
-    *,
-    lumen: CylindricalLumen,
-    weights: LumenCostWeights,
-    backbone_points: Any,
-    terminal: bool = False,
-) -> float:
-    clearance = lumen.backbone_clearance(backbone_points)
-    denominator = max(lumen.safety_margin, 1.0e-12)
-    soft = np.maximum(0.0, lumen.safety_margin - clearance.radial_clearance) / denominator
-    radial = np.maximum(0.0, -clearance.radial_clearance) / denominator
-    inlet = np.maximum(0.0, -clearance.axial_position) / denominator
-    outlet = np.maximum(0.0, clearance.axial_position - lumen.length) / denominator
-    end_cap = np.maximum(inlet, outlet)
-    cost = (
-        weights.safety_margin_weight * float(np.mean(soft**2))
-        + weights.radial_collision_weight * float(np.mean(radial**2))
-        + weights.end_cap_weight * float(np.mean(end_cap**2))
-    )
-    if terminal and clearance.points.shape[0] > 0:
-        terminal_violation = max(float(np.max(radial)), float(np.max(end_cap)))
-        if terminal_violation > 0.0:
-            cost += weights.terminal_collision_weight * terminal_violation**2
-    if not math.isfinite(cost):
-        raise ValueError("cylindrical lumen cost is not finite")
-    return float(cost)
 
 
 def _points(values: Any, label: str) -> np.ndarray:

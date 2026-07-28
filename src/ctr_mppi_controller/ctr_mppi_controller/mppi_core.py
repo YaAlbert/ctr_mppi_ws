@@ -8,12 +8,6 @@ from typing import Any
 
 import numpy as np
 
-from .cylindrical_lumen import (
-    CylindricalLumen,
-    LumenCostWeights,
-    compute_lumen_cost,
-    cylindrical_lumen_enabled,
-)
 from .cost_functions import (
     control_magnitude_cost,
     control_smoothness_cost,
@@ -24,6 +18,7 @@ from .cost_functions import (
     terminal_tip_cost,
     tip_tracking_cost,
 )
+from .lumen_geometry import LumenCostWeights, LumenGeometry, compute_lumen_cost
 
 
 REQUIRED_WEIGHT_KEYS = (
@@ -148,7 +143,14 @@ class MPPIRollout:
 class MPPICore:
     """A small MPPI optimizer independent of ROS2."""
 
-    def __init__(self, config: dict[str, Any], model: Any):
+    def __init__(
+        self,
+        config: dict[str, Any],
+        model: Any,
+        *,
+        lumen_geometry: LumenGeometry | None = None,
+        lumen_cost_weights: LumenCostWeights | None = None,
+    ):
         self._config = config
         self._model = model
 
@@ -172,12 +174,10 @@ class MPPICore:
         self.last_costs = np.zeros(0, dtype=float)
         self.last_normalized_weights = np.zeros(0, dtype=float)
         self.last_rollout_final_q = np.zeros((0, self.control_dimension), dtype=float)
-        self.lumen = CylindricalLumen.from_config(config) if cylindrical_lumen_enabled(config) else None
-        self.lumen_cost_weights = (
-            LumenCostWeights.from_config(config["cylindrical_lumen_cost"])
-            if self.lumen is not None
-            else None
-        )
+        self.lumen = lumen_geometry
+        self.lumen_cost_weights = None
+        if self.lumen is not None:
+            self.lumen_cost_weights = lumen_cost_weights or LumenCostWeights.from_config(config)
         self._validate_disabled_costs()
 
     def reset(self) -> None:
@@ -403,7 +403,7 @@ class MPPICore:
         for index, point in enumerate(reference_sequence):
             validation = self.lumen.validate_target(point, frame_id=self._config.get("goal", {}).get("frame_id"), require_safety_margin=True)
             if not validation.valid:
-                raise ValueError(f"target_tip_sequence[{index}] is outside cylindrical lumen: {validation.reasons}")
+                raise ValueError(f"target_tip_sequence[{index}] is outside selected lumen geometry: {validation.reasons}")
 
     def _lumen_cost(self, backbone_points: np.ndarray, *, terminal: bool) -> float:
         if self.lumen is None or self.lumen_cost_weights is None:
@@ -418,7 +418,7 @@ class MPPICore:
     def _diagnostic_status(self) -> str:
         costs = "tip/control/smoothness/terminal"
         if self.lumen is not None:
-            costs += "/cylindrical_lumen"
+            costs += "/lumen"
         return f"MPPI controller: {costs} costs enabled; unsupported advanced costs disabled."
 
     def _weight(self, name: str) -> float:
