@@ -14,6 +14,9 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PACKAGE_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "src" / "ctr_bringup"))
+sys.path.insert(0, str(REPO_ROOT / "src" / "ctr_model"))
+sys.path.insert(0, str(REPO_ROOT / "src" / "ctr_mppi_controller"))
+sys.path.insert(0, str(REPO_ROOT / "src" / "ctr_sim"))
 
 from ctr_evaluation.metrics import compare_summaries  # noqa: E402
 from ctr_evaluation.run_evaluation import (  # noqa: E402
@@ -32,6 +35,7 @@ from ctr_evaluation.run_evaluation import (  # noqa: E402
     compute_initial_stability,
     default_config_paths,
     main,
+    model_reachability_sanity,
     output_root_from_config,
     parse_args,
     parse_completed_result,
@@ -163,6 +167,30 @@ class RunEvaluationHelpersTest(unittest.TestCase):
         self.assertEqual("circle", args.trajectory)
         self.assertAlmostEqual(12.0, args.duration)
 
+    def test_cylinder_cli_argument_parsing(self):
+        args = parse_args(
+            [
+                "--experiment-group",
+                "m6a_cylinder",
+                "--task",
+                "cylinder_navigation",
+                "--target",
+                "0.015",
+                "0.005",
+                "0.1",
+                "--mppi-profile",
+                "cylinder_fast",
+                "--seed",
+                "11",
+                "--duration",
+                "8.0",
+            ]
+        )
+        self.assertEqual("cylinder_navigation", args.task)
+        self.assertEqual([0.015, 0.005, 0.1], args.target)
+        self.assertEqual("cylinder_fast", args.mppi_profile)
+        self.assertEqual(11, args.seed)
+
     def test_default_cli_success_allows_worse_performance(self):
         original = patch_fake_orchestrator({"comparison": {"compatibility_valid": True}, "baseline_improvement_pass": False})
         try:
@@ -250,6 +278,35 @@ class RunEvaluationHelpersTest(unittest.TestCase):
         self.assertNotIn("evaluation_baseline_result_dir:=", command)
         self.assertTrue(all(not item.endswith(":=") for item in command))
 
+    def test_cylinder_launch_command_includes_navigation_arguments(self):
+        command = build_base_simulation_command(
+            experiment_group="group",
+            controller_label="mppi",
+            baseline_dir=None,
+            task="cylinder_navigation",
+            target_position=[0.015, 0.005, 0.1],
+            mppi_profile="cylinder_fast",
+            random_seed=11,
+            run_role="candidate",
+        )
+        self.assertIn("enable_cylindrical_lumen:=true", command)
+        self.assertIn("cylinder_target_x:=0.015000000", command)
+        self.assertIn("cylinder_target_y:=0.005000000", command)
+        self.assertIn("cylinder_target_z:=0.100000000", command)
+        self.assertIn("cylinder_profile:=cylinder_fast", command)
+        self.assertIn("mppi_random_seed:=11", command)
+        self.assertIn("run_role:=candidate", command)
+
+    def test_cylinder_launch_command_rejects_missing_target(self):
+        with self.assertRaises(OrchestrationError):
+            build_base_simulation_command(
+                experiment_group="group",
+                controller_label="mppi",
+                baseline_dir=None,
+                task="cylinder_navigation",
+                target_position=[],
+            )
+
     def test_candidate_launch_command_includes_baseline_result_dir(self):
         command = build_base_simulation_command(
             experiment_group="group",
@@ -257,6 +314,15 @@ class RunEvaluationHelpersTest(unittest.TestCase):
             baseline_dir=Path("/tmp/baseline"),
         )
         self.assertIn("evaluation_baseline_result_dir:=/tmp/baseline", command)
+
+    def test_launch_command_includes_output_root_override(self):
+        command = build_base_simulation_command(
+            experiment_group="group",
+            controller_label="mppi",
+            baseline_dir=None,
+            output_root=Path("/tmp/results"),
+        )
+        self.assertIn("evaluation_output_root:=/tmp/results", command)
 
     def test_baseline_nonzero_command_rejection(self):
         audit = CommandAudit(
@@ -572,6 +638,39 @@ class RunEvaluationHelpersTest(unittest.TestCase):
         controller_b = build_controller_configuration_hash(config, "mppi")
         self.assertEqual(shared_a, shared_b)
         self.assertNotEqual(controller_a, controller_b)
+
+    def test_cylinder_shared_hash_changes_with_goal(self):
+        config = load_parameter_files(CONFIG_FILES)
+        changed = yaml.safe_load(yaml.safe_dump(config))
+        changed["goal"]["position"] = [0.010, 0.012, 0.095]
+        shared_a = build_shared_environment_hash(
+            config,
+            task="cylinder_navigation",
+            trajectory="circle",
+            duration=12.0,
+            reference_lead_time=1.0,
+        )
+        shared_b = build_shared_environment_hash(
+            changed,
+            task="cylinder_navigation",
+            trajectory="circle",
+            duration=12.0,
+            reference_lead_time=1.0,
+        )
+        self.assertNotEqual(shared_a, shared_b)
+
+    def test_model_reachability_sanity_reaches_default_cylinder_target(self):
+        from ctr_model.approximate_model import ApproximateCTRModel
+
+        config = load_parameter_files(CONFIG_FILES)
+        result = model_reachability_sanity(
+            model=ApproximateCTRModel(config),
+            config=config,
+            target=config["goal"]["position"],
+            tolerance=float(config["goal"]["tolerance"]),
+        )
+        self.assertTrue(result["reachable"], result)
+        self.assertGreater(result["evaluated_candidates"], 0)
 
     def test_run_ids_are_unique(self):
         first = build_run_id("orch", "baseline", "zero_command")

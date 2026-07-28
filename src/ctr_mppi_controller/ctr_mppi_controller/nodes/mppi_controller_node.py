@@ -12,6 +12,7 @@ from ctr_bringup.parameter_validation import load_parameter_files, validate_conf
 from ctr_bringup.placeholder_node import run_node_until_shutdown
 from ctr_interfaces.msg import CtrControllerMetrics, CtrJointCommand, CtrState
 from ctr_model.approximate_model import ApproximateCTRModel
+from ctr_mppi_controller.cylindrical_lumen import config_with_cylinder_overrides, goal_position_from_config
 from ctr_mppi_controller.mppi_core import MPPICore
 from ctr_mppi_controller.trajectory_metrics import TrajectoryMetricsAccumulator, TrajectoryMetricsConfig
 from rclpy.node import Node
@@ -32,15 +33,31 @@ class MPPIControllerNode(Node):
         self.declare_parameter("reference_mode", "")
         self.declare_parameter("reference_type", "")
         self.declare_parameter("publish_safe_command_for_simulation", False)
+        self.declare_parameter("enable_cylindrical_lumen", False)
+        self.declare_parameter("cylinder_profile", "")
+        self.declare_parameter("cylinder_target_position", Parameter.Type.DOUBLE_ARRAY)
+        self.declare_parameter("mppi_random_seed", -1)
 
         config_paths = validate_config_paths(self.get_parameter("config_paths").value)
 
-        self.config = load_parameter_files(config_paths)
+        raw_config = load_parameter_files(config_paths)
+        enable_lumen = _bool_value(self.get_parameter("enable_cylindrical_lumen").value)
+        self.config = config_with_cylinder_overrides(
+            raw_config,
+            enabled=enable_lumen,
+            target_position=_optional_vector3_parameter(self.get_parameter("cylinder_target_position").value),
+            mppi_profile=str(self.get_parameter("cylinder_profile").value or ""),
+            random_seed=_optional_seed(self.get_parameter("mppi_random_seed").value),
+        )
         validate_or_raise(self.config)
 
         self.model = ApproximateCTRModel(self.config)
         self.core = MPPICore(self.config, self.model)
-        self.target_tip = _vector3(self.get_parameter("target_position").value, "target_position")
+        self.target_tip = (
+            goal_position_from_config(self.config)
+            if enable_lumen
+            else _vector3(self.get_parameter("target_position").value, "target_position")
+        )
         self.reference_mode = reference_mode_from_config(self.config, self.get_parameter("reference_mode").value)
         self.trajectory_type = reference_type_from_config(self.config, self.get_parameter("reference_type").value)
         self.latest_state: CtrState | None = None
@@ -396,6 +413,27 @@ def _vector3(values, label: str) -> np.ndarray:
     if array.shape != (3,) or not np.all(np.isfinite(array)):
         raise ValueError(f"{label} must contain 3 finite values")
     return array
+
+
+def _optional_vector3_parameter(values) -> list[float] | None:
+    if values is None or values == "":
+        return None
+    if isinstance(values, (list, tuple)) and len(values) == 0:
+        return None
+    return [float(value) for value in _vector3(values, "cylinder_target_position")]
+
+
+def _bool_value(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+    return bool(value)
+
+
+def _optional_seed(value) -> int | None:
+    seed = int(value)
+    return None if seed < 0 else seed
 
 
 def _finite_float(value, label: str) -> float:

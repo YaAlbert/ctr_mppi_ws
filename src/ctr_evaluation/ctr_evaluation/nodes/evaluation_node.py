@@ -17,6 +17,7 @@ from ctr_bringup.parameter_validation import load_parameter_files, validate_conf
 from ctr_evaluation.experiment_recorder import EvaluationRecorderConfig, ExperimentRecorder, STATE_RECORDING
 from ctr_interfaces.msg import CtrControllerMetrics, CtrJointCommand, CtrState
 from ctr_interfaces.srv import StartExperiment, StopExperiment
+from ctr_mppi_controller.cylindrical_lumen import config_with_cylinder_overrides
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 
@@ -35,11 +36,27 @@ class EvaluationNode(Node):
         self.declare_parameter("experiment_group", "")
         self.declare_parameter("controller_label", "")
         self.declare_parameter("baseline_result_dir", "")
+        self.declare_parameter("output_root", "")
+        self.declare_parameter("enable_cylindrical_lumen", False)
+        self.declare_parameter("cylinder_profile", "")
+        self.declare_parameter("cylinder_target_position", Parameter.Type.DOUBLE_ARRAY)
+        self.declare_parameter("mppi_random_seed", -1)
+        self.declare_parameter("run_role", "")
 
         config_paths = validate_config_paths(self.get_parameter("config_paths").value)
-        self.project_config = load_parameter_files(config_paths)
+        raw_config = load_parameter_files(config_paths)
+        self.project_config = config_with_cylinder_overrides(
+            raw_config,
+            enabled=_bool_value(self.get_parameter("enable_cylindrical_lumen").value),
+            target_position=_optional_vector3_parameter(self.get_parameter("cylinder_target_position").value),
+            mppi_profile=str(self.get_parameter("cylinder_profile").value or ""),
+            random_seed=_optional_seed(self.get_parameter("mppi_random_seed").value),
+        )
         runtime_mode = str(self.get_parameter("runtime_mode").value)
         self.project_config.setdefault("runtime", {})["mode"] = runtime_mode
+        output_root = str(self.get_parameter("output_root").value or "")
+        if output_root:
+            self.project_config.setdefault("evaluation", {})["output_root"] = output_root
         validate_or_raise(self.project_config)
 
         self.recorder = ExperimentRecorder(
@@ -140,6 +157,7 @@ class EvaluationNode(Node):
             q=msg.q,
             q_dot=msg.q_dot,
             tip_position=[msg.tip_pose.position.x, msg.tip_pose.position.y, msg.tip_pose.position.z],
+            backbone_points=[[point.x, point.y, point.z] for point in msg.backbone],
         )
 
     def _on_tip(self, msg: PoseStamped) -> None:
@@ -224,6 +242,30 @@ def stamp_seconds(stamp) -> float:
 
 def point_from_pose(msg: PoseStamped) -> np.ndarray:
     return np.asarray([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z], dtype=float)
+
+
+def _optional_vector3_parameter(values) -> list[float] | None:
+    if values is None or values == "":
+        return None
+    if isinstance(values, (list, tuple)) and len(values) == 0:
+        return None
+    array = np.asarray(values, dtype=float)
+    if array.shape != (3,) or not np.all(np.isfinite(array)):
+        raise ValueError("cylinder_target_position must contain 3 finite values")
+    return [float(value) for value in array]
+
+
+def _bool_value(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+    return bool(value)
+
+
+def _optional_seed(value) -> int | None:
+    seed = int(value)
+    return None if seed < 0 else seed
 
 
 def run_evaluation_node_until_shutdown(rclpy_module, node_factory, *, args=None) -> None:

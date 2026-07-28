@@ -8,6 +8,7 @@ from launch.conditions import IfCondition
 from launch.substitutions import PythonExpression
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 CONFIG_NAMES = (
@@ -39,6 +40,18 @@ def generate_launch_description():
     evaluation_experiment_group = LaunchConfiguration("evaluation_experiment_group")
     evaluation_controller_label = LaunchConfiguration("evaluation_controller_label")
     evaluation_baseline_result_dir = LaunchConfiguration("evaluation_baseline_result_dir")
+    evaluation_output_root = LaunchConfiguration("evaluation_output_root")
+    enable_cylindrical_lumen = LaunchConfiguration("enable_cylindrical_lumen")
+    cylinder_profile = LaunchConfiguration("cylinder_profile")
+    cylinder_target_x = LaunchConfiguration("cylinder_target_x")
+    cylinder_target_y = LaunchConfiguration("cylinder_target_y")
+    cylinder_target_z = LaunchConfiguration("cylinder_target_z")
+    mppi_random_seed = LaunchConfiguration("mppi_random_seed")
+    run_role = LaunchConfiguration("run_role")
+    cylinder_target_position = ParameterValue(
+        PythonExpression(["[", cylinder_target_x, ", ", cylinder_target_y, ", ", cylinder_target_z, "]"]),
+        value_type=list[float],
+    )
     reference_manager_condition = IfCondition(
         PythonExpression(
             [
@@ -46,7 +59,9 @@ def generate_launch_description():
                 start_reference_manager,
                 "' == 'true' or '",
                 reference_mode,
-                "' == 'trajectory'",
+                "' == 'trajectory' or '",
+                enable_cylindrical_lumen,
+                "' == 'true'",
             ]
         )
     )
@@ -108,6 +123,46 @@ def generate_launch_description():
                 default_value="",
                 description="Optional baseline result directory for automatic comparison.",
             ),
+            DeclareLaunchArgument(
+                "evaluation_output_root",
+                default_value="",
+                description="Optional override for evaluation.output_root.",
+            ),
+            DeclareLaunchArgument(
+                "enable_cylindrical_lumen",
+                default_value="false",
+                description="Enable simulation-only straight cylindrical-lumen point-goal navigation.",
+            ),
+            DeclareLaunchArgument(
+                "cylinder_profile",
+                default_value="",
+                description="Optional MPPI profile name, for example cylinder_fast.",
+            ),
+            DeclareLaunchArgument(
+                "cylinder_target_x",
+                default_value="0.015",
+                description="Simulation-only cylinder point-goal x coordinate in meters.",
+            ),
+            DeclareLaunchArgument(
+                "cylinder_target_y",
+                default_value="0.005",
+                description="Simulation-only cylinder point-goal y coordinate in meters.",
+            ),
+            DeclareLaunchArgument(
+                "cylinder_target_z",
+                default_value="0.100",
+                description="Simulation-only cylinder point-goal z coordinate in meters.",
+            ),
+            DeclareLaunchArgument(
+                "mppi_random_seed",
+                default_value="-1",
+                description="Optional MPPI random seed override.",
+            ),
+            DeclareLaunchArgument(
+                "run_role",
+                default_value="",
+                description="Optional evaluation run role metadata.",
+            ),
             Node(
                 package="ctr_bringup",
                 executable="parameter_validator_node",
@@ -132,6 +187,8 @@ def generate_launch_description():
                         "runtime_mode": runtime_mode,
                         "target_position": [0.0, 0.0, 0.08],
                         "command_timeout": 0.25,
+                        "enable_cylindrical_lumen": enable_cylindrical_lumen,
+                        "cylinder_target_position": cylinder_target_position,
                     }
                 ],
             ),
@@ -164,6 +221,10 @@ def generate_launch_description():
                         "reference_mode": reference_mode,
                         "reference_type": reference_type,
                         "publish_safe_command_for_simulation": mppi_publish_safe_for_simulation,
+                        "enable_cylindrical_lumen": enable_cylindrical_lumen,
+                        "cylinder_profile": cylinder_profile,
+                        "cylinder_target_position": cylinder_target_position,
+                        "mppi_random_seed": mppi_random_seed,
                     }
                 ],
             ),
@@ -179,6 +240,10 @@ def generate_launch_description():
                         "runtime_mode": runtime_mode,
                         "reference_mode": reference_mode,
                         "reference_type": reference_type,
+                        "enable_cylindrical_lumen": enable_cylindrical_lumen,
+                        "cylinder_profile": cylinder_profile,
+                        "cylinder_target_position": cylinder_target_position,
+                        "mppi_random_seed": mppi_random_seed,
                     }
                 ],
             ),
@@ -195,6 +260,12 @@ def generate_launch_description():
                         "experiment_group": evaluation_experiment_group,
                         "controller_label": evaluation_controller_label,
                         "baseline_result_dir": evaluation_baseline_result_dir,
+                        "output_root": evaluation_output_root,
+                        "enable_cylindrical_lumen": enable_cylindrical_lumen,
+                        "cylinder_profile": cylinder_profile,
+                        "cylinder_target_position": cylinder_target_position,
+                        "mppi_random_seed": mppi_random_seed,
+                        "run_role": run_role,
                     }
                 ],
             ),

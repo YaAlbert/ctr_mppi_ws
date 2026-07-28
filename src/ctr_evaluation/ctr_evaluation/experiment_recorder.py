@@ -29,11 +29,20 @@ from ctr_evaluation.metrics import (
     aggregate_trial_summaries,
     compute_acceptance,
     compute_control_metrics,
+    compute_goal_metrics,
+    compute_lumen_safety_metrics,
+    compute_motion_metrics,
     compute_timing_metrics,
     compute_tracking_metrics,
     dataclass_to_plain,
     sanitize_for_json,
     stable_hash,
+)
+from ctr_mppi_controller.cylindrical_lumen import (
+    CylindricalLumen,
+    goal_hold_duration_from_config,
+    goal_position_from_config,
+    goal_tolerance_from_config,
 )
 from ctr_evaluation.time_alignment import (
     AlignmentConfig,
@@ -87,6 +96,10 @@ class EvaluationRecorderConfig:
     command_limits: np.ndarray
     state_min: np.ndarray
     state_max: np.ndarray
+    cylindrical_lumen: CylindricalLumen | None
+    goal_position: np.ndarray | None
+    goal_tolerance: float | None
+    goal_required_hold_duration: float | None
 
     @classmethod
     def from_project_config(
@@ -203,6 +216,26 @@ class EvaluationRecorderConfig:
             command_limits=command_limits,
             state_min=state_min,
             state_max=state_max,
+            cylindrical_lumen=(
+                CylindricalLumen.from_config(project_config)
+                if bool(project_config.get("cylindrical_lumen", {}).get("enabled", False))
+                else None
+            ),
+            goal_position=(
+                goal_position_from_config(project_config)
+                if bool(project_config.get("cylindrical_lumen", {}).get("enabled", False))
+                else None
+            ),
+            goal_tolerance=(
+                goal_tolerance_from_config(project_config)
+                if bool(project_config.get("cylindrical_lumen", {}).get("enabled", False))
+                else None
+            ),
+            goal_required_hold_duration=(
+                goal_hold_duration_from_config(project_config)
+                if bool(project_config.get("cylindrical_lumen", {}).get("enabled", False))
+                else None
+            ),
         )
 
 
@@ -252,6 +285,7 @@ class ExperimentRecorder:
         }
         self.horizon_records: list[dict[str, Any]] = []
         self.path_records: list[dict[str, Any]] = []
+        self.backbone_records: list[dict[str, Any]] = []
         self.initial_state_q: list[float] | None = None
         self.initial_tip_position: list[float] | None = None
 
@@ -365,7 +399,7 @@ class ExperimentRecorder:
 
                 plot_paths: list[Path] = []
                 if self.config.plot_generation:
-                    plot_paths = generate_plots(partial_dir, alignment.samples)
+                    plot_paths = generate_plots(partial_dir, alignment.samples, metadata=metadata)
                 if self.config.report_generation:
                     generate_report(
                         run_dir=partial_dir,
@@ -414,12 +448,23 @@ class ExperimentRecorder:
             self._write_finalization_error(partial_dir, exc)
             raise
 
-    def record_state(self, *, timestamp: float, q: Any, q_dot: Any, tip_position: Any) -> None:
+    def record_state(self, *, timestamp: float, q: Any, q_dot: Any, tip_position: Any, backbone_points: Any | None = None) -> None:
         if not self._accept_sample("/ctr/state"):
             return
         try:
-            sample = state_sample(timestamp, q, q_dot, tip_position)
+            sample = state_sample(timestamp, q, q_dot, tip_position, backbone_points=backbone_points)
             self.states.append(sample)
+            if sample.backbone_points is not None:
+                for index, point in enumerate(sample.backbone_points):
+                    self.backbone_records.append(
+                        {
+                            "timestamp": sample.timestamp,
+                            "index": index,
+                            "x": float(point[0]),
+                            "y": float(point[1]),
+                            "z": float(point[2]),
+                        }
+                    )
             if self.initial_state_q is None:
                 self.initial_state_q = [float(value) for value in sample.q]
             if self.initial_tip_position is None:
@@ -547,6 +592,29 @@ class ExperimentRecorder:
                 "model_parameters": self.config.model_parameters,
                 "model_configuration_hash": stable_hash(self.config.model_parameters),
                 "random_seed": self.config.random_seed,
+                "mppi_profile": self.config.mppi_parameters.get("active_profile", ""),
+                "cylindrical_lumen": (
+                    dataclass_to_plain(self.config.cylindrical_lumen)
+                    if self.config.cylindrical_lumen is not None
+                    else None
+                ),
+                "cylindrical_lumen_hash": (
+                    stable_hash(dataclass_to_plain(self.config.cylindrical_lumen))
+                    if self.config.cylindrical_lumen is not None
+                    else ""
+                ),
+                "goal": {
+                    "position": None if self.config.goal_position is None else self.config.goal_position.tolist(),
+                    "tolerance": self.config.goal_tolerance,
+                    "required_hold_duration": self.config.goal_required_hold_duration,
+                },
+                "goal_configuration_hash": stable_hash(
+                    {
+                        "position": None if self.config.goal_position is None else self.config.goal_position.tolist(),
+                        "tolerance": self.config.goal_tolerance,
+                        "required_hold_duration": self.config.goal_required_hold_duration,
+                    }
+                ),
                 "configured_duration": self.config.configured_duration,
                 "configured_control_period": self.config.thresholds.control_period,
                 "reference_sample_period": self.config.reference_sample_period,
@@ -572,6 +640,16 @@ class ExperimentRecorder:
         shared_environment = {
             "model_parameters": self.config.model_parameters,
             "simulation_parameters": self.project_config.get("simulation", {}),
+            "cylindrical_lumen": (
+                dataclass_to_plain(self.config.cylindrical_lumen)
+                if self.config.cylindrical_lumen is not None
+                else None
+            ),
+            "goal": {
+                "position": None if self.config.goal_position is None else self.config.goal_position.tolist(),
+                "tolerance": self.config.goal_tolerance,
+                "required_hold_duration": self.config.goal_required_hold_duration,
+            },
             "reference": {
                 "trajectory_type": self.config.trajectory_type,
                 "trajectory_parameters": self.config.trajectory_parameters,
@@ -721,7 +799,31 @@ class ExperimentRecorder:
             nearest_reference_fallback_count=alignment.diagnostics.nearest_reference_fallback_count,
             missing_command_count=alignment.diagnostics.missing_command_count,
             missing_topic_count=missing_topic_count,
+            missing_backbone_sample_count=sum(1 for sample in alignment.samples if sample.backbone_points is None),
         )
+        goal_metrics = None
+        lumen_safety = None
+        motion = None
+        if self.config.cylindrical_lumen is not None and self.config.goal_position is not None:
+            goal_metrics = compute_goal_metrics(
+                times=timestamps,
+                tip_positions=arrays["tip_positions"],
+                goal_position=self.config.goal_position,
+                tolerance=float(self.config.goal_tolerance),
+                required_hold_duration=float(self.config.goal_required_hold_duration),
+            )
+            lumen_safety = compute_lumen_safety_metrics(
+                times=timestamps,
+                backbone_points=[sample.backbone_points for sample in alignment.samples],
+                lumen=self.config.cylindrical_lumen,
+            )
+            motion = compute_motion_metrics(
+                times=timestamps,
+                tip_positions=arrays["tip_positions"],
+                q_values=arrays["q"],
+                goal_position=self.config.goal_position,
+                control=control,
+            )
         acceptance = compute_acceptance(
             tracking=tracking,
             control=control,
@@ -730,6 +832,8 @@ class ExperimentRecorder:
             data_quality=data_quality,
             thresholds=self.config.thresholds,
             baseline_improvement_valid=not self.config.baseline_result_dir,
+            goal=goal_metrics,
+            lumen_safety=lumen_safety,
             physical_validation=self.config.physical_validation,
             hardware_validation=self.config.hardware_validation,
         )
@@ -741,6 +845,12 @@ class ExperimentRecorder:
             data_quality=data_quality,
             acceptance=acceptance,
         ).to_dict()
+        if goal_metrics is not None:
+            summary["goal"] = dataclass_to_plain(goal_metrics)
+        if lumen_safety is not None:
+            summary["lumen_safety"] = dataclass_to_plain(lumen_safety)
+        if motion is not None:
+            summary["motion"] = dataclass_to_plain(motion)
         summary["alignment_rejection_reasons"] = alignment.diagnostics.rejection_reasons
         summary["topic_status"] = self._topic_status()
         return summary
@@ -810,6 +920,25 @@ class ExperimentRecorder:
             ["timestamp", "count"],
             self.path_records,
         )
+        write_rows(
+            run_dir / "backbone.csv",
+            ["timestamp", "index", "x", "y", "z"],
+            self.backbone_records,
+        )
+        if self.config.cylindrical_lumen is not None and self.config.goal_position is not None:
+            write_rows(
+                run_dir / "cylinder_navigation.csv",
+                [
+                    "timestamp",
+                    "tip_to_goal_error",
+                    "minimum_backbone_clearance",
+                    "minimum_axial_end_cap_clearance",
+                    "collision",
+                    "safety_margin_violation",
+                    "closest_backbone_point_index",
+                ],
+                self._cylinder_rows(),
+            )
 
     def _write_aggregate(self, group_dir: Path) -> None:
         summaries = []
@@ -853,6 +982,29 @@ class ExperimentRecorder:
                 "optional": topic not in required_topics(),
             }
         return result
+
+    def _cylinder_rows(self) -> list[list[Any]]:
+        if self.config.cylindrical_lumen is None or self.config.goal_position is None:
+            return []
+        rows: list[list[Any]] = []
+        for sample in self.states:
+            if sample.backbone_points is None:
+                rows.append([sample.timestamp, "", "", "", True, True, -1])
+                continue
+            clearance = self.config.cylindrical_lumen.backbone_clearance(sample.backbone_points)
+            tip_error = float(np.linalg.norm(sample.tip_position - self.config.goal_position))
+            rows.append(
+                [
+                    sample.timestamp,
+                    tip_error,
+                    clearance.minimum_radial_clearance,
+                    clearance.minimum_axial_clearance,
+                    clearance.collision_count > 0,
+                    clearance.safety_margin_violation_count > 0,
+                    clearance.closest_backbone_point_index,
+                ]
+            )
+        return rows
 
 
 def write_aligned_csv(path: Path, alignment: AlignmentResult) -> None:

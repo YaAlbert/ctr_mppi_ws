@@ -14,6 +14,7 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PACKAGE_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "src" / "ctr_bringup"))
+sys.path.insert(0, str(REPO_ROOT / "src" / "ctr_mppi_controller"))
 
 from ctr_bringup.parameter_validation import load_parameter_files, validate_or_raise  # noqa: E402
 from ctr_evaluation.experiment_recorder import (  # noqa: E402
@@ -49,6 +50,7 @@ def project_config(temp_dir, *, baseline_result_dir=""):
     config["evaluation"]["plot_generation"] = True
     config["evaluation"]["report_generation"] = True
     config["evaluation"]["baseline_result_dir"] = baseline_result_dir
+    config["cylindrical_lumen"]["enabled"] = False
     return config
 
 
@@ -72,6 +74,25 @@ def add_samples(recorder, *, tip_offset=0.0):
     recorder.record_reference(timestamp=1.0, position=[0.0, 0.0, 0.0], progress=1.0)
     recorder.record_command(timestamp=1.0, command=[0.0] * 6, saturated=False, source="safe_command")
     recorder.record_solve_timing(timestamp=1.0, solve_time=0.02, saturated=False)
+
+
+def add_cylinder_samples(recorder):
+    for timestamp, tip in ((0.0, [0.0192, 0.0, 0.080]), (1.0, [0.015, 0.005, 0.100])):
+        recorder.record_state(
+            timestamp=timestamp,
+            q=[0.0] * 6,
+            q_dot=[0.0] * 6,
+            tip_position=tip,
+            backbone_points=[
+                [0.0, 0.0, 0.0],
+                [0.010, 0.0, 0.050],
+                tip,
+            ],
+        )
+        recorder.record_tip(timestamp=timestamp, position=tip)
+        recorder.record_reference(timestamp=timestamp, position=[0.015, 0.005, 0.100], progress=1.0)
+        recorder.record_command(timestamp=timestamp, command=[0.0] * 6, saturated=False, source="safe_command")
+        recorder.record_solve_timing(timestamp=timestamp, solve_time=0.01, saturated=False)
 
 
 def strict_json_load(path: Path):
@@ -101,9 +122,30 @@ class ExperimentRecorderTest(unittest.TestCase):
             self.assertTrue((result.run_dir / "state.csv").is_file())
             self.assertTrue((result.run_dir / "tip.csv").is_file())
             self.assertTrue((result.run_dir / "aligned_samples.csv").is_file())
+            self.assertTrue((result.run_dir / "backbone.csv").is_file())
             self.assertTrue((result.run_dir / "report.md").is_file())
             self.assertTrue((result.run_dir / "tracking_error.png").is_file())
             self.assertFalse((result.run_dir.parent / f"{run_id}.partial").exists())
+
+    def test_cylinder_navigation_outputs_are_written_when_enabled(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = project_config(temp_dir)
+            config["cylindrical_lumen"]["enabled"] = True
+            recorder = ExperimentRecorder(
+                config=EvaluationRecorderConfig.from_project_config(config),
+                project_config=config,
+            )
+            recorder.start(experiment_name="cylinder", monotonic_time=0.0)
+            add_cylinder_samples(recorder)
+            result = recorder.stop(monotonic_time=1.0)
+            summary = strict_json_load(result.run_dir / "summary.json")
+            self.assertIn("goal", summary)
+            self.assertIn("lumen_safety", summary)
+            self.assertIn("motion", summary)
+            self.assertTrue((result.run_dir / "cylinder_navigation.csv").is_file())
+            self.assertTrue((result.run_dir / "wall_clearance.png").is_file())
+            self.assertTrue((result.run_dir / "cylinder_backbone_target_3d.png").is_file())
+            self.assertTrue(summary["lumen_safety"]["collision_free_pass"])
 
     def test_metadata_and_summary_are_machine_readable(self):
         with tempfile.TemporaryDirectory() as temp_dir:

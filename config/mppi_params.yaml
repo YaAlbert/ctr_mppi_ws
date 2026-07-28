@@ -32,6 +32,60 @@ mppi:
     shape_tolerance: 0.003
     stable_cycles: 10
 
+mppi_profiles:
+  cylinder_fast:
+    samples: 36
+    horizon: 7
+    dt: 0.55
+    control_period: 0.10
+    noise_std:
+      insertion: [0.0030, 0.0030, 0.0030]
+      rotation: [0.100, 0.100, 0.100]
+    weights:
+      tip: 15000.0
+      terminal: 15000.0
+      control: 0.005
+      smoothness: 0.01
+    simulation_default: true
+    note: provisional bounded software-test profile tuned for functional cylinder navigation, not real-time certification
+  reference_quality:
+    samples: 500
+    horizon: 10
+    dt: 0.05
+    control_period: 0.05
+    simulation_default: true
+    note: existing Milestone 5 reference-quality software-test profile
+
+cylindrical_lumen:
+  enabled: true
+  simulation_default: true
+  frame_id: base_link
+  axis_origin: [0.0, 0.0, 0.0]
+  axis_direction: [0.0, 0.0, 1.0]
+  radius: 0.030
+  length: 0.120
+  ctr_outer_radius: 0.0015
+  safety_margin: 0.0020
+  note: provisional straight-cylinder software-simulation defaults only
+
+cylindrical_lumen_cost:
+  simulation_default: true
+  safety_margin_weight: 100.0
+  radial_collision_weight: 100000.0
+  end_cap_weight: 100000.0
+  terminal_collision_weight: 200000.0
+  note: provisional dimensionless software-simulation weights
+
+goal:
+  simulation_default: true
+  frame_id: base_link
+  position: [0.015, 0.005, 0.100]
+  tolerance: 0.003
+  required_hold_duration: 0.5
+  reachability_samples: 2048
+  reachability_seed: 4
+  note: provisional software-simulation point goal, not measured hardware target
+
 # Milestone 5 software-test references are centered near the approximate
 # model's zero-configuration tip [0.0192, 0.0, 0.08] m. They are not physical
 # CTR workspace limits.

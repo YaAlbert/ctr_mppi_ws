@@ -8,6 +8,12 @@ from typing import Any
 
 import numpy as np
 
+from .cylindrical_lumen import (
+    CylindricalLumen,
+    LumenCostWeights,
+    compute_lumen_cost,
+    cylindrical_lumen_enabled,
+)
 from .cost_functions import (
     control_magnitude_cost,
     control_smoothness_cost,
@@ -166,6 +172,12 @@ class MPPICore:
         self.last_costs = np.zeros(0, dtype=float)
         self.last_normalized_weights = np.zeros(0, dtype=float)
         self.last_rollout_final_q = np.zeros((0, self.control_dimension), dtype=float)
+        self.lumen = CylindricalLumen.from_config(config) if cylindrical_lumen_enabled(config) else None
+        self.lumen_cost_weights = (
+            LumenCostWeights.from_config(config["cylindrical_lumen_cost"])
+            if self.lumen is not None
+            else None
+        )
         self._validate_disabled_costs()
 
     def reset(self) -> None:
@@ -213,7 +225,7 @@ class MPPICore:
 
         total = 0.0
         command_saturated = False
-        final_tip = None
+        final_model_result = None
 
         for step_index, command in enumerate(sequence_array):
             clipped_command = np.clip(command, -self.velocity_max, self.velocity_max)
@@ -223,20 +235,23 @@ class MPPICore:
             command_saturated = command_saturated or not np.allclose(next_q_unclipped, q)
 
             model_result = self._validated_model_result(q)
-            final_tip = model_result.tip_position
-            total += self._weight("tip") * tip_tracking_cost(final_tip, reference_sequence[step_index])
+            final_model_result = model_result
+            total += self._weight("tip") * tip_tracking_cost(model_result.tip_position, reference_sequence[step_index])
             total += self._weight("control") * control_magnitude_cost(clipped_command)
             total += self._weight("smoothness") * control_smoothness_cost(clipped_command, previous)
+            total += self._lumen_cost(model_result.backbone_points, terminal=False)
             total += shape_tracking_cost(enabled=self._weight("shape") > 0.0)
             total += obstacle_cost(enabled=self._weight("obstacle") > 0.0)
             total += tactile_cost(enabled=self._weight("force") > 0.0)
             total += stability_cost(enabled=self._weight("stability") > 0.0)
             previous = clipped_command
 
-        if final_tip is None:
+        if final_model_result is None:
             raise ValueError("rollout sequence is empty")
-        terminal = self._validated_model_result(q).tip_position
+        terminal_result = self._validated_model_result(q)
+        terminal = terminal_result.tip_position
         total += self._weight("terminal") * terminal_tip_cost(terminal, reference_sequence[-1])
+        total += self._lumen_cost(terminal_result.backbone_points, terminal=True)
         if not np.isfinite(total):
             raise ValueError("rollout cost is not finite")
         return MPPIRollout(
@@ -321,7 +336,7 @@ class MPPICore:
             effective_sample_weight=effective_sample_weight,
             command_magnitude=float(np.linalg.norm(command)),
             command_saturated=bool(command_saturated),
-            diagnostic_status="MPPI controller: tip/control/smoothness/terminal costs enabled; advanced costs disabled.",
+            diagnostic_status=self._diagnostic_status(),
         )
 
     def _rollout_cost(
@@ -353,8 +368,11 @@ class MPPICore:
             raise ValueError("exactly one of target_tip or target_tip_sequence must be provided")
         if target_tip is not None:
             target = _array_shape(target_tip, "target_tip", (3,))
-            return np.tile(target, (self.horizon, 1))
-        return _array_shape(target_tip_sequence, "target_tip_sequence", (self.horizon, 3)).copy()
+            sequence = np.tile(target, (self.horizon, 1))
+        else:
+            sequence = _array_shape(target_tip_sequence, "target_tip_sequence", (self.horizon, 3)).copy()
+        self._validate_reference_inside_lumen(sequence)
+        return sequence
 
     def _validate_disabled_costs(self) -> None:
         disabled = {
@@ -378,6 +396,30 @@ class MPPICore:
         if not np.all(np.isfinite(backbone)) or not np.all(np.isfinite(tip)):
             raise ValueError("model output contains non-finite values")
         return result
+
+    def _validate_reference_inside_lumen(self, reference_sequence: np.ndarray) -> None:
+        if self.lumen is None:
+            return
+        for index, point in enumerate(reference_sequence):
+            validation = self.lumen.validate_target(point, frame_id=self._config.get("goal", {}).get("frame_id"), require_safety_margin=True)
+            if not validation.valid:
+                raise ValueError(f"target_tip_sequence[{index}] is outside cylindrical lumen: {validation.reasons}")
+
+    def _lumen_cost(self, backbone_points: np.ndarray, *, terminal: bool) -> float:
+        if self.lumen is None or self.lumen_cost_weights is None:
+            return 0.0
+        return compute_lumen_cost(
+            lumen=self.lumen,
+            weights=self.lumen_cost_weights,
+            backbone_points=backbone_points,
+            terminal=terminal,
+        )
+
+    def _diagnostic_status(self) -> str:
+        costs = "tip/control/smoothness/terminal"
+        if self.lumen is not None:
+            costs += "/cylindrical_lumen"
+        return f"MPPI controller: {costs} costs enabled; unsupported advanced costs disabled."
 
     def _weight(self, name: str) -> float:
         return float(self.weights.get(name, 0.0))

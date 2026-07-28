@@ -138,6 +138,14 @@ def validate_project_config(config: dict[str, Any]) -> list[str]:
         errors.extend(_validate_model(config["model"]))
     if "mppi" in config:
         errors.extend(_validate_mppi(config["mppi"]))
+    if "mppi_profiles" in config:
+        errors.extend(_validate_mppi_profiles(config["mppi_profiles"]))
+    if "cylindrical_lumen" in config:
+        errors.extend(_validate_cylindrical_lumen(config["cylindrical_lumen"]))
+    if "cylindrical_lumen_cost" in config:
+        errors.extend(_validate_cylindrical_lumen_cost(config["cylindrical_lumen_cost"]))
+    if "goal" in config:
+        errors.extend(_validate_goal(config["goal"]))
     if "reference" in config:
         errors.extend(_validate_reference(config["reference"]))
     if "tracking_metrics" in config:
@@ -247,6 +255,109 @@ def _validate_mppi(mppi: Any) -> list[str]:
     weights = mppi.get("weights", {})
     for key in ("tip", "shape", "control", "smoothness", "obstacle", "terminal", "force", "joint_limit", "stability"):
         errors.extend(_require_number(weights, key, "mppi.weights", nonnegative=True))
+    return errors
+
+
+def _validate_mppi_profiles(profiles: Any) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(profiles, dict):
+        return ["`mppi_profiles` must be a map."]
+    for name, profile in profiles.items():
+        label = f"mppi_profiles.{name}"
+        if not isinstance(name, str) or not name:
+            errors.append("`mppi_profiles` keys must be non-empty strings.")
+            continue
+        if not isinstance(profile, dict):
+            errors.append(f"`{label}` must be a map.")
+            continue
+        errors.extend(_require_positive_number(profile, "samples", label, integer=True))
+        errors.extend(_require_positive_number(profile, "horizon", label, integer=True))
+        errors.extend(_require_positive_number(profile, "dt", label))
+        if "control_frequency" in profile:
+            errors.extend(_require_positive_number(profile, "control_frequency", label))
+        else:
+            errors.extend(_require_positive_number(profile, "control_period", label))
+        if "simulation_default" in profile and not isinstance(profile["simulation_default"], bool):
+            errors.append(f"`{label}.simulation_default` must be a boolean when present.")
+        if "lambda" in profile:
+            errors.extend(_require_positive_number(profile, "lambda", label))
+        if "weights" in profile:
+            weights = profile["weights"]
+            if not isinstance(weights, dict):
+                errors.append(f"`{label}.weights` must be a map.")
+            else:
+                for weight_name in ("tip", "shape", "control", "smoothness", "obstacle", "terminal", "force", "joint_limit", "stability"):
+                    if weight_name in weights:
+                        errors.extend(_require_number(weights, weight_name, f"{label}.weights", nonnegative=True))
+        if "noise_std" in profile:
+            noise = profile["noise_std"]
+            if not isinstance(noise, dict):
+                errors.append(f"`{label}.noise_std` must be a map.")
+            else:
+                for key in ("insertion", "rotation"):
+                    if key in noise:
+                        errors.extend(_require_numeric_list(noise, key, 3, f"{label}.noise_std", positive=True))
+    return errors
+
+
+def _validate_cylindrical_lumen(lumen: Any) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(lumen, dict):
+        return ["`cylindrical_lumen` must be a map."]
+    if not isinstance(lumen.get("enabled"), bool):
+        errors.append("`cylindrical_lumen.enabled` must be a boolean.")
+    if "simulation_default" in lumen and not isinstance(lumen["simulation_default"], bool):
+        errors.append("`cylindrical_lumen.simulation_default` must be a boolean when present.")
+    if not isinstance(lumen.get("frame_id"), str) or not lumen["frame_id"]:
+        errors.append("`cylindrical_lumen.frame_id` must be a non-empty string.")
+    errors.extend(_require_numeric_list(lumen, "axis_origin", 3, "cylindrical_lumen"))
+    errors.extend(_require_numeric_list(lumen, "axis_direction", 3, "cylindrical_lumen"))
+    errors.extend(_require_positive_number(lumen, "radius", "cylindrical_lumen"))
+    errors.extend(_require_positive_number(lumen, "length", "cylindrical_lumen"))
+    errors.extend(_require_positive_number(lumen, "ctr_outer_radius", "cylindrical_lumen"))
+    errors.extend(_require_positive_number(lumen, "safety_margin", "cylindrical_lumen"))
+    direction = _as_finite_vector(lumen.get("axis_direction"), 3)
+    if direction is not None and math.sqrt(sum(value * value for value in direction)) <= 0.0:
+        errors.append("`cylindrical_lumen.axis_direction` must be non-zero.")
+    radius = _as_finite_number(lumen.get("radius"))
+    outer = _as_finite_number(lumen.get("ctr_outer_radius"))
+    margin = _as_finite_number(lumen.get("safety_margin"))
+    if radius is not None and outer is not None and radius <= outer:
+        errors.append("`cylindrical_lumen.radius` must exceed `cylindrical_lumen.ctr_outer_radius`.")
+    if radius is not None and outer is not None and margin is not None and radius - outer <= margin:
+        errors.append("`cylindrical_lumen` usable radius must exceed `safety_margin`.")
+    return errors
+
+
+def _validate_cylindrical_lumen_cost(cost: Any) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(cost, dict):
+        return ["`cylindrical_lumen_cost` must be a map."]
+    if "simulation_default" in cost and not isinstance(cost["simulation_default"], bool):
+        errors.append("`cylindrical_lumen_cost.simulation_default` must be a boolean when present.")
+    for key in ("safety_margin_weight", "radial_collision_weight", "end_cap_weight", "terminal_collision_weight"):
+        errors.extend(_require_number(cost, key, "cylindrical_lumen_cost", nonnegative=True))
+    return errors
+
+
+def _validate_goal(goal: Any) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(goal, dict):
+        return ["`goal` must be a map."]
+    if "simulation_default" in goal and not isinstance(goal["simulation_default"], bool):
+        errors.append("`goal.simulation_default` must be a boolean when present.")
+    if not isinstance(goal.get("frame_id"), str) or not goal["frame_id"]:
+        errors.append("`goal.frame_id` must be a non-empty string.")
+    errors.extend(_require_numeric_list(goal, "position", 3, "goal"))
+    errors.extend(_require_positive_number(goal, "tolerance", "goal"))
+    errors.extend(_require_number(goal, "required_hold_duration", "goal", nonnegative=True))
+    if "reachability_samples" in goal:
+        errors.extend(_require_positive_number(goal, "reachability_samples", "goal", integer=True))
+    if "reachability_seed" in goal:
+        errors.extend(_require_number(goal, "reachability_seed", "goal", nonnegative=True))
+        seed = _as_finite_number(goal.get("reachability_seed"))
+        if seed is not None and int(seed) != seed:
+            errors.append("`goal.reachability_seed` must be an integer.")
     return errors
 
 
@@ -624,3 +735,15 @@ def _as_finite_number(value: Any) -> float | None:
     if not math.isfinite(numeric):
         return None
     return numeric
+
+
+def _as_finite_vector(value: Any, length: int) -> list[float] | None:
+    if not isinstance(value, list) or len(value) != length:
+        return None
+    result: list[float] = []
+    for item in value:
+        numeric = _as_finite_number(item)
+        if numeric is None:
+            return None
+        result.append(numeric)
+    return result

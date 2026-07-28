@@ -74,6 +74,9 @@ def generate_report(
     lines.extend(["", "## Metrics", ""])
     lines.extend(_metrics_table("Tracking", summary.get("tracking", {})))
     lines.extend(_metrics_table("Control", summary.get("control", {})))
+    lines.extend(_metrics_table("Goal", summary.get("goal", {})))
+    lines.extend(_metrics_table("Lumen Safety", summary.get("lumen_safety", {})))
+    lines.extend(_metrics_table("Motion", summary.get("motion", {})))
     lines.extend(_metrics_table("Timing", summary.get("timing", {})))
     lines.extend(_metrics_table("Data Quality", summary.get("data_quality", {})))
     lines.extend(_metrics_table("Numerical Safety", summary.get("numerical_safety", {})))
@@ -130,11 +133,12 @@ def generate_report(
     return path
 
 
-def generate_plots(run_dir: Path, samples: list[AlignedSample]) -> list[Path]:
+def generate_plots(run_dir: Path, samples: list[AlignedSample], metadata: dict[str, Any] | None = None) -> list[Path]:
     paths = [
         run_dir / "tracking_error.png",
         run_dir / "trajectory_xy.png",
         run_dir / "trajectory_3d.png",
+        run_dir / "tip_trajectory.png",
         run_dir / "command_history.png",
         run_dir / "solve_time.png",
         run_dir / "cumulative_control_effort.png",
@@ -142,7 +146,7 @@ def generate_plots(run_dir: Path, samples: list[AlignedSample]) -> list[Path]:
     if not samples:
         for path in paths:
             _empty_plot(path, "No aligned samples")
-        return paths
+        return _maybe_add_cylinder_plots(run_dir, paths, metadata)
 
     times = np.asarray([sample.timestamp for sample in samples], dtype=float)
     times = times - times[0]
@@ -162,8 +166,9 @@ def generate_plots(run_dir: Path, samples: list[AlignedSample]) -> list[Path]:
     _line_plot(paths[0], times, [errors], ["tip error"], "Tracking Error", "time [s]", "error [m]")
     _xy_plot(paths[1], tip, reference)
     _trajectory_3d_plot(paths[2], tip, reference)
+    _trajectory_3d_plot(paths[3], tip, reference)
     _line_plot(
-        paths[3],
+        paths[4],
         times,
         [commands[:, index] for index in range(commands.shape[1])],
         [f"u{index}" for index in range(commands.shape[1])],
@@ -171,9 +176,9 @@ def generate_plots(run_dir: Path, samples: list[AlignedSample]) -> list[Path]:
         "time [s]",
         "command [SI units/s]",
     )
-    _line_plot(paths[4], times, [solve_times], ["solve time"], "Solve Time", "time [s]", "solve time [s]")
-    _line_plot(paths[5], times, [effort], ["effort"], "Cumulative Control Effort", "time [s]", "sum ||u||^2 dt")
-    return paths
+    _line_plot(paths[5], times, [solve_times], ["solve time"], "Solve Time", "time [s]", "solve time [s]")
+    _line_plot(paths[6], times, [effort], ["effort"], "Cumulative Control Effort", "time [s]", "sum ||u||^2 dt")
+    return _maybe_add_cylinder_plots(run_dir, paths, metadata, tip=tip)
 
 
 def _metrics_table(title: str, values: dict[str, Any]) -> list[str]:
@@ -230,6 +235,132 @@ def _trajectory_3d_plot(path: Path, tip: np.ndarray, reference: np.ndarray) -> N
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
+
+
+def _maybe_add_cylinder_plots(
+    run_dir: Path,
+    paths: list[Path],
+    metadata: dict[str, Any] | None,
+    *,
+    tip: np.ndarray | None = None,
+) -> list[Path]:
+    configuration = {} if metadata is None else metadata.get("configuration", {})
+    lumen = configuration.get("cylindrical_lumen")
+    goal = configuration.get("goal", {})
+    cylinder_csv = run_dir / "cylinder_navigation.csv"
+    if not isinstance(lumen, dict) or not cylinder_csv.is_file():
+        return paths
+    wall_clearance_path = run_dir / "wall_clearance.png"
+    cylinder_3d_path = run_dir / "cylinder_backbone_target_3d.png"
+    _wall_clearance_plot(wall_clearance_path, cylinder_csv)
+    _cylinder_3d_plot(cylinder_3d_path, run_dir, lumen, goal, tip=tip)
+    return paths + [wall_clearance_path, cylinder_3d_path]
+
+
+def _wall_clearance_plot(path: Path, csv_path: Path) -> None:
+    data = _csv_numeric_columns(csv_path)
+    times = data.get("timestamp", np.asarray([], dtype=float))
+    clearance = data.get("minimum_backbone_clearance", np.asarray([], dtype=float))
+    if times.size == 0 or clearance.size == 0:
+        _empty_plot(path, "No cylinder clearance samples")
+        return
+    times = times - times[0]
+    _line_plot(path, times, [clearance], ["minimum clearance"], "Wall Clearance", "time [s]", "clearance [m]")
+
+
+def _cylinder_3d_plot(
+    path: Path,
+    run_dir: Path,
+    lumen: dict[str, Any],
+    goal: dict[str, Any],
+    *,
+    tip: np.ndarray | None,
+) -> None:
+    try:
+        axis_origin = np.asarray(lumen["axis_origin"], dtype=float)
+        axis_direction = np.asarray(lumen["axis_direction"], dtype=float)
+        axis_direction = axis_direction / np.linalg.norm(axis_direction)
+        radius = float(lumen["radius"])
+        length = float(lumen["length"])
+    except (KeyError, TypeError, ValueError):
+        _empty_plot(path, "Malformed cylinder metadata")
+        return
+    fig = plt.figure(figsize=(6, 5))
+    ax = fig.add_subplot(111, projection="3d")
+    _plot_cylinder_wire(ax, axis_origin, axis_direction, radius, length)
+    if tip is not None and tip.size:
+        ax.plot(tip[:, 0], tip[:, 1], tip[:, 2], label="tip")
+    backbone = _latest_backbone(run_dir / "backbone.csv")
+    if backbone.size:
+        ax.plot(backbone[:, 0], backbone[:, 1], backbone[:, 2], marker="o", markersize=2, label="final backbone")
+    goal_position = goal.get("position") if isinstance(goal, dict) else None
+    if goal_position is not None:
+        target = np.asarray(goal_position, dtype=float)
+        if target.shape == (3,) and np.all(np.isfinite(target)):
+            ax.scatter([target[0]], [target[1]], [target[2]], s=40, label="goal")
+    ax.set_title("Cylinder, Backbone, And Target")
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+    ax.set_zlabel("z [m]")
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def _plot_cylinder_wire(ax, origin: np.ndarray, direction: np.ndarray, radius: float, length: float) -> None:
+    helper = np.array([1.0, 0.0, 0.0], dtype=float)
+    if abs(float(np.dot(helper, direction))) > 0.9:
+        helper = np.array([0.0, 1.0, 0.0], dtype=float)
+    u = np.cross(direction, helper)
+    u = u / np.linalg.norm(u)
+    v = np.cross(direction, u)
+    theta = np.linspace(0.0, 2.0 * math.pi, 48)
+    for axial in (0.0, length):
+        center = origin + axial * direction
+        ring = center[None, :] + radius * (np.cos(theta)[:, None] * u[None, :] + np.sin(theta)[:, None] * v[None, :])
+        ax.plot(ring[:, 0], ring[:, 1], ring[:, 2], color="0.6", alpha=0.5)
+    for angle in np.linspace(0.0, 2.0 * math.pi, 8, endpoint=False):
+        radial = radius * (math.cos(angle) * u + math.sin(angle) * v)
+        line = np.vstack((origin + radial, origin + length * direction + radial))
+        ax.plot(line[:, 0], line[:, 1], line[:, 2], color="0.6", alpha=0.25)
+
+
+def _latest_backbone(path: Path) -> np.ndarray:
+    data = _csv_rows(path)
+    if not data:
+        return np.empty((0, 3), dtype=float)
+    timed_rows = [row for row in data if row.get("timestamp") not in {None, ""}]
+    if not timed_rows:
+        return np.empty((0, 3), dtype=float)
+    latest = max(float(row["timestamp"]) for row in timed_rows)
+    rows = [row for row in timed_rows if float(row["timestamp"]) == latest]
+    rows.sort(key=lambda row: int(float(row.get("index", 0))))
+    points = [[float(row["x"]), float(row["y"]), float(row["z"])] for row in rows]
+    return np.asarray(points, dtype=float)
+
+
+def _csv_numeric_columns(path: Path) -> dict[str, np.ndarray]:
+    rows = _csv_rows(path)
+    if not rows:
+        return {}
+    result: dict[str, list[float]] = {key: [] for key in rows[0]}
+    for row in rows:
+        for key, value in row.items():
+            try:
+                result.setdefault(key, []).append(float(value))
+            except (TypeError, ValueError):
+                result.setdefault(key, []).append(math.nan)
+    return {key: np.asarray(values, dtype=float) for key, values in result.items()}
+
+
+def _csv_rows(path: Path) -> list[dict[str, str]]:
+    if not path.is_file():
+        return []
+    import csv
+
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
 
 
 def _empty_plot(path: Path, message: str) -> None:

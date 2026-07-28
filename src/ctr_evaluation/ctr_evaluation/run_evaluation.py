@@ -23,6 +23,14 @@ import yaml
 from ctr_bringup.parameter_validation import load_parameter_files, validate_config_paths, validate_or_raise
 from ctr_evaluation.compare_results import compare_result_dirs, read_json, write_json
 from ctr_evaluation.metrics import sanitize_for_json, stable_hash
+from ctr_model.approximate_model import ApproximateCTRModel
+from ctr_mppi_controller.cylindrical_lumen import (
+    CylindricalLumen,
+    config_with_cylinder_overrides,
+    goal_position_from_config,
+    goal_tolerance_from_config,
+)
+from ctr_sim.simulation_core import CTRSimulationCore
 
 
 CONFIG_NAMES = (
@@ -176,6 +184,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a deterministic zero-command baseline and MPPI candidate evaluation pair.")
     parser.add_argument("--experiment-group", required=True)
     parser.add_argument("--trajectory", default="circle", choices=("circle", "ellipse", "helix"))
+    parser.add_argument("--task", default="trajectory", choices=("trajectory", "cylinder_navigation"))
+    parser.add_argument("--target", nargs=3, type=float, default=None)
+    parser.add_argument("--mppi-profile", default="")
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--baseline", default="zero_command")
     parser.add_argument("--candidate", default="mppi")
     parser.add_argument("--duration", type=float, required=True)
@@ -223,13 +235,21 @@ class EvaluationOrchestrator:
             raise OrchestrationError("--duration must be positive and finite")
         self.experiment_group = validate_experiment_group(args.experiment_group)
         self.config_paths = default_config_paths(args.config_path)
-        self.project_config = load_parameter_files(self.config_paths)
+        raw_config = load_parameter_files(self.config_paths)
+        self.project_config = config_with_cylinder_overrides(
+            raw_config,
+            enabled=args.task == "cylinder_navigation",
+            target_position=args.target,
+            mppi_profile=args.mppi_profile,
+            random_seed="" if args.seed is None else args.seed,
+        )
         validate_or_raise(self.project_config)
         self.output_root = output_root_from_config(self.project_config, args.output_root)
         self.settings = orchestration_settings_from_config(self.project_config)
         self.orchestration_id = f"m5d1_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}"
         self.process_manager = ProcessManager(Path.cwd())
         self.used_domain_ids: set[int] = set()
+        self.cylinder_setup = self._validate_cylinder_setup() if args.task == "cylinder_navigation" else {}
 
     def run_pair(self) -> dict[str, Any]:
         baseline = self._run_one(role="baseline", controller_label=self.args.baseline, baseline_dir=None)
@@ -269,6 +289,12 @@ class EvaluationOrchestrator:
                 experiment_group=self.experiment_group,
                 controller_label=controller_label,
                 baseline_dir=baseline_dir,
+                output_root=self.output_root,
+                task=self.args.task,
+                target_position=self._target_position_for_launch(),
+                mppi_profile=self.args.mppi_profile,
+                random_seed=self.args.seed,
+                run_role=role,
             )
             records.append(self.process_manager.start(role=f"{role}_base", command=base_command, env=env))
             monitor = RosRunMonitor(domain_id=domain_id)
@@ -318,36 +344,48 @@ class EvaluationOrchestrator:
             if started_run_id != run_id:
                 raise OrchestrationError(f"evaluator started unexpected run ID {started_run_id}; expected {run_id}")
 
+            reference_mode = "fixed_target" if self.args.task == "cylinder_navigation" else "trajectory"
             reference_command = [
                 "ros2",
                 "launch",
                 "ctr_bringup",
                 "evaluation_reference.launch.py",
                 "runtime_mode:=simulation",
-                "reference_mode:=trajectory",
+                f"reference_mode:={reference_mode}",
                 f"reference_type:={self.args.trajectory}",
-                "trajectory_start_policy:=scheduled_time",
-                f"scheduled_reference_epoch:={reference_epoch:.9f}",
             ]
+            if self.args.task == "trajectory":
+                reference_command.extend(
+                    [
+                        "trajectory_start_policy:=scheduled_time",
+                        f"scheduled_reference_epoch:={reference_epoch:.9f}",
+                    ]
+                )
+            else:
+                reference_command.extend(self._cylinder_launch_arguments())
             records.append(self.process_manager.start(role=f"{role}_reference", command=reference_command, env=env))
-            monitor.wait_for_reference(self.settings.reference_ready_timeout)
-            if role == "baseline":
+            monitor.wait_for_reference(self.settings.reference_ready_timeout, require_horizon=self.args.task == "trajectory")
+            if role == "baseline" and self.args.task == "trajectory":
                 monitor.verify_pre_epoch_reference(
                     reference_epoch,
                     self.settings.reference_ready_timeout,
                     expected_first_point=expected_first_reference_point(self.project_config, self.args.trajectory),
                 )
             if role == "candidate":
+                if self.args.task == "cylinder_navigation":
+                    monitor.spin_until_time(reference_epoch)
                 controller_command = [
                     "ros2",
                     "launch",
                     "ctr_bringup",
                     "evaluation_mppi_controller.launch.py",
                     "runtime_mode:=simulation",
-                    "reference_mode:=trajectory",
+                    f"reference_mode:={reference_mode}",
                     f"reference_type:={self.args.trajectory}",
                     "publish_safe_command_for_simulation:=true",
                 ]
+                if self.args.task == "cylinder_navigation":
+                    controller_command.extend(self._cylinder_launch_arguments())
                 records.append(self.process_manager.start(role=f"{role}_controller", command=controller_command, env=env))
                 first_command = monitor.wait_for_first_command(self.settings.startup_timeout)
                 if self.settings.require_recording_before_candidate_command and first_command.timestamp < recording_start_time:
@@ -446,11 +484,14 @@ class EvaluationOrchestrator:
         }
         shared_environment_hash = build_shared_environment_hash(
             self.project_config,
+            task=self.args.task,
             trajectory=self.args.trajectory,
             duration=self.args.duration,
             reference_lead_time=self.settings.reference_lead_time,
         )
         controller_hash = build_controller_configuration_hash(self.project_config, controller_label)
+        reference_start_policy = "fixed_target_window_epoch" if self.args.task == "cylinder_navigation" else "scheduled_time"
+        reference_pre_epoch_behavior = "fixed_target_ready" if self.args.task == "cylinder_navigation" else "first_trajectory_point"
         return {
             "requested_run_id": run_id,
             "orchestration_id": self.orchestration_id,
@@ -462,11 +503,11 @@ class EvaluationOrchestrator:
             "evaluation_window_end_time_s": evaluation_window_end,
             "evaluation_window_duration_s": self.args.duration,
             "recording_start_time_s": recording_start_time,
-            "reference_start_policy": "scheduled_time",
+            "reference_start_policy": reference_start_policy,
             "scheduled_reference_epoch_s": reference_epoch,
             "reference_lead_duration_s": self.settings.reference_lead_time,
             "reference_phase_offset_s": self.settings.reference_lead_time,
-            "reference_pre_epoch_behavior": "first_trajectory_point",
+            "reference_pre_epoch_behavior": reference_pre_epoch_behavior,
             "shared_environment_hash": shared_environment_hash,
             "controller_configuration_hash": controller_hash,
             "orchestration_hash": stable_hash(orchestration_policy),
@@ -486,15 +527,84 @@ class EvaluationOrchestrator:
             "pre_roll_nonzero_command_count": audit.nonzero_count(self.settings.command_zero_tolerance),
             "unexpected_command_publishers": unexpected_command_publishers(publisher_counts),
             "reference_configuration": {
+                "task": self.args.task,
+                "reference_mode": "fixed_target" if self.args.task == "cylinder_navigation" else "trajectory",
                 "trajectory_type": self.args.trajectory,
                 "trajectory_parameters": reference_config.get(self.args.trajectory, {}),
                 "sample_period": reference_config.get("sample_period"),
                 "frame_id": reference_config.get("frame_id"),
                 "loop": reference_config.get("loop"),
                 "completion_behavior": reference_config.get("completion_behavior"),
+                "goal_position": None if self.args.task != "cylinder_navigation" else self._target_position_for_launch(),
+                "cylinder_setup": self.cylinder_setup,
+                "reference_window_policy": reference_start_policy,
             },
             "processes_at_start": [record.to_dict() for record in records],
             "ros_domain_id": str(domain_id),
+        }
+
+    def _target_position_for_launch(self) -> list[float]:
+        if self.args.task != "cylinder_navigation":
+            return []
+        return [float(value) for value in goal_position_from_config(self.project_config)]
+
+    def _cylinder_launch_arguments(self) -> list[str]:
+        target = self._target_position_for_launch()
+        args = [
+            "enable_cylindrical_lumen:=true",
+            f"cylinder_target_x:={target[0]:.9f}",
+            f"cylinder_target_y:={target[1]:.9f}",
+            f"cylinder_target_z:={target[2]:.9f}",
+        ]
+        if self.args.mppi_profile:
+            args.append(f"cylinder_profile:={self.args.mppi_profile}")
+        if self.args.seed is not None:
+            args.append(f"mppi_random_seed:={self.args.seed}")
+        return args
+
+    def _validate_cylinder_setup(self) -> dict[str, Any]:
+        lumen = CylindricalLumen.from_config(self.project_config)
+        model = ApproximateCTRModel(self.project_config)
+        simulation = CTRSimulationCore(self.project_config)
+        initial = model.forward_kinematics(simulation.q)
+        initial_clearance = lumen.backbone_clearance(initial.backbone_points)
+        if not initial_clearance.collision_free:
+            raise OrchestrationError("initial model backbone is outside the cylindrical lumen")
+        target = goal_position_from_config(self.project_config)
+        validation = lumen.validate_target(target, frame_id=self.project_config["goal"].get("frame_id"))
+        if not validation.valid:
+            suggestion = lumen.nearest_valid_target(target)
+            raise OrchestrationError(
+                f"configured cylinder target is invalid: {validation.reasons}; nearest valid suggestion: {suggestion.tolist()}"
+            )
+        reachability = model_reachability_sanity(
+            model=model,
+            config=self.project_config,
+            target=target,
+            tolerance=goal_tolerance_from_config(self.project_config),
+        )
+        if not reachability["reachable"]:
+            replacement = lumen.nearest_valid_target(reachability["best_tip"])
+            replacement_validation = lumen.validate_target(replacement, frame_id=self.project_config["goal"].get("frame_id"))
+            if not replacement_validation.valid:
+                raise OrchestrationError(f"configured cylinder target is unreachable: {reachability}")
+            self.project_config = config_with_cylinder_overrides(
+                self.project_config,
+                enabled=True,
+                target_position=replacement,
+                mppi_profile=self.args.mppi_profile,
+                random_seed="" if self.args.seed is None else self.args.seed,
+            )
+            reachability["requested_target_replaced"] = True
+            reachability["replacement_target"] = [float(value) for value in replacement]
+        else:
+            reachability["requested_target_replaced"] = False
+            reachability["replacement_target"] = None
+        return {
+            "initial_backbone_minimum_clearance": initial_clearance.minimum_radial_clearance,
+            "initial_tip": [float(value) for value in initial.tip_position],
+            "target_validation": {"valid": validation.valid, "reasons": validation.reasons},
+            "reachability": reachability,
         }
 
     def _runtime_metadata(
@@ -606,9 +716,13 @@ class RosRunMonitor:
     def wait_for_state_tip(self, timeout_s: float) -> None:
         self._spin_until(lambda: self.latest_state is not None and self.latest_tip is not None, timeout_s, "state/tip readiness")
 
-    def wait_for_reference(self, timeout_s: float) -> None:
+    def wait_for_reference(self, timeout_s: float, *, require_horizon: bool = True) -> None:
         self._spin_until(
-            lambda: self.reference_tip_seen and self.reference_horizon_seen and self.reference_path_seen,
+            lambda: (
+                self.reference_tip_seen
+                and self.reference_path_seen
+                and (self.reference_horizon_seen or not require_horizon)
+            ),
             timeout_s,
             "reference readiness",
         )
@@ -1057,17 +1171,22 @@ def path_is_relative_to(path: Path, parent: Path) -> bool:
 def build_shared_environment_hash(
     config: dict[str, Any],
     *,
+    task: str = "trajectory",
     trajectory: str,
     duration: float,
     reference_lead_time: float,
 ) -> str:
     reference = config["reference"]
     robot = config["robot"]
+    cylinder = config.get("cylindrical_lumen", {}) if task == "cylinder_navigation" else None
+    goal = config.get("goal", {}) if task == "cylinder_navigation" else None
     return stable_hash(
         {
+            "task": task,
             "model": config["model"],
             "simulation": config["simulation"],
             "reference": {
+                "mode": "fixed_target" if task == "cylinder_navigation" else "trajectory",
                 "trajectory_type": trajectory,
                 "trajectory_parameters": reference[trajectory],
                 "sample_period": reference["sample_period"],
@@ -1077,6 +1196,8 @@ def build_shared_environment_hash(
                 "duration": reference["duration"],
                 "reference_lead_time": reference_lead_time,
             },
+            "cylindrical_lumen": cylinder,
+            "goal": goal,
             "frames": robot["frames"],
             "software_mode": "simulation",
             "evaluation_window_duration": duration,
@@ -1106,6 +1227,12 @@ def build_base_simulation_command(
     experiment_group: str,
     controller_label: str,
     baseline_dir: Path | None,
+    output_root: Path | None = None,
+    task: str = "trajectory",
+    target_position: list[float] | None = None,
+    mppi_profile: str = "",
+    random_seed: int | None = None,
+    run_role: str = "",
 ) -> list[str]:
     command = [
         "ros2",
@@ -1121,9 +1248,118 @@ def build_base_simulation_command(
         f"evaluation_experiment_group:={experiment_group}",
         f"evaluation_controller_label:={controller_label}",
     ]
+    if output_root is not None:
+        command.append(f"evaluation_output_root:={output_root}")
+    if task == "cylinder_navigation":
+        target = target_position or []
+        if len(target) != 3:
+            raise OrchestrationError("cylinder_navigation launch requires a 3D target position")
+        command.extend(
+            [
+                "enable_cylindrical_lumen:=true",
+                f"cylinder_target_x:={float(target[0]):.9f}",
+                f"cylinder_target_y:={float(target[1]):.9f}",
+                f"cylinder_target_z:={float(target[2]):.9f}",
+            ]
+        )
+        if mppi_profile:
+            command.append(f"cylinder_profile:={mppi_profile}")
+        if random_seed is not None:
+            command.append(f"mppi_random_seed:={int(random_seed)}")
+    if run_role:
+        command.append(f"run_role:={run_role}")
     if baseline_dir is not None:
         command.append(f"evaluation_baseline_result_dir:={baseline_dir}")
     return command
+
+
+def model_reachability_sanity(
+    *,
+    model: ApproximateCTRModel,
+    config: dict[str, Any],
+    target: Any,
+    tolerance: float,
+) -> dict[str, Any]:
+    """Cheap deterministic reachability sanity check for the approximate model."""
+
+    target_array = np.asarray(target, dtype=float)
+    if target_array.shape != (3,) or not np.all(np.isfinite(target_array)):
+        raise OrchestrationError("target must be finite with shape (3,)")
+    limits = config["robot"]["limits"]
+    insertion_min = np.asarray(limits["insertion_min"], dtype=float)
+    insertion_max = np.asarray(limits["insertion_max"], dtype=float)
+    rotation_min = np.asarray(limits["rotation_min"], dtype=float)
+    rotation_max = np.asarray(limits["rotation_max"], dtype=float)
+    if insertion_min.shape != (3,) or insertion_max.shape != (3,) or rotation_min.shape != (3,) or rotation_max.shape != (3,):
+        raise OrchestrationError("joint limits must contain 3 insertion and 3 rotation bounds")
+
+    insertion_values = [
+        insertion_min,
+        insertion_max,
+        0.5 * (insertion_min + insertion_max),
+        np.array([insertion_max[0], insertion_min[1], insertion_max[2]], dtype=float),
+        np.array([insertion_min[0], insertion_max[1], insertion_max[2]], dtype=float),
+    ]
+    rotation_values = [
+        np.zeros(3, dtype=float),
+        rotation_min,
+        rotation_max,
+        0.5 * (rotation_min + rotation_max),
+    ]
+    goal_config = config.get("goal", {})
+    random_count = int(goal_config.get("reachability_samples", 0) or 0)
+    random_seed = int(goal_config.get("reachability_seed", 0) or 0)
+    if random_count > 0:
+        rng = np.random.default_rng(random_seed)
+        random_insertions = rng.uniform(insertion_min, insertion_max, size=(random_count, 3))
+        random_rotations = rng.uniform(rotation_min, rotation_max, size=(random_count, 3))
+    else:
+        random_insertions = np.empty((0, 3), dtype=float)
+        random_rotations = np.empty((0, 3), dtype=float)
+
+    best_error = math.inf
+    best_q: list[float] = []
+    best_tip: list[float] = []
+    evaluated = 0
+    for insertion in insertion_values:
+        for rotation in rotation_values:
+            q = np.concatenate([insertion, rotation])
+            try:
+                tip = model.forward_kinematics(q).tip_position
+            except Exception:
+                continue
+            if not np.all(np.isfinite(tip)):
+                continue
+            evaluated += 1
+            error = float(np.linalg.norm(tip - target_array))
+            if error < best_error:
+                best_error = error
+                best_q = [float(value) for value in q]
+                best_tip = [float(value) for value in tip]
+    for insertion, rotation in zip(random_insertions, random_rotations):
+        q = np.concatenate([insertion, rotation])
+        try:
+            tip = model.forward_kinematics(q).tip_position
+        except Exception:
+            continue
+        if not np.all(np.isfinite(tip)):
+            continue
+        evaluated += 1
+        error = float(np.linalg.norm(tip - target_array))
+        if error < best_error:
+            best_error = error
+            best_q = [float(value) for value in q]
+            best_tip = [float(value) for value in tip]
+    return {
+        "reachable": bool(best_error <= float(tolerance)),
+        "best_error": float(best_error),
+        "best_q": best_q,
+        "best_tip": best_tip,
+        "tolerance": float(tolerance),
+        "evaluated_candidates": evaluated,
+        "random_sample_count": random_count,
+        "random_seed": random_seed,
+    }
 
 
 def fresh_ros_domain_id() -> int:

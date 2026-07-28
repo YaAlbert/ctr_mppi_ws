@@ -7,7 +7,9 @@ import numpy as np
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PACKAGE_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "src" / "ctr_mppi_controller"))
 
 from ctr_evaluation.report_generator import generate_plots, generate_report  # noqa: E402
 from ctr_evaluation.time_alignment import AlignedSample  # noqa: E402
@@ -19,6 +21,7 @@ def sample(t):
         q=np.zeros(6),
         q_dot=np.zeros(6),
         tip_position=np.array([t, 0.0, 0.0]),
+        backbone_points=None,
         reference_position=np.array([0.0, 0.0, 0.0]),
         command=np.ones(6) * 0.1,
         solve_time=0.01,
@@ -37,7 +40,8 @@ class ReportGeneratorTest(unittest.TestCase):
     def test_plot_generation_creates_png_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             paths = generate_plots(Path(temp_dir), [sample(0.0), sample(1.0)])
-            self.assertEqual(6, len(paths))
+            self.assertEqual(7, len(paths))
+            self.assertIn("tip_trajectory.png", [path.name for path in paths])
             for path in paths:
                 self.assertTrue(path.is_file())
                 self.assertGreater(path.stat().st_size, 0)
@@ -45,7 +49,8 @@ class ReportGeneratorTest(unittest.TestCase):
     def test_empty_plot_generation_still_creates_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             paths = generate_plots(Path(temp_dir), [])
-            self.assertEqual(6, len(paths))
+            self.assertEqual(7, len(paths))
+            self.assertIn("tip_trajectory.png", [path.name for path in paths])
             self.assertTrue(all(path.is_file() for path in paths))
 
     def test_markdown_report_contains_required_sections(self):

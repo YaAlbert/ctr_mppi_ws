@@ -16,6 +16,7 @@ sys.path.insert(0, str(REPO_ROOT / "src" / "ctr_sim"))
 
 from ctr_bringup.parameter_validation import load_parameter_files, validate_or_raise  # noqa: E402
 from ctr_model.approximate_model import ApproximateCTRModel  # noqa: E402
+from ctr_mppi_controller.cylindrical_lumen import CylindricalLumen, LumenCostWeights, compute_lumen_cost  # noqa: E402
 from ctr_mppi_controller.mppi_core import MPPICore  # noqa: E402
 from ctr_sim.simulation_core import CTRSimulationCore  # noqa: E402
 
@@ -62,8 +63,29 @@ class FirstThreeJointTipModel:
         )
 
 
+class BackbonePenaltyModel:
+    def __init__(self, *, colliding_middle: bool):
+        self.colliding_middle = colliding_middle
+
+    def forward_kinematics(self, q):
+        tip = np.array([0.010, 0.0, 0.050], dtype=float)
+        middle_x = 0.040 if self.colliding_middle else 0.010
+        return SimpleNamespace(
+            backbone_points=np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [middle_x, 0.0, 0.050],
+                    tip,
+                ],
+                dtype=float,
+            ),
+            tip_position=tip,
+        )
+
+
 def make_cost_indexing_controller():
     config = make_test_config()
+    config["cylindrical_lumen"]["enabled"] = False
     config["mppi"]["dt"] = 1.0
     config["mppi"]["horizon"] = 3
     config["mppi"]["num_samples"] = 2
@@ -230,6 +252,154 @@ class MPPICoreTest(unittest.TestCase):
         config["mppi"]["weights"]["obstacle"] = 1.0
         with self.assertRaises(NotImplementedError):
             MPPICore(config, ApproximateCTRModel(config))
+
+    def test_lumen_disabled_matches_missing_lumen_section_behavior(self):
+        config = make_test_config()
+        config["cylindrical_lumen"]["enabled"] = False
+        no_lumen_config = copy.deepcopy(config)
+        no_lumen_config.pop("cylindrical_lumen")
+        no_lumen_config.pop("cylindrical_lumen_cost")
+        model = ApproximateCTRModel(config)
+        target = model.forward_kinematics(np.zeros(6)).tip_position
+        disabled = MPPICore(config, model).solve(q=np.zeros(6), q_dot=np.zeros(6), target_tip=target)
+        missing = MPPICore(no_lumen_config, ApproximateCTRModel(no_lumen_config)).solve(
+            q=np.zeros(6),
+            q_dot=np.zeros(6),
+            target_tip=target,
+        )
+        self.assertTrue(np.allclose(disabled.command, missing.command))
+        self.assertAlmostEqual(disabled.minimum_cost, missing.minimum_cost)
+
+    def test_lumen_collision_free_rollout_has_no_penalty(self):
+        config = make_test_config()
+        cyl = CylindricalLumen.from_config(config)
+        weights = LumenCostWeights.from_config(config["cylindrical_lumen_cost"])
+        cost = compute_lumen_cost(
+            lumen=cyl,
+            weights=weights,
+            backbone_points=[[0.0, 0.0, 0.0], [0.010, 0.0, 0.05]],
+        )
+        self.assertEqual(0.0, cost)
+
+    def test_lumen_near_wall_rollout_receives_soft_cost(self):
+        config = make_test_config()
+        cyl = CylindricalLumen.from_config(config)
+        weights = LumenCostWeights.from_config(config["cylindrical_lumen_cost"])
+        cost = compute_lumen_cost(
+            lumen=cyl,
+            weights=weights,
+            backbone_points=[[0.0, 0.0, 0.0], [cyl.usable_radius - 0.001, 0.0, 0.05]],
+        )
+        self.assertGreater(cost, 0.0)
+        self.assertLess(cost, config["cylindrical_lumen_cost"]["radial_collision_weight"])
+
+    def test_lumen_wall_penetration_receives_hard_cost(self):
+        config = make_test_config()
+        cyl = CylindricalLumen.from_config(config)
+        weights = LumenCostWeights.from_config(config["cylindrical_lumen_cost"])
+        soft = compute_lumen_cost(
+            lumen=cyl,
+            weights=weights,
+            backbone_points=[[0.0, 0.0, 0.0], [cyl.usable_radius - 0.001, 0.0, 0.05]],
+        )
+        hard = compute_lumen_cost(
+            lumen=cyl,
+            weights=weights,
+            backbone_points=[[0.0, 0.0, 0.0], [cyl.usable_radius + 0.001, 0.0, 0.05]],
+        )
+        self.assertGreater(hard, soft)
+
+    def test_lumen_end_cap_violation_receives_hard_cost(self):
+        config = make_test_config()
+        cyl = CylindricalLumen.from_config(config)
+        weights = LumenCostWeights.from_config(config["cylindrical_lumen_cost"])
+        cost = compute_lumen_cost(
+            lumen=cyl,
+            weights=weights,
+            backbone_points=[[0.0, 0.0, 0.0], [0.0, 0.0, cyl.length + 0.001]],
+        )
+        self.assertGreater(cost, 0.0)
+
+    def test_whole_backbone_collision_is_detected_even_when_tip_is_valid(self):
+        config = make_test_config()
+        config["mppi"]["weights"]["tip"] = 0.0
+        config["mppi"]["weights"]["control"] = 0.0
+        config["mppi"]["weights"]["smoothness"] = 0.0
+        config["mppi"]["weights"]["terminal"] = 0.0
+        safe = MPPICore(config, BackbonePenaltyModel(colliding_middle=False))
+        colliding = MPPICore(config, BackbonePenaltyModel(colliding_middle=True))
+        sequence = np.zeros((safe.horizon, safe.control_dimension))
+        target = [0.010, 0.0, 0.050]
+        safe_cost = safe.rollout_candidate(
+            q0=np.zeros(6),
+            sequence=sequence,
+            previous_command=np.zeros(6),
+            target_tip=target,
+        ).cost
+        collision_cost = colliding.rollout_candidate(
+            q0=np.zeros(6),
+            sequence=sequence,
+            previous_command=np.zeros(6),
+            target_tip=target,
+        ).cost
+        self.assertEqual(0.0, safe_cost)
+        self.assertGreater(collision_cost, safe_cost)
+
+    def test_target_outside_lumen_is_rejected(self):
+        config = make_test_config()
+        controller = MPPICore(config, ApproximateCTRModel(config))
+        with self.assertRaisesRegex(ValueError, "outside cylindrical lumen"):
+            controller.solve(q=np.zeros(6), q_dot=np.zeros(6), target_tip=[0.040, 0.0, 0.050])
+
+    def test_offset_valid_target_produces_meaningful_nonzero_command(self):
+        config, _, controller = make_controller()
+        result = controller.solve(q=np.zeros(6), q_dot=np.zeros(6), target_tip=config["goal"]["position"])
+        self.assertTrue(np.all(np.isfinite(result.command)))
+        self.assertGreater(float(np.linalg.norm(result.command)), 0.0)
+
+    def test_predicted_command_reduces_goal_error_in_simple_case(self):
+        config = make_test_config()
+        config["cylindrical_lumen"]["enabled"] = False
+        config["mppi"]["dt"] = 1.0
+        config["mppi"]["horizon"] = 2
+        config["mppi"]["num_samples"] = 64
+        config["mppi"]["noise_std"]["insertion"] = [0.05, 0.05, 0.05]
+        config["mppi"]["noise_std"]["rotation"] = [0.0, 0.0, 0.0]
+        config["mppi"]["weights"]["control"] = 0.0
+        config["mppi"]["weights"]["smoothness"] = 0.0
+        config["robot"]["limits"]["insertion_max"] = [10.0, 10.0, 10.0]
+        config["robot"]["limits"]["insertion_velocity_max"] = [10.0, 10.0, 10.0]
+        controller = MPPICore(config, FirstThreeJointTipModel())
+        target = np.array([0.1, 0.0, 0.0])
+        result = controller.solve(q=np.zeros(6), q_dot=np.zeros(6), target_tip=target)
+        initial_error = np.linalg.norm(target)
+        next_q = result.command * config["mppi"]["dt"]
+        next_tip = FirstThreeJointTipModel().forward_kinematics(next_q).tip_position
+        self.assertLess(np.linalg.norm(next_tip - target), initial_error)
+
+    def test_collision_cost_changes_candidate_preference(self):
+        config = make_test_config()
+        config["mppi"]["weights"]["tip"] = 0.0
+        config["mppi"]["weights"]["terminal"] = 0.0
+        config["mppi"]["weights"]["control"] = 0.0
+        config["mppi"]["weights"]["smoothness"] = 0.0
+        target = [0.010, 0.0, 0.050]
+        sequence = np.zeros((config["mppi"]["horizon"], 6))
+        safe = MPPICore(config, BackbonePenaltyModel(colliding_middle=False))
+        colliding = MPPICore(config, BackbonePenaltyModel(colliding_middle=True))
+        safe_rollout = safe.rollout_candidate(
+            q0=np.zeros(6),
+            sequence=sequence,
+            previous_command=np.zeros(6),
+            target_tip=target,
+        )
+        collision_rollout = colliding.rollout_candidate(
+            q0=np.zeros(6),
+            sequence=sequence,
+            previous_command=np.zeros(6),
+            target_tip=target,
+        )
+        self.assertLess(safe_rollout.cost, collision_rollout.cost)
 
     def test_rejects_bad_inputs(self):
         _, _, controller = make_controller()

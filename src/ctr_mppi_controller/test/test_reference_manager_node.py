@@ -12,6 +12,7 @@ sys.path.insert(0, str(PACKAGE_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "src" / "ctr_bringup"))
 
 from ctr_bringup.parameter_validation import load_parameter_files, validate_or_raise  # noqa: E402
+from ctr_mppi_controller.cylindrical_lumen import config_with_cylinder_overrides, goal_position_from_config  # noqa: E402
 from ctr_mppi_controller.nodes.reference_manager_node import (  # noqa: E402
     adjusted_trajectory_start_time,
     build_reference_trajectory,
@@ -57,6 +58,29 @@ class ReferenceManagerNodeHelpersTest(unittest.TestCase):
         self.assertEqual("ellipse", trajectory.trajectory_type)
         self.assertEqual("base_link", trajectory.frame_id)
         self.assertTrue(np.all(np.isfinite(trajectory.points)))
+
+    def test_cylinder_fixed_target_uses_goal_override(self):
+        config = config_with_cylinder_overrides(
+            make_config(),
+            enabled=True,
+            target_position=[0.010, 0.012, 0.095],
+            mppi_profile="cylinder_fast",
+            random_seed=11,
+        )
+        settings = reference_settings_from_config(config, mode_override="fixed_target", type_override="circle")
+        fixed_settings = settings.__class__(
+            mode=settings.mode,
+            trajectory_type=settings.trajectory_type,
+            frame_id=settings.frame_id,
+            completion_behavior=settings.completion_behavior,
+            sample_period=settings.sample_period,
+            duration=settings.duration,
+            publish_frequency=settings.publish_frequency,
+            stale_timeout=settings.stale_timeout,
+            fixed_target=goal_position_from_config(config),
+            horizon=settings.horizon,
+        )
+        self.assertTrue(np.allclose([0.010, 0.012, 0.095], fixed_settings.fixed_target))
 
     def test_elapsed_ros_time_progression_uses_sample_period(self):
         config = make_config()

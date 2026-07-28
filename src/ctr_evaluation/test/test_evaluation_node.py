@@ -9,18 +9,20 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PACKAGE_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "src" / "ctr_bringup"))
+sys.path.insert(0, str(REPO_ROOT / "src" / "ctr_mppi_controller"))
 
-if "ctr_interfaces" not in sys.modules:
-    ctr_interfaces = types.ModuleType("ctr_interfaces")
-    ctr_interfaces_msg = types.ModuleType("ctr_interfaces.msg")
-    ctr_interfaces_srv = types.ModuleType("ctr_interfaces.srv")
-    for name in ("CtrControllerMetrics", "CtrJointCommand", "CtrState"):
+ctr_interfaces = sys.modules.get("ctr_interfaces", types.ModuleType("ctr_interfaces"))
+ctr_interfaces_msg = sys.modules.get("ctr_interfaces.msg", types.ModuleType("ctr_interfaces.msg"))
+ctr_interfaces_srv = sys.modules.get("ctr_interfaces.srv", types.ModuleType("ctr_interfaces.srv"))
+for name in ("CtrControllerMetrics", "CtrJointCommand", "CtrState"):
+    if not hasattr(ctr_interfaces_msg, name):
         setattr(ctr_interfaces_msg, name, type(name, (), {}))
-    for name in ("StartExperiment", "StopExperiment"):
+for name in ("StartExperiment", "StopExperiment"):
+    if not hasattr(ctr_interfaces_srv, name):
         setattr(ctr_interfaces_srv, name, type(name, (), {}))
-    sys.modules["ctr_interfaces"] = ctr_interfaces
-    sys.modules["ctr_interfaces.msg"] = ctr_interfaces_msg
-    sys.modules["ctr_interfaces.srv"] = ctr_interfaces_srv
+sys.modules["ctr_interfaces"] = ctr_interfaces
+sys.modules["ctr_interfaces.msg"] = ctr_interfaces_msg
+sys.modules["ctr_interfaces.srv"] = ctr_interfaces_srv
 
 from ctr_evaluation.nodes import evaluation_node  # noqa: E402
 
@@ -38,6 +40,16 @@ class EvaluationNodeStaticTest(unittest.TestCase):
         self.assertNotIn("create_publisher", source)
         self.assertNotIn('"/ctr/mppi_command"', source.split("create_subscription")[0])
         self.assertNotIn('"/ctr/safe_command"', source.split("create_subscription")[0])
+
+    def test_state_callback_records_backbone_points(self):
+        source = inspect.getsource(evaluation_node.EvaluationNode._on_state)
+        self.assertIn("backbone_points=", source)
+        self.assertIn("msg.backbone", source)
+
+    def test_output_root_override_parameter_is_supported(self):
+        source = inspect.getsource(evaluation_node.EvaluationNode.__init__)
+        self.assertIn('declare_parameter("output_root"', source)
+        self.assertIn('["output_root"]', source)
 
     def test_parse_metadata_json(self):
         self.assertEqual({"case": "circle"}, evaluation_node.parse_metadata('{"case": "circle"}'))

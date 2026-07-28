@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -12,6 +12,7 @@ from nav_msgs.msg import Path as NavPath
 
 from ctr_bringup.parameter_validation import load_parameter_files, validate_config_paths, validate_or_raise
 from ctr_bringup.placeholder_node import run_node_until_shutdown
+from ctr_mppi_controller.cylindrical_lumen import config_with_cylinder_overrides, goal_position_from_config
 from ctr_mppi_controller.reference_trajectory import (
     ReferenceTrajectory,
     generate_circle,
@@ -53,9 +54,21 @@ class ReferenceManagerNode(Node):
         self.declare_parameter("reference_type", "")
         self.declare_parameter("trajectory_start_policy", "node_start")
         self.declare_parameter("scheduled_reference_epoch", 0.0)
+        self.declare_parameter("enable_cylindrical_lumen", False)
+        self.declare_parameter("cylinder_profile", "")
+        self.declare_parameter("cylinder_target_position", Parameter.Type.DOUBLE_ARRAY)
+        self.declare_parameter("mppi_random_seed", -1)
 
         config_paths = validate_config_paths(self.get_parameter("config_paths").value)
-        self.config = load_parameter_files(config_paths)
+        raw_config = load_parameter_files(config_paths)
+        enable_lumen = _bool_value(self.get_parameter("enable_cylindrical_lumen").value)
+        self.config = config_with_cylinder_overrides(
+            raw_config,
+            enabled=enable_lumen,
+            target_position=_optional_vector3_parameter(self.get_parameter("cylinder_target_position").value),
+            mppi_profile=str(self.get_parameter("cylinder_profile").value or ""),
+            random_seed=_optional_seed(self.get_parameter("mppi_random_seed").value),
+        )
         validate_or_raise(self.config)
 
         self.settings = reference_settings_from_config(
@@ -63,6 +76,8 @@ class ReferenceManagerNode(Node):
             mode_override=self.get_parameter("reference_mode").value,
             type_override=self.get_parameter("reference_type").value,
         )
+        if enable_lumen and self.settings.mode == "fixed_target":
+            self.settings = replace(self.settings, fixed_target=goal_position_from_config(self.config))
         self.trajectory = (
             build_reference_trajectory(self.config, settings=self.settings)
             if self.settings.mode == "trajectory"
@@ -337,6 +352,27 @@ def _vector3(values: Any, label: str) -> np.ndarray:
     if array.shape != (3,) or not np.all(np.isfinite(array)):
         raise ValueError(f"{label} must contain 3 finite values")
     return array.copy()
+
+
+def _optional_vector3_parameter(values: Any) -> list[float] | None:
+    if values is None or values == "":
+        return None
+    if isinstance(values, (list, tuple)) and len(values) == 0:
+        return None
+    return [float(value) for value in _vector3(values, "cylinder_target_position")]
+
+
+def _bool_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+    return bool(value)
+
+
+def _optional_seed(value: Any) -> int | None:
+    seed = int(value)
+    return None if seed < 0 else seed
 
 
 def _number(value: Any, label: str) -> float:

@@ -20,11 +20,15 @@ from ctr_evaluation.metrics import (  # noqa: E402
     compute_acceptance,
     compute_control_effort_series,
     compute_control_metrics,
+    compute_goal_metrics,
+    compute_lumen_safety_metrics,
+    compute_motion_metrics,
     compute_timing_metrics,
     compute_tracking_metrics,
     publication_rate,
     relative_improvement_percent,
 )
+from ctr_mppi_controller.cylindrical_lumen import CylindricalLumen  # noqa: E402
 from ctr_mppi_controller.trajectory_metrics import (  # noqa: E402
     TrajectoryMetricsAccumulator,
     TrajectoryMetricsConfig,
@@ -146,6 +150,67 @@ class EvaluationMetricsTest(unittest.TestCase):
         self.assertAlmostEqual(10.0, metrics.state_publication_rate)
         self.assertAlmostEqual(1.0, publication_rate([0.0, 1.0, 2.0]))
 
+    def test_goal_metrics_hold_duration(self):
+        metrics = compute_goal_metrics(
+            times=[0.0, 0.2, 0.4, 0.7, 1.0],
+            tip_positions=[
+                [0.010, 0.0, 0.0],
+                [0.004, 0.0, 0.0],
+                [0.002, 0.0, 0.0],
+                [0.001, 0.0, 0.0],
+                [0.001, 0.0, 0.0],
+            ],
+            goal_position=[0.0, 0.0, 0.0],
+            tolerance=0.003,
+            required_hold_duration=0.5,
+        )
+        self.assertTrue(metrics.goal_reached)
+        self.assertAlmostEqual(0.4, metrics.time_to_goal)
+        self.assertAlmostEqual(0.6, metrics.goal_hold_duration)
+        self.assertAlmostEqual(0.001, metrics.final_goal_error)
+
+    def test_lumen_safety_metrics_detect_backbone_collision_and_margin(self):
+        lumen = CylindricalLumen(
+            frame_id="base_link",
+            axis_origin=[0.0, 0.0, 0.0],
+            axis_direction=[0.0, 0.0, 1.0],
+            radius=0.030,
+            length=0.120,
+            ctr_outer_radius=0.0015,
+            safety_margin=0.002,
+        )
+        metrics = compute_lumen_safety_metrics(
+            times=[0.0, 0.5, 1.0],
+            backbone_points=[
+                np.array([[0.0, 0.0, 0.0], [0.010, 0.0, 0.05]]),
+                np.array([[0.0, 0.0, 0.0], [0.027, 0.0, 0.05]]),
+                np.array([[0.0, 0.0, 0.0], [0.040, 0.0, 0.05]]),
+            ],
+            lumen=lumen,
+        )
+        self.assertFalse(metrics.collision_free_pass)
+        self.assertFalse(metrics.safety_margin_pass)
+        self.assertEqual(1, metrics.radial_collision_count)
+        self.assertEqual(2, metrics.safety_margin_violation_count)
+        self.assertGreater(metrics.maximum_penetration_depth, 0.0)
+
+    def test_motion_metrics_path_efficiency_and_control_fields(self):
+        control = compute_control_metrics(
+            times=[0.0, 1.0],
+            commands=[[1.0, 0.0, 0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
+        )
+        metrics = compute_motion_metrics(
+            times=[0.0, 1.0],
+            tip_positions=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            q_values=np.zeros((2, 6)),
+            goal_position=[1.0, 0.0, 0.0],
+            control=control,
+        )
+        self.assertAlmostEqual(1.0, metrics.tip_path_length)
+        self.assertAlmostEqual(1.0, metrics.straight_line_target_distance)
+        self.assertAlmostEqual(1.0, metrics.path_efficiency)
+        self.assertAlmostEqual(control.total_control_effort, metrics.total_control_effort)
+
     def test_acceptance_categories_are_separate(self):
         tracking = compute_tracking_metrics(
             times=[0.0, 0.1],
@@ -191,6 +256,9 @@ class EvaluationMetricsTest(unittest.TestCase):
             baseline_improvement_valid=True,
         )
         self.assertTrue(result.functional_pass)
+        self.assertTrue(result.goal_reached_pass)
+        self.assertTrue(result.collision_free_pass)
+        self.assertTrue(result.safety_margin_pass)
         self.assertTrue(result.numerical_safety_pass)
         self.assertFalse(result.real_time_pass)
         self.assertFalse(result.physical_validation_pass)
@@ -259,6 +327,20 @@ class EvaluationMetricsTest(unittest.TestCase):
         self.assertEqual(2, aggregate["count"])
         self.assertAlmostEqual(2.0, aggregate["metrics"]["rmse"]["mean"])
         self.assertIn("confidence_interval_95", aggregate["metrics"]["rmse"])
+
+    def test_higher_is_better_clearance_comparison(self):
+        result = compare_summaries(
+            candidate_summary={"lumen_safety": {"minimum_backbone_wall_clearance": 0.004}},
+            baseline_summary={"lumen_safety": {"minimum_backbone_wall_clearance": 0.002}},
+            candidate_metadata={"configuration": {"trajectory_type": "circle", "frame_id": "base_link"}},
+            baseline_metadata={"configuration": {"trajectory_type": "circle", "frame_id": "base_link"}},
+            near_zero_epsilon=1.0e-12,
+            duration_tolerance=1.0,
+            initial_state_tolerance=1.0e-6,
+        )
+        self.assertTrue(result.metric_comparisons[0].comparison_valid)
+        self.assertEqual("higher", result.metric_comparisons[0].direction)
+        self.assertAlmostEqual(100.0, result.metric_comparisons[0].relative_improvement_percent)
 
     def test_online_metric_cross_check_for_shared_definitions(self):
         online_config = TrajectoryMetricsConfig(

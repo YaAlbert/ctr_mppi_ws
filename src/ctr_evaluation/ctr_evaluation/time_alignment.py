@@ -24,6 +24,7 @@ class TimedState:
     q: np.ndarray
     q_dot: np.ndarray
     tip_position: np.ndarray
+    backbone_points: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,7 @@ class AlignedSample:
     q: np.ndarray
     q_dot: np.ndarray
     tip_position: np.ndarray
+    backbone_points: np.ndarray | None
     reference_position: np.ndarray
     command: np.ndarray
     solve_time: float
@@ -182,6 +184,7 @@ def align_samples(
                 q=state.q,
                 q_dot=state.q_dot,
                 tip_position=state.tip_position,
+                backbone_points=state.backbone_points,
                 reference_position=reference,
                 command=command,
                 solve_time=solve_time,
@@ -214,12 +217,13 @@ def align_samples(
     return AlignmentResult(samples=samples, diagnostics=diagnostics)
 
 
-def state_sample(timestamp: Any, q: Any, q_dot: Any, tip_position: Any) -> TimedState:
+def state_sample(timestamp: Any, q: Any, q_dot: Any, tip_position: Any, backbone_points: Any | None = None) -> TimedState:
     return TimedState(
         timestamp=_time(timestamp),
         q=_array(q, "q", (6,)),
         q_dot=_array(q_dot, "q_dot", (6,)),
         tip_position=_array(tip_position, "tip_position", (3,)),
+        backbone_points=None if backbone_points is None else _points(backbone_points, "backbone_points"),
     )
 
 
@@ -324,7 +328,8 @@ def _valid_states(samples: list[TimedState]) -> tuple[list[TimedState], int]:
     valid: list[TimedState] = []
     invalid = 0
     for sample in samples:
-        if _sample_is_finite(sample.timestamp, sample.q, sample.q_dot, sample.tip_position):
+        backbone_valid = sample.backbone_points is None or _sample_is_finite(sample.backbone_points)
+        if backbone_valid and _sample_is_finite(sample.timestamp, sample.q, sample.q_dot, sample.tip_position):
             valid.append(sample)
         else:
             invalid += 1
@@ -386,6 +391,13 @@ def _array(values: Any, label: str, shape: tuple[int, ...]) -> np.ndarray:
     array = np.asarray(values, dtype=float)
     if array.shape != shape or not np.all(np.isfinite(array)):
         raise ValueError(f"{label} must have shape {shape} and contain finite values")
+    return array.copy()
+
+
+def _points(values: Any, label: str) -> np.ndarray:
+    array = np.asarray(values, dtype=float)
+    if array.ndim != 2 or array.shape[1] != 3 or array.shape[0] == 0 or not np.all(np.isfinite(array)):
+        raise ValueError(f"{label} must have shape (N, 3) with N > 0 and finite values")
     return array.copy()
 
 

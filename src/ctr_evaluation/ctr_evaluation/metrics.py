@@ -17,6 +17,8 @@ from typing import Any, Iterable
 
 import numpy as np
 
+from ctr_mppi_controller.cylindrical_lumen import CylindricalLumen
+
 
 NO_TRANSIENT_REACHED = -1.0
 METRIC_DIRECTIONS = {
@@ -42,6 +44,22 @@ METRIC_DIRECTIONS = {
     "effective_solve_frequency": "higher",
     "deadline_overrun_percentage": "lower",
     "valid_aligned_sample_count": "higher",
+    "final_goal_error": "lower",
+    "minimum_tip_error": "lower",
+    "goal_hold_duration": "higher",
+    "time_inside_goal_tolerance_percentage": "higher",
+    "minimum_backbone_wall_clearance": "higher",
+    "mean_minimum_backbone_clearance": "higher",
+    "p05_clearance": "higher",
+    "safety_margin_violation_duration": "lower",
+    "radial_collision_count": "lower",
+    "radial_collision_duration": "lower",
+    "inlet_violation_count": "lower",
+    "outlet_violation_count": "lower",
+    "maximum_penetration_depth": "lower",
+    "tip_path_length": "lower",
+    "joint_space_path_length": "lower",
+    "path_efficiency": "higher",
 }
 
 
@@ -147,11 +165,60 @@ class DataQualityMetrics:
     nearest_reference_fallback_count: int
     missing_command_count: int
     missing_topic_count: int
+    missing_backbone_sample_count: int = 0
+
+
+@dataclass(frozen=True)
+class GoalMetrics:
+    initial_tip_error: float
+    final_goal_error: float
+    minimum_tip_error: float
+    mean_tip_error: float
+    rmse: float
+    goal_reached: bool
+    time_to_goal: float
+    goal_hold_duration: float
+    time_inside_goal_tolerance_percentage: float
+
+
+@dataclass(frozen=True)
+class LumenSafetyMetrics:
+    minimum_backbone_wall_clearance: float
+    mean_minimum_backbone_clearance: float
+    p05_clearance: float
+    minimum_axial_end_cap_clearance: float
+    safety_margin_violation_count: int
+    safety_margin_violation_duration: float
+    radial_collision_count: int
+    radial_collision_duration: float
+    inlet_violation_count: int
+    outlet_violation_count: int
+    maximum_penetration_depth: float
+    closest_backbone_point_index_over_time: list[int]
+    collision_free_pass: bool
+    safety_margin_pass: bool
+    missing_backbone_sample_count: int
+
+
+@dataclass(frozen=True)
+class MotionMetrics:
+    tip_path_length: float
+    joint_space_path_length: float
+    straight_line_target_distance: float
+    path_efficiency: float
+    total_control_effort: float
+    insertion_control_effort: float
+    rotation_control_effort: float
+    maximum_command_per_joint: list[float]
+    command_saturation_count: int
 
 
 @dataclass(frozen=True)
 class AcceptanceResults:
     functional_pass: bool
+    goal_reached_pass: bool
+    collision_free_pass: bool
+    safety_margin_pass: bool
     numerical_safety_pass: bool
     data_quality_pass: bool
     baseline_improvement_pass: bool
@@ -368,6 +435,147 @@ def compute_timing_metrics(
     )
 
 
+def compute_goal_metrics(
+    *,
+    times: Any,
+    tip_positions: Any,
+    goal_position: Any,
+    tolerance: float,
+    required_hold_duration: float,
+) -> GoalMetrics:
+    time_values = _vector(times, "times", allow_empty=True)
+    tip = _matrix3(tip_positions, "tip_positions")
+    goal = _array_shape(goal_position, "goal_position", (3,))
+    if tip.shape[0] != time_values.shape[0]:
+        raise ValueError("times and tip_positions must have matching lengths")
+    if tip.shape[0] == 0:
+        return GoalMetrics(math.nan, math.nan, math.nan, math.nan, math.nan, False, NO_TRANSIENT_REACHED, 0.0, 0.0)
+    tol = _positive_number(tolerance, "tolerance")
+    required_hold = _nonnegative_number(required_hold_duration, "required_hold_duration")
+    relative_times = _relative_times(time_values)
+    errors = np.linalg.norm(tip - goal, axis=1)
+    inside = errors <= tol
+    durations = _sample_durations(relative_times)
+    hold_duration = _maximum_contiguous_duration(inside, durations)
+    time_to_goal = _time_to_hold(relative_times, inside, durations, required_hold)
+    total_duration = float(np.sum(durations))
+    inside_duration = _total_true_span_duration(inside, durations)
+    inside_percentage = 100.0 * inside_duration / total_duration if total_duration > 0.0 else float(100.0 * np.mean(inside))
+    return GoalMetrics(
+        initial_tip_error=float(errors[0]),
+        final_goal_error=float(errors[-1]),
+        minimum_tip_error=float(np.min(errors)),
+        mean_tip_error=float(np.mean(errors)),
+        rmse=float(math.sqrt(float(np.mean(errors**2)))),
+        goal_reached=bool(hold_duration >= required_hold and bool(np.any(inside))),
+        time_to_goal=time_to_goal,
+        goal_hold_duration=hold_duration,
+        time_inside_goal_tolerance_percentage=float(inside_percentage),
+    )
+
+
+def compute_lumen_safety_metrics(
+    *,
+    times: Any,
+    backbone_points: list[np.ndarray | None],
+    lumen: CylindricalLumen,
+) -> LumenSafetyMetrics:
+    time_values = _vector(times, "times", allow_empty=True)
+    if len(backbone_points) != time_values.shape[0]:
+        raise ValueError("times and backbone_points must have matching lengths")
+    if time_values.size == 0:
+        return LumenSafetyMetrics(math.nan, math.nan, math.nan, math.nan, 0, 0.0, 0, 0.0, 0, 0, 0.0, [], False, False, 0)
+
+    durations = _sample_durations(_relative_times(time_values))
+    minimum_clearances: list[float] = []
+    axial_clearances: list[float] = []
+    closest_indices: list[int] = []
+    safety_flags: list[bool] = []
+    radial_collision_flags: list[bool] = []
+    inlet_flags: list[bool] = []
+    outlet_flags: list[bool] = []
+    penetration_depths: list[float] = []
+    missing = 0
+    for points in backbone_points:
+        if points is None:
+            missing += 1
+            minimum_clearances.append(math.nan)
+            axial_clearances.append(math.nan)
+            closest_indices.append(-1)
+            safety_flags.append(True)
+            radial_collision_flags.append(True)
+            inlet_flags.append(True)
+            outlet_flags.append(True)
+            penetration_depths.append(math.nan)
+            continue
+        clearance = lumen.backbone_clearance(points)
+        minimum_clearances.append(clearance.minimum_radial_clearance)
+        axial_clearances.append(clearance.minimum_axial_clearance)
+        closest_indices.append(clearance.closest_backbone_point_index)
+        safety_flags.append(clearance.safety_margin_violation_count > 0)
+        radial_collision_flags.append(bool(np.any(clearance.radial_collision_mask)))
+        inlet_flags.append(bool(np.any(clearance.inlet_violation_mask)))
+        outlet_flags.append(bool(np.any(clearance.outlet_violation_mask)))
+        penetration_depths.append(clearance.maximum_penetration_depth)
+
+    min_clearance_array = np.asarray([value for value in minimum_clearances if math.isfinite(value)], dtype=float)
+    axial_array = np.asarray([value for value in axial_clearances if math.isfinite(value)], dtype=float)
+    penetration_array = np.asarray([value for value in penetration_depths if math.isfinite(value)], dtype=float)
+    safety = np.asarray(safety_flags, dtype=bool)
+    radial = np.asarray(radial_collision_flags, dtype=bool)
+    inlet = np.asarray(inlet_flags, dtype=bool)
+    outlet = np.asarray(outlet_flags, dtype=bool)
+    collision = radial | inlet | outlet
+    return LumenSafetyMetrics(
+        minimum_backbone_wall_clearance=float(np.min(min_clearance_array)) if min_clearance_array.size else math.nan,
+        mean_minimum_backbone_clearance=float(np.mean(min_clearance_array)) if min_clearance_array.size else math.nan,
+        p05_clearance=float(np.percentile(min_clearance_array, 5.0)) if min_clearance_array.size else math.nan,
+        minimum_axial_end_cap_clearance=float(np.min(axial_array)) if axial_array.size else math.nan,
+        safety_margin_violation_count=int(np.sum(safety)),
+        safety_margin_violation_duration=float(np.sum(durations[safety])),
+        radial_collision_count=int(np.sum(radial)),
+        radial_collision_duration=float(np.sum(durations[radial])),
+        inlet_violation_count=int(np.sum(inlet)),
+        outlet_violation_count=int(np.sum(outlet)),
+        maximum_penetration_depth=float(np.max(penetration_array)) if penetration_array.size else math.nan,
+        closest_backbone_point_index_over_time=closest_indices,
+        collision_free_pass=bool(not np.any(collision) and missing == 0),
+        safety_margin_pass=bool(not np.any(safety) and missing == 0),
+        missing_backbone_sample_count=int(missing),
+    )
+
+
+def compute_motion_metrics(
+    *,
+    times: Any,
+    tip_positions: Any,
+    q_values: Any,
+    goal_position: Any,
+    control: ControlMetrics,
+) -> MotionMetrics:
+    time_values = _vector(times, "times", allow_empty=True)
+    tip = _matrix3(tip_positions, "tip_positions")
+    q = _array_shape(q_values, "q_values", (-1, 6))
+    goal = _array_shape(goal_position, "goal_position", (3,))
+    if tip.shape[0] != time_values.shape[0] or q.shape[0] != time_values.shape[0]:
+        raise ValueError("times, tip_positions, and q_values must have matching lengths")
+    tip_path = float(np.sum(np.linalg.norm(np.diff(tip, axis=0), axis=1))) if tip.shape[0] > 1 else 0.0
+    joint_path = float(np.sum(np.linalg.norm(np.diff(q, axis=0), axis=1))) if q.shape[0] > 1 else 0.0
+    straight = float(np.linalg.norm(goal - tip[0])) if tip.shape[0] else math.nan
+    efficiency = float(straight / tip_path) if tip_path > 1.0e-12 and math.isfinite(straight) else math.nan
+    return MotionMetrics(
+        tip_path_length=tip_path,
+        joint_space_path_length=joint_path,
+        straight_line_target_distance=straight,
+        path_efficiency=efficiency,
+        total_control_effort=control.total_control_effort,
+        insertion_control_effort=control.insertion_control_effort,
+        rotation_control_effort=control.rotation_control_effort,
+        maximum_command_per_joint=list(control.maximum_command_per_joint),
+        command_saturation_count=control.saturation_count,
+    )
+
+
 def compute_acceptance(
     *,
     tracking: TrackingMetrics,
@@ -377,6 +585,8 @@ def compute_acceptance(
     data_quality: DataQualityMetrics,
     thresholds: EvaluationThresholds,
     baseline_improvement_valid: bool,
+    goal: GoalMetrics | None = None,
+    lumen_safety: LumenSafetyMetrics | None = None,
     physical_validation: bool = False,
     hardware_validation: bool = False,
 ) -> AcceptanceResults:
@@ -384,6 +594,18 @@ def compute_acceptance(
     functional_pass = data_quality.valid_aligned_sample_count >= thresholds.minimum_valid_sample_count
     if not functional_pass:
         reasons.append("valid aligned sample count below threshold")
+
+    goal_reached_pass = True if goal is None else bool(goal.goal_reached)
+    if not goal_reached_pass:
+        reasons.append("goal tolerance hold requirement was not met")
+
+    collision_free_pass = True if lumen_safety is None else bool(lumen_safety.collision_free_pass)
+    if not collision_free_pass:
+        reasons.append("backbone collision or missing backbone data was recorded")
+
+    safety_margin_pass = True if lumen_safety is None else bool(lumen_safety.safety_margin_pass)
+    if not safety_margin_pass:
+        reasons.append("backbone safety-margin violation was recorded")
 
     numerical_safety_pass = (
         numerical_safety.nonfinite_state_samples == 0
@@ -420,6 +642,9 @@ def compute_acceptance(
 
     return AcceptanceResults(
         functional_pass=functional_pass,
+        goal_reached_pass=goal_reached_pass,
+        collision_free_pass=collision_free_pass,
+        safety_margin_pass=safety_margin_pass,
         numerical_safety_pass=numerical_safety_pass,
         data_quality_pass=data_quality_pass,
         baseline_improvement_pass=baseline_improvement_valid,
@@ -536,6 +761,8 @@ def compatibility_report_for(
     for key in (
         "trajectory_type",
         "trajectory_parameters_hash",
+        "cylindrical_lumen_hash",
+        "goal_configuration_hash",
         "frame_id",
         "model_configuration_hash",
         "software_mode",
@@ -789,7 +1016,7 @@ def sanitize_for_json(value: Any) -> Any:
 
 def _flatten_numeric_metrics(summary: dict[str, Any]) -> dict[str, float]:
     flat: dict[str, float] = {}
-    for section in ("tracking", "control", "timing", "data_quality"):
+    for section in ("tracking", "control", "timing", "data_quality", "goal", "lumen_safety", "motion"):
         values = summary.get(section, {})
         if not isinstance(values, dict):
             continue
@@ -842,6 +1069,54 @@ def _sample_durations(times: np.ndarray) -> np.ndarray:
         return np.asarray([0.0], dtype=float)
     deltas = np.diff(times)
     return np.concatenate([[0.0], np.maximum(deltas, 0.0)])
+
+
+def _maximum_contiguous_duration(flags: np.ndarray, durations: np.ndarray) -> float:
+    maximum = 0.0
+    current = 0.0
+    previous = False
+    for flag, duration in zip(flags, durations):
+        if flag:
+            if previous:
+                current += float(duration)
+            maximum = max(maximum, current)
+        else:
+            current = 0.0
+        previous = bool(flag)
+    return float(maximum)
+
+
+def _time_to_hold(times: np.ndarray, flags: np.ndarray, durations: np.ndarray, required_hold: float) -> float:
+    if required_hold == 0.0:
+        indices = np.nonzero(flags)[0]
+        return float(times[int(indices[0])]) if indices.size else NO_TRANSIENT_REACHED
+    current = 0.0
+    start_time = 0.0
+    in_streak = False
+    for time_value, flag, duration in zip(times, flags, durations):
+        if flag:
+            if not in_streak:
+                start_time = float(time_value)
+                in_streak = True
+                current = 0.0
+            else:
+                current += float(duration)
+            if current >= required_hold:
+                return start_time
+        else:
+            in_streak = False
+            current = 0.0
+    return NO_TRANSIENT_REACHED
+
+
+def _total_true_span_duration(flags: np.ndarray, durations: np.ndarray) -> float:
+    total = 0.0
+    previous = False
+    for flag, duration in zip(flags, durations):
+        if flag and previous:
+            total += float(duration)
+        previous = bool(flag)
+    return float(total)
 
 
 def _relative_times(times: np.ndarray) -> np.ndarray:

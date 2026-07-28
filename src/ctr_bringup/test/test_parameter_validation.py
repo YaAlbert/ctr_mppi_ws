@@ -151,6 +151,14 @@ class ParameterValidationTest(unittest.TestCase):
         self.assertIn("evaluation_experiment_group", launch_arguments)
         self.assertIn("evaluation_controller_label", launch_arguments)
         self.assertIn("evaluation_baseline_result_dir", launch_arguments)
+        self.assertIn("evaluation_output_root", launch_arguments)
+        self.assertIn("enable_cylindrical_lumen", launch_arguments)
+        self.assertIn("cylinder_profile", launch_arguments)
+        self.assertIn("cylinder_target_x", launch_arguments)
+        self.assertIn("cylinder_target_y", launch_arguments)
+        self.assertIn("cylinder_target_z", launch_arguments)
+        self.assertIn("mppi_random_seed", launch_arguments)
+        self.assertIn("run_role", launch_arguments)
 
         node_actions = [entity for entity in launch_description.entities if isinstance(entity, Node)]
         executables = {getattr(node, "_Node__node_executable", None) for node in node_actions}
@@ -173,6 +181,12 @@ class ParameterValidationTest(unittest.TestCase):
         }
         self.assertIn("trajectory_start_policy", launch_arguments)
         self.assertIn("scheduled_reference_epoch", launch_arguments)
+        self.assertIn("enable_cylindrical_lumen", launch_arguments)
+        self.assertIn("cylinder_profile", launch_arguments)
+        self.assertIn("cylinder_target_x", launch_arguments)
+        self.assertIn("cylinder_target_y", launch_arguments)
+        self.assertIn("cylinder_target_z", launch_arguments)
+        self.assertIn("mppi_random_seed", launch_arguments)
         nodes = [entity for entity in launch_description.entities if isinstance(entity, Node)]
         self.assertEqual(["reference_manager_node"], [getattr(node, "_Node__node_executable", None) for node in nodes])
 
@@ -191,8 +205,62 @@ class ParameterValidationTest(unittest.TestCase):
             if isinstance(entity, DeclareLaunchArgument)
         }
         self.assertIn("publish_safe_command_for_simulation", launch_arguments)
+        self.assertIn("enable_cylindrical_lumen", launch_arguments)
+        self.assertIn("cylinder_profile", launch_arguments)
+        self.assertIn("cylinder_target_x", launch_arguments)
+        self.assertIn("cylinder_target_y", launch_arguments)
+        self.assertIn("cylinder_target_z", launch_arguments)
+        self.assertIn("mppi_random_seed", launch_arguments)
         nodes = [entity for entity in launch_description.entities if isinstance(entity, Node)]
         self.assertEqual(["mppi_controller_node"], [getattr(node, "_Node__node_executable", None) for node in nodes])
+
+    def test_cylinder_target_node_parameters_are_double_arrays(self):
+        node_files = (
+            REPO_ROOT / "src" / "ctr_sim" / "ctr_sim" / "nodes" / "simulator_node.py",
+            REPO_ROOT / "src" / "ctr_mppi_controller" / "ctr_mppi_controller" / "nodes" / "mppi_controller_node.py",
+            REPO_ROOT / "src" / "ctr_mppi_controller" / "ctr_mppi_controller" / "nodes" / "reference_manager_node.py",
+            REPO_ROOT / "src" / "ctr_evaluation" / "ctr_evaluation" / "nodes" / "evaluation_node.py",
+        )
+        for path in node_files:
+            with self.subTest(path=path.name):
+                source = path.read_text(encoding="utf-8")
+                self.assertIn('declare_parameter("cylinder_target_position", Parameter.Type.DOUBLE_ARRAY)', source)
+
+    def test_cylinder_target_launch_parameters_are_typed_double_arrays(self):
+        launch_files = (
+            REPO_ROOT / "src" / "ctr_bringup" / "launch" / "simulation.launch.py",
+            REPO_ROOT / "src" / "ctr_bringup" / "launch" / "evaluation_reference.launch.py",
+            REPO_ROOT / "src" / "ctr_bringup" / "launch" / "evaluation_mppi_controller.launch.py",
+        )
+        for path in launch_files:
+            with self.subTest(path=path.name):
+                source = path.read_text(encoding="utf-8")
+                self.assertIn("ParameterValue", source)
+                self.assertIn("value_type=list[float]", source)
+
+    def test_mppi_seed_node_parameters_are_integer_with_negative_default(self):
+        node_files = (
+            REPO_ROOT / "src" / "ctr_mppi_controller" / "ctr_mppi_controller" / "nodes" / "mppi_controller_node.py",
+            REPO_ROOT / "src" / "ctr_mppi_controller" / "ctr_mppi_controller" / "nodes" / "reference_manager_node.py",
+            REPO_ROOT / "src" / "ctr_evaluation" / "ctr_evaluation" / "nodes" / "evaluation_node.py",
+        )
+        for path in node_files:
+            with self.subTest(path=path.name):
+                source = path.read_text(encoding="utf-8")
+                self.assertIn('declare_parameter("mppi_random_seed", -1)', source)
+                self.assertIn("def _optional_seed", source)
+
+    def test_mppi_seed_launch_defaults_are_negative_integer(self):
+        launch_files = (
+            REPO_ROOT / "src" / "ctr_bringup" / "launch" / "simulation.launch.py",
+            REPO_ROOT / "src" / "ctr_bringup" / "launch" / "evaluation_reference.launch.py",
+            REPO_ROOT / "src" / "ctr_bringup" / "launch" / "evaluation_mppi_controller.launch.py",
+        )
+        for path in launch_files:
+            with self.subTest(path=path.name):
+                source = path.read_text(encoding="utf-8")
+                self.assertIn('"mppi_random_seed"', source)
+                self.assertIn('default_value="-1"', source)
 
     def test_evaluation_launch_helpers_start_no_hardware(self):
         from launch_ros.actions import Node
@@ -309,6 +377,50 @@ class ParameterValidationTest(unittest.TestCase):
         config["tracking_metrics"]["stable_cycles"] = 0
         errors = validate_project_config(config)
         self.assertTrue(any("tracking_metrics.stable_cycles" in error for error in errors))
+
+    def test_cylindrical_lumen_yaml_section_validates(self):
+        config = load_parameter_files(CONFIG_FILES)
+        errors = validate_project_config(config)
+        self.assertEqual([], [error for error in errors if "cylindrical_lumen" in error])
+        self.assertEqual([], [error for error in errors if "goal." in error])
+        self.assertEqual([], [error for error in errors if "mppi_profiles" in error])
+
+    def test_cylindrical_lumen_rejects_invalid_axis(self):
+        config = load_parameter_files(CONFIG_FILES)
+        config = copy.deepcopy(config)
+        config["cylindrical_lumen"]["axis_direction"] = [0.0, 0.0, 0.0]
+        errors = validate_project_config(config)
+        self.assertTrue(any("axis_direction" in error for error in errors))
+
+    def test_cylindrical_lumen_rejects_unusable_radius(self):
+        config = load_parameter_files(CONFIG_FILES)
+        config = copy.deepcopy(config)
+        config["cylindrical_lumen"]["radius"] = config["cylindrical_lumen"]["ctr_outer_radius"]
+        errors = validate_project_config(config)
+        self.assertTrue(any("radius" in error for error in errors))
+
+    def test_goal_rejects_bad_position_and_tolerance(self):
+        config = load_parameter_files(CONFIG_FILES)
+        config = copy.deepcopy(config)
+        config["goal"]["position"] = [0.0, 0.0]
+        config["goal"]["tolerance"] = 0.0
+        errors = validate_project_config(config)
+        self.assertTrue(any("goal.position" in error for error in errors))
+        self.assertTrue(any("goal.tolerance" in error for error in errors))
+
+    def test_mppi_profile_rejects_nonpositive_control_period(self):
+        config = load_parameter_files(CONFIG_FILES)
+        config = copy.deepcopy(config)
+        config["mppi_profiles"]["cylinder_fast"]["control_period"] = 0.0
+        errors = validate_project_config(config)
+        self.assertTrue(any("mppi_profiles.cylinder_fast.control_period" in error for error in errors))
+
+    def test_mppi_profile_rejects_negative_weight_override(self):
+        config = load_parameter_files(CONFIG_FILES)
+        config = copy.deepcopy(config)
+        config["mppi_profiles"]["cylinder_fast"]["weights"]["tip"] = -1.0
+        errors = validate_project_config(config)
+        self.assertTrue(any("mppi_profiles.cylinder_fast.weights.tip" in error for error in errors))
 
     def test_evaluation_yaml_section_validates(self):
         config = load_parameter_files(CONFIG_FILES)
