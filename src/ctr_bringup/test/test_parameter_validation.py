@@ -435,6 +435,104 @@ class ParameterValidationTest(unittest.TestCase):
         errors = validate_project_config(config)
         self.assertTrue(any("reference.mode" in error for error in errors))
 
+    def test_reference_modes_are_explicitly_supported(self):
+        for mode in ("fixed_target", "trajectory", "external_target"):
+            with self.subTest(mode=mode):
+                config = load_parameter_files(CONFIG_FILES)
+                config = copy.deepcopy(config)
+                config["reference"]["mode"] = mode
+                errors = validate_project_config(config)
+                self.assertEqual([], [error for error in errors if "reference.mode" in error])
+
+    def test_reference_empty_or_non_string_mode_is_rejected(self):
+        for mode in ("", None, 1, True):
+            with self.subTest(mode=mode):
+                config = load_parameter_files(CONFIG_FILES)
+                config = copy.deepcopy(config)
+                config["reference"]["mode"] = mode
+                errors = validate_project_config(config)
+                self.assertTrue(any("reference.mode" in error for error in errors), errors)
+
+    def test_invalid_placeholder_goal_does_not_block_external_or_trajectory_modes(self):
+        for mode in ("external_target", "trajectory"):
+            with self.subTest(mode=mode):
+                config = load_parameter_files(CONFIG_FILES)
+                config = copy.deepcopy(config)
+                config["reference"]["mode"] = mode
+                config["goal"]["position"] = [float("nan"), 0.0]
+                errors = validate_project_config(config)
+                self.assertEqual([], [error for error in errors if "goal.position" in error])
+
+    def test_fixed_target_mode_still_requires_valid_goal_position(self):
+        config = load_parameter_files(CONFIG_FILES)
+        config = copy.deepcopy(config)
+        config["reference"]["mode"] = "fixed_target"
+        config["goal"]["position"] = [float("nan"), 0.0]
+        errors = validate_project_config(config)
+        self.assertTrue(any("goal.position" in error for error in errors), errors)
+
+    def test_reference_mode_override_is_applied_before_goal_validation(self):
+        config = load_parameter_files(CONFIG_FILES)
+        config = copy.deepcopy(config)
+        config["reference"]["mode"] = "fixed_target"
+        config["goal"]["position"] = [float("nan"), 0.0]
+
+        fixed_errors = validate_project_config(project_config_with_overrides(config, reference_mode="fixed_target"))
+        self.assertTrue(any("goal.position" in error for error in fixed_errors), fixed_errors)
+
+        for mode in ("external_target", "trajectory"):
+            with self.subTest(mode=mode):
+                effective = project_config_with_overrides(config, reference_mode=mode)
+                validate_or_raise(effective)
+                self.assertEqual(mode, effective["reference"]["mode"])
+
+    def test_lumen_goal_frame_mismatch_is_ignored_only_when_goal_is_placeholder(self):
+        config = curved_lumen_config()
+        config["reference"]["mode"] = "external_target"
+        config["goal"]["frame_id"] = "placeholder_frame"
+        errors = validate_project_config(config)
+        self.assertEqual([], [error for error in errors if "goal.frame_id" in error and "selected lumen frame" in error])
+
+    def test_simulation_launch_rejects_external_target_with_forced_reference_manager(self):
+        from launch import LaunchContext
+
+        module = load_launch_module("simulation.launch.py", "simulation_launch_external_conflict_under_test")
+        context = LaunchContext()
+        context.launch_configurations["reference_mode"] = "external_target"
+        context.launch_configurations["start_reference_manager"] = "true"
+        with self.assertRaisesRegex(RuntimeError, "external_target"):
+            module._validate_reference_launch_arguments(context)
+
+    def test_simulation_launch_accepts_external_target_without_reference_manager(self):
+        from launch import LaunchContext
+
+        module = load_launch_module("simulation.launch.py", "simulation_launch_external_ok_under_test")
+        context = LaunchContext()
+        context.launch_configurations["reference_mode"] = "external_target"
+        context.launch_configurations["start_reference_manager"] = "false"
+        self.assertEqual([], module._validate_reference_launch_arguments(context))
+
+    def test_simulation_launch_rejects_invalid_reference_mode(self):
+        from launch import LaunchContext
+
+        module = load_launch_module("simulation.launch.py", "simulation_launch_invalid_reference_mode_under_test")
+        context = LaunchContext()
+        context.launch_configurations["reference_mode"] = "invalid"
+        context.launch_configurations["start_reference_manager"] = "false"
+        with self.assertRaisesRegex(RuntimeError, "reference_mode"):
+            module._validate_reference_launch_arguments(context)
+
+    def test_simulation_launch_forwards_effective_reference_mode_to_parameter_validator(self):
+        source = (REPO_ROOT / "src" / "ctr_bringup" / "launch" / "simulation.launch.py").read_text(encoding="utf-8")
+        validator_index = source.index('executable="parameter_validator_node"')
+        simulator_index = source.index('executable="simulator_node"')
+        validator_block = source[validator_index:simulator_index]
+        self.assertIn('"reference_mode": reference_mode', validator_block)
+        self.assertIn('"reference_type": reference_type', validator_block)
+        self.assertIn('"enable_cylindrical_lumen": enable_cylindrical_lumen', validator_block)
+        self.assertIn('"enable_curved_lumen": enable_curved_lumen', validator_block)
+        self.assertIn('"cylinder_target_position": cylinder_target_position', validator_block)
+
     def test_reference_zero_helix_height_is_rejected(self):
         config = load_parameter_files(CONFIG_FILES)
         config = copy.deepcopy(config)

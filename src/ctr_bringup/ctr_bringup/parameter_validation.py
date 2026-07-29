@@ -39,6 +39,10 @@ class ParameterValidationError(ValueError):
     """Raised when one or more project parameter files fail validation."""
 
 
+REFERENCE_MODES = ("fixed_target", "trajectory", "external_target")
+REFERENCE_TRAJECTORY_TYPES = ("circle", "ellipse", "helix")
+
+
 def validate_config_paths(
     paths: Iterable[str | Path] | None,
     *,
@@ -118,6 +122,7 @@ def validate_project_config(config: dict[str, Any]) -> list[str]:
     """Return validation errors for the full project configuration."""
 
     errors: list[str] = []
+    reference_mode = _reference_mode_for_validation(config)
     for section in (
         "robot",
         "model",
@@ -148,7 +153,7 @@ def validate_project_config(config: dict[str, Any]) -> list[str]:
     if "cylindrical_lumen_cost" in config:
         errors.extend(_validate_cylindrical_lumen_cost(config["cylindrical_lumen_cost"]))
     if "goal" in config:
-        errors.extend(_validate_goal(config["goal"]))
+        errors.extend(_validate_goal(config["goal"], reference_mode=reference_mode))
     if "reference" in config:
         errors.extend(_validate_reference(config["reference"]))
     if "tracking_metrics" in config:
@@ -172,6 +177,14 @@ def project_config_with_overrides(
     *,
     runtime_mode: str | None = None,
     hardware_implementation: str | None = None,
+    reference_mode: Any | None = None,
+    reference_type: Any | None = None,
+    enable_cylindrical_lumen: Any | None = None,
+    enable_curved_lumen: Any | None = None,
+    curved_lumen_type: Any | None = None,
+    cylinder_target_position: Any | None = None,
+    mppi_profile: Any | None = None,
+    mppi_random_seed: Any | None = None,
 ) -> dict[str, Any]:
     """Return a copy of config with launch-mode overrides applied."""
 
@@ -180,7 +193,131 @@ def project_config_with_overrides(
         result.setdefault("runtime", {})["mode"] = runtime_mode
     if hardware_implementation is not None:
         result.setdefault("hardware", {})["implementation"] = hardware_implementation
+    if reference_mode is not None and reference_mode != "":
+        result.setdefault("reference", {})["mode"] = _choice(reference_mode, "reference_mode", REFERENCE_MODES)
+    if reference_type is not None and reference_type != "":
+        result.setdefault("reference", {})["trajectory_type"] = _choice(
+            reference_type,
+            "reference_type",
+            REFERENCE_TRAJECTORY_TYPES,
+        )
+    if enable_cylindrical_lumen is not None and enable_cylindrical_lumen != "":
+        result.setdefault("cylindrical_lumen", {})["enabled"] = parse_launch_bool(
+            enable_cylindrical_lumen,
+            "enable_cylindrical_lumen",
+        )
+    if enable_curved_lumen is not None and enable_curved_lumen != "":
+        result.setdefault("curved_lumen", {})["enabled"] = parse_launch_bool(
+            enable_curved_lumen,
+            "enable_curved_lumen",
+        )
+    if curved_lumen_type is not None and curved_lumen_type != "":
+        result.setdefault("curved_lumen", {})["type"] = _choice(
+            curved_lumen_type,
+            "curved_lumen_type",
+            ("circular_arc", "s_curve"),
+        )
+    if mppi_profile is not None and mppi_profile != "":
+        _apply_mppi_profile(result, mppi_profile)
+    if (
+        cylinder_target_position is not None
+        and cylinder_target_position != ""
+        and _reference_mode_for_validation(result) == "fixed_target"
+    ):
+        if not (isinstance(cylinder_target_position, (list, tuple)) and len(cylinder_target_position) == 0):
+            result.setdefault("goal", {})["position"] = deepcopy(cylinder_target_position)
+    if mppi_random_seed is not None and mppi_random_seed != "":
+        seed = _optional_seed(mppi_random_seed, "mppi_random_seed")
+        if seed is not None:
+            result.setdefault("mppi", {})["random_seed"] = seed
     return result
+
+
+def _apply_mppi_profile(config: dict[str, Any], profile_name: Any) -> None:
+    name = _non_empty_string(profile_name, "cylinder_profile")
+    profiles = config.get("mppi_profiles", {})
+    if not isinstance(profiles, dict) or name not in profiles:
+        raise ParameterValidationError(f"`cylinder_profile` must name an existing MPPI profile.")
+    profile = profiles[name]
+    if not isinstance(profile, dict):
+        raise ParameterValidationError(f"`mppi_profiles.{name}` must be a map.")
+    mppi = config.setdefault("mppi", {})
+    mppi["num_samples"] = _positive_int(profile.get("samples"), f"mppi_profiles.{name}.samples")
+    mppi["horizon"] = _positive_int(profile.get("horizon"), f"mppi_profiles.{name}.horizon")
+    mppi["dt"] = _positive_number_value(profile.get("dt"), f"mppi_profiles.{name}.dt")
+    if "lambda" in profile:
+        mppi["lambda"] = _positive_number_value(profile["lambda"], f"mppi_profiles.{name}.lambda")
+    if "noise_std" in profile:
+        mppi["noise_std"] = deepcopy(profile["noise_std"])
+    if "weights" in profile:
+        if not isinstance(profile["weights"], dict):
+            raise ParameterValidationError(f"`mppi_profiles.{name}.weights` must be a map.")
+        mppi.setdefault("weights", {}).update(deepcopy(profile["weights"]))
+    if "control_frequency" in profile:
+        mppi["control_frequency"] = _positive_number_value(
+            profile["control_frequency"],
+            f"mppi_profiles.{name}.control_frequency",
+        )
+    else:
+        period = _positive_number_value(profile.get("control_period"), f"mppi_profiles.{name}.control_period")
+        mppi["control_frequency"] = 1.0 / period
+    mppi["active_profile"] = name
+
+
+def _choice(value: Any, label: str, allowed: tuple[str, ...]) -> str:
+    if not isinstance(value, str) or value not in allowed:
+        raise ParameterValidationError(f"`{label}` must be one of {allowed}.")
+    return value
+
+
+def _non_empty_string(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ParameterValidationError(f"`{label}` must be a non-empty string.")
+    return value
+
+
+def _vector3(values: Any, label: str) -> list[float]:
+    if not isinstance(values, (list, tuple)) or len(values) != 3:
+        raise ParameterValidationError(f"`{label}` must contain exactly three finite numeric values.")
+    result = []
+    for value in values:
+        numeric = _finite_number(value, label)
+        result.append(float(numeric))
+    return result
+
+
+def _optional_seed(value: Any, label: str) -> int | None:
+    numeric = _finite_number(value, label)
+    if int(numeric) != numeric:
+        raise ParameterValidationError(f"`{label}` must be an integer.")
+    seed = int(numeric)
+    return None if seed < 0 else seed
+
+
+def _positive_int(value: Any, label: str) -> int:
+    numeric = _positive_number_value(value, label)
+    if int(numeric) != numeric:
+        raise ParameterValidationError(f"`{label}` must be an integer.")
+    return int(numeric)
+
+
+def _positive_number_value(value: Any, label: str) -> float:
+    numeric = _finite_number(value, label)
+    if numeric <= 0:
+        raise ParameterValidationError(f"`{label}` must be positive.")
+    return float(numeric)
+
+
+def _finite_number(value: Any, label: str) -> float:
+    if isinstance(value, bool):
+        raise ParameterValidationError(f"`{label}` must be numeric, not boolean.")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ParameterValidationError(f"`{label}` must be finite.") from exc
+    if not math.isfinite(numeric):
+        raise ParameterValidationError(f"`{label}` must be finite.")
+    return numeric
 
 
 def parse_launch_bool(value: Any, label: str) -> bool:
@@ -195,6 +332,13 @@ def parse_launch_bool(value: Any, label: str) -> bool:
         if normalized == "false":
             return False
     raise ParameterValidationError(f"`{label}` must be a launch boolean string `true` or `false`.")
+
+
+def _reference_mode_for_validation(config: dict[str, Any]) -> str:
+    reference = config.get("reference")
+    if isinstance(reference, dict) and reference.get("mode") in REFERENCE_MODES:
+        return str(reference["mode"])
+    return "fixed_target"
 
 
 def _validate_robot(robot: Any) -> list[str]:
@@ -486,11 +630,12 @@ def _validate_lumen_mode_and_frames(config: dict[str, Any]) -> list[str]:
     lumen_frame = selected.get("frame_id")
     if not isinstance(lumen_frame, str) or not lumen_frame:
         return errors
-    frame_sources = (
+    frame_sources = [
         ("robot.frames.base", config.get("robot", {}).get("frames", {}).get("base")),
-        ("goal.frame_id", config.get("goal", {}).get("frame_id")),
         ("reference.frame_id", config.get("reference", {}).get("frame_id")),
-    )
+    ]
+    if _reference_mode_for_validation(config) == "fixed_target":
+        frame_sources.append(("goal.frame_id", config.get("goal", {}).get("frame_id")))
     for label, frame in frame_sources:
         if isinstance(frame, str) and frame and frame != lumen_frame:
             errors.append(f"selected lumen frame `{lumen_frame}` must match `{label}` `{frame}`.")
@@ -508,7 +653,7 @@ def _validate_cylindrical_lumen_cost(cost: Any) -> list[str]:
     return errors
 
 
-def _validate_goal(goal: Any) -> list[str]:
+def _validate_goal(goal: Any, *, reference_mode: str = "fixed_target") -> list[str]:
     errors: list[str] = []
     if not isinstance(goal, dict):
         return ["`goal` must be a map."]
@@ -516,7 +661,8 @@ def _validate_goal(goal: Any) -> list[str]:
         errors.append("`goal.simulation_default` must be a boolean when present.")
     if not isinstance(goal.get("frame_id"), str) or not goal["frame_id"]:
         errors.append("`goal.frame_id` must be a non-empty string.")
-    errors.extend(_require_numeric_list(goal, "position", 3, "goal"))
+    if reference_mode == "fixed_target":
+        errors.extend(_require_numeric_list(goal, "position", 3, "goal"))
     errors.extend(_require_positive_number(goal, "tolerance", "goal"))
     errors.extend(_require_number(goal, "required_hold_duration", "goal", nonnegative=True))
     if "reachability_samples" in goal:
@@ -534,8 +680,11 @@ def _validate_reference(reference: Any) -> list[str]:
     if not isinstance(reference, dict):
         return ["`reference` must be a map."]
 
-    if reference.get("mode") not in {"fixed_target", "trajectory"}:
-        errors.append("`reference.mode` must be `fixed_target` or `trajectory`.")
+    mode = reference.get("mode")
+    if not isinstance(mode, str) or not mode:
+        errors.append("`reference.mode` must be `fixed_target`, `trajectory`, or `external_target`.")
+    elif mode not in REFERENCE_MODES:
+        errors.append("`reference.mode` must be `fixed_target`, `trajectory`, or `external_target`.")
     if reference.get("trajectory_type") not in {"circle", "ellipse", "helix"}:
         errors.append("`reference.trajectory_type` must be `circle`, `ellipse`, or `helix`.")
     if not isinstance(reference.get("frame_id"), str) or not reference["frame_id"]:

@@ -56,7 +56,7 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "reference_mode",
                 default_value="trajectory",
-                description="Reference mode for the evaluation reference manager.",
+                description="Reference manager mode: fixed_target or trajectory. external_target is controller-owned.",
             ),
             DeclareLaunchArgument(
                 "reference_type",

@@ -11,6 +11,7 @@ from nav_msgs.msg import Path as NavPath
 from ctr_bringup.parameter_validation import (
     load_parameter_files,
     parse_launch_bool,
+    project_config_with_overrides,
     validate_config_paths,
     validate_or_raise,
 )
@@ -26,12 +27,23 @@ from ctr_mppi_controller.lumen_factory import (
     lumen_mode_from_config,
 )
 from ctr_mppi_controller.mppi_core import MPPICore
+from ctr_mppi_controller.reference_validation import (
+    EXTERNAL_TARGET,
+    FIXED_TARGET,
+    REFERENCE_MODES,
+    TRAJECTORY,
+    VALID_REFERENCE,
+    accept_point_reference,
+    initial_reference,
+    reference_kwargs_from_active,
+    reference_state_log_line,
+    reject_reference_update,
+    validate_reference_mode,
+    validate_reference_point,
+)
 from ctr_mppi_controller.trajectory_metrics import TrajectoryMetricsAccumulator, TrajectoryMetricsConfig
 from rclpy.node import Node
 from rclpy.parameter import Parameter
-
-
-REFERENCE_MODES = ("fixed_target", "trajectory")
 
 
 class MPPIControllerNode(Node):
@@ -63,12 +75,17 @@ class MPPIControllerNode(Node):
             self.get_parameter("enable_curved_lumen").value,
             "enable_curved_lumen",
         )
-        self.config = config_with_lumen_overrides(
+        reference_config = project_config_with_overrides(
             raw_config,
+            reference_mode=self.get_parameter("reference_mode").value,
+            reference_type=self.get_parameter("reference_type").value,
+            cylinder_target_position=self.get_parameter("cylinder_target_position").value,
+        )
+        self.config = config_with_lumen_overrides(
+            reference_config,
             enable_cylindrical_lumen=enable_lumen,
             enable_curved_lumen=enable_curved_lumen,
             curved_lumen_type=str(self.get_parameter("curved_lumen_type").value or ""),
-            target=_optional_vector3_parameter(self.get_parameter("cylinder_target_position").value),
             cylinder_profile=str(self.get_parameter("cylinder_profile").value or ""),
             random_seed=_optional_seed(self.get_parameter("mppi_random_seed").value),
         )
@@ -77,36 +94,26 @@ class MPPIControllerNode(Node):
         self.model = ApproximateCTRModel(self.config)
         self.lumen_geometry = lumen_geometry_from_config(self.config)
         self.lumen_mode = lumen_mode_from_config(self.config)
-        self.target_tip = (
-            goal_position_from_config(self.config)
-            if self.lumen_geometry is not None
-            else _vector3(self.get_parameter("target_position").value, "target_position")
-        )
-        target_validation_status = "not_applicable"
-        if self.lumen_geometry is not None:
-            validation = self.lumen_geometry.validate_target(
-                self.target_tip,
-                frame_id=self.config.get("goal", {}).get("frame_id"),
-                require_safety_margin=True,
-            )
-            target_validation_status = "valid" if validation.valid else "invalid"
-            if not validation.valid:
-                raise ValueError(f"configured target is outside selected lumen geometry: {validation.reasons}")
+        self.reference_mode = reference_mode_from_config(self.config, "")
+        self.trajectory_type = reference_type_from_config(self.config, "")
+        self.frame_id = str(self.config["robot"]["frames"]["base"])
+        self.reference_frame_id = str(self.config.get("reference", {}).get("frame_id", self.frame_id))
+        self.reference_stale_timeout = float(self.config.get("reference", {}).get("stale_timeout", 0.20))
+        self.active_reference = initial_reference(self.reference_mode)
+        self.target_tip = np.zeros(3, dtype=float)
+        target_validation_status = self._initialize_active_reference()
         self.core = MPPICore(
             self.config,
             self.model,
             lumen_geometry=self.lumen_geometry,
             lumen_cost_weights=lumen_cost_weights_from_config(self.config),
         )
-        self.reference_mode = reference_mode_from_config(self.config, self.get_parameter("reference_mode").value)
-        self.trajectory_type = reference_type_from_config(self.config, self.get_parameter("reference_type").value)
         self.latest_state: CtrState | None = None
-        self.frame_id = str(self.config["robot"]["frames"]["base"])
-        self.reference_frame_id = str(self.config.get("reference", {}).get("frame_id", self.frame_id))
-        self.reference_stale_timeout = float(self.config.get("reference", {}).get("stale_timeout", 0.20))
         self.latest_reference_horizon: np.ndarray | None = None
         self.latest_reference_horizon_stamp_s: float | None = None
         self._warned_missing_horizon = False
+        self._warned_missing_reference = False
+        self._last_invalid_reference_warning_s: float | None = None
         self.publish_safe_for_sim = bool(self.get_parameter("publish_safe_command_for_simulation").value)
         self.tracking_metrics_config = TrajectoryMetricsConfig.from_project_config(self.config)
         self.trajectory_metrics = TrajectoryMetricsAccumulator(
@@ -140,6 +147,37 @@ class MPPIControllerNode(Node):
             f"advanced costs disabled; reference_mode={self.reference_mode}; trajectory_type={self.trajectory_type}."
         )
         self.get_logger().info(self._geometry_summary(target_validation_status=target_validation_status))
+        self._log_reference_state(reason=target_validation_status)
+
+    def _initialize_active_reference(self) -> str:
+        if self.reference_mode == FIXED_TARGET:
+            frame_id = str(self.config.get("goal", {}).get("frame_id", ""))
+            try:
+                point = goal_position_from_config(self.config)
+                validated = validate_reference_point(
+                    point,
+                    received_frame=frame_id,
+                    expected_frame=self.reference_frame_id,
+                    lumen_geometry=self.lumen_geometry,
+                    require_safety_margin=True,
+                    label="goal.position",
+                )
+            except ValueError as exc:
+                self.active_reference = reject_reference_update(self.active_reference, str(exc))
+                raise ValueError(f"configured fixed target is invalid: {exc}") from exc
+            self.active_reference = accept_point_reference(
+                self.active_reference,
+                source=FIXED_TARGET,
+                point=validated,
+                frame=frame_id,
+            )
+            self.target_tip = validated.copy()
+            return "fixed_target_valid"
+        if self.reference_mode == EXTERNAL_TARGET:
+            return "external_target_waiting"
+        if self.reference_mode == TRAJECTORY:
+            return "trajectory_horizon_waiting"
+        raise ValueError(f"reference_mode must be one of {REFERENCE_MODES}")
 
     def _on_state(self, msg: CtrState) -> None:
         if msg.valid:
@@ -148,13 +186,76 @@ class MPPIControllerNode(Node):
             self.get_logger().warn("Ignoring invalid /ctr/state message.")
 
     def _on_target(self, msg: PoseStamped) -> None:
+        point = [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z]
+        frame_id = msg.header.frame_id
+        if self.reference_mode == EXTERNAL_TARGET:
+            self._handle_external_target(point, frame_id)
+            return
+        if self.reference_mode == FIXED_TARGET:
+            self._handle_fixed_target_tip(point, frame_id)
+            return
+        if self.reference_mode == TRAJECTORY:
+            return
+
+    def _handle_fixed_target_tip(self, point, frame_id: str) -> None:
         try:
-            self.target_tip = _vector3(
-                [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z],
-                "/ctr/reference/tip",
+            validated = validate_reference_point(
+                point,
+                received_frame=frame_id,
+                expected_frame=self.reference_frame_id,
+                lumen_geometry=self.lumen_geometry,
+                require_safety_margin=True,
+                label="/ctr/reference/tip",
             )
         except ValueError as exc:
-            self.get_logger().warn(f"Ignoring malformed /ctr/reference/tip message: {exc}")
+            self._warn_invalid_reference(f"Ignoring invalid fixed-target /ctr/reference/tip update: {exc}")
+            return
+        if (
+            self.active_reference.has_valid_target
+            and self.active_reference.target_frame == frame_id
+            and np.array_equal(self.active_reference.target, validated)
+        ):
+            return
+        self._warn_invalid_reference(
+            "Ignoring /ctr/reference/tip update in fixed_target mode; configured fixed target is authoritative."
+        )
+
+    def _handle_external_target(self, point, frame_id: str) -> None:
+        previous = self.active_reference
+        try:
+            validated = validate_reference_point(
+                point,
+                received_frame=frame_id,
+                expected_frame=self.reference_frame_id,
+                lumen_geometry=self.lumen_geometry,
+                require_safety_margin=True,
+                label="/ctr/reference/tip",
+            )
+        except ValueError as exc:
+            self.active_reference = reject_reference_update(previous, str(exc))
+            reason = "invalid_external_target_retained_previous" if previous.has_valid_target else "invalid_external_target"
+            self._warn_invalid_reference(f"Rejected external target: {exc}")
+            self._log_reference_state(reason=reason)
+            return
+
+        self.active_reference = accept_point_reference(
+            previous,
+            source=EXTERNAL_TARGET,
+            point=validated,
+            frame=frame_id,
+        )
+        self.target_tip = validated.copy()
+        self._warned_missing_horizon = False
+        self._warned_missing_reference = False
+        reason = "external_target_accepted"
+        if previous.has_valid_target:
+            reason = (
+                "external_target_duplicate"
+                if self.active_reference.revision == previous.revision
+                else "external_target_replaced"
+            )
+        self.get_logger().info(f"Accepted external target revision={self.active_reference.revision}.")
+        self._log_reference_state(reason=reason)
 
     def _on_reference_horizon(self, msg: NavPath) -> None:
         if self.reference_mode != "trajectory":
@@ -184,14 +285,7 @@ class MPPIControllerNode(Node):
 
         try:
             current_time_s = ros_time_seconds(self.get_clock().now())
-            reference_kwargs = solve_reference_kwargs(
-                reference_mode=self.reference_mode,
-                target_tip=self.target_tip,
-                target_tip_sequence=self.latest_reference_horizon,
-                horizon_stamp_s=self.latest_reference_horizon_stamp_s,
-                current_time_s=current_time_s,
-                stale_timeout=self.reference_stale_timeout,
-            )
+            reference_kwargs = self._timer_reference_kwargs(current_time_s=current_time_s)
         except ValueError as exc:
             if not self._warned_missing_horizon:
                 self.get_logger().warn(f"MPPI reference unavailable: {exc}")
@@ -278,13 +372,42 @@ class MPPIControllerNode(Node):
     def _geometry_summary(self, *, target_validation_status: str) -> str:
         return f"{lumen_geometry_log_line(self.config, role='controller')} target_validation={target_validation_status}"
 
+    def _timer_reference_kwargs(self, *, current_time_s: float) -> dict[str, np.ndarray]:
+        if self.reference_mode in (FIXED_TARGET, EXTERNAL_TARGET):
+            if self.active_reference.state != VALID_REFERENCE:
+                raise ValueError(f"{self.reference_mode} mode is waiting for a valid active reference")
+            return reference_kwargs_from_active(self.active_reference)
+        return solve_reference_kwargs(
+            reference_mode=self.reference_mode,
+            target_tip=self.target_tip,
+            target_tip_sequence=self.latest_reference_horizon,
+            horizon_stamp_s=self.latest_reference_horizon_stamp_s,
+            current_time_s=current_time_s,
+            stale_timeout=self.reference_stale_timeout,
+        )
+
+    def _log_reference_state(self, *, reason: str) -> None:
+        self.get_logger().info(reference_state_log_line(self.active_reference, reason=reason))
+
+    def _warn_invalid_reference(self, message: str) -> None:
+        now_s: float | None = None
+        try:
+            now_s = ros_time_seconds(self.get_clock().now())
+        except Exception:
+            now_s = None
+        if (
+            now_s is None
+            or self._last_invalid_reference_warning_s is None
+            or now_s - self._last_invalid_reference_warning_s >= 1.0
+        ):
+            self.get_logger().warn(message)
+            self._last_invalid_reference_warning_s = now_s
+
 
 def reference_mode_from_config(config: dict, override) -> str:
     configured = config.get("reference", {}).get("mode", "fixed_target")
     mode = configured if override is None or override == "" else override
-    if mode not in REFERENCE_MODES:
-        raise ValueError(f"reference_mode must be one of {REFERENCE_MODES}")
-    return str(mode)
+    return validate_reference_mode(mode, "reference_mode")
 
 
 def reference_type_from_config(config: dict, override) -> str:
@@ -349,7 +472,7 @@ def solve_reference_kwargs(
     current_time_s: float,
     stale_timeout: float,
 ) -> dict[str, np.ndarray]:
-    if reference_mode == "fixed_target":
+    if reference_mode in ("fixed_target", "external_target"):
         return {"target_tip": _vector3(target_tip, "target_tip")}
     if reference_mode != "trajectory":
         raise ValueError(f"reference_mode must be one of {REFERENCE_MODES}")

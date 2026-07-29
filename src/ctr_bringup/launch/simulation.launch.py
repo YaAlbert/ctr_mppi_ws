@@ -1,9 +1,9 @@
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
-from ctr_bringup.parameter_validation import validate_config_paths
+from ctr_bringup.parameter_validation import parse_launch_bool, validate_config_paths
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.substitutions import PythonExpression
 from launch.substitutions import LaunchConfiguration
@@ -21,11 +21,25 @@ CONFIG_NAMES = (
     "tactile_params.yaml",
     "hardware_params.yaml",
 )
+REFERENCE_MODES = ("fixed_target", "trajectory", "external_target")
 
 
 def _config_paths():
     config_dir = Path(get_package_share_directory("ctr_bringup")) / "config"
     return validate_config_paths([str(config_dir / name) for name in CONFIG_NAMES])
+
+
+def _validate_reference_launch_arguments(context, *args, **kwargs):
+    mode = LaunchConfiguration("reference_mode").perform(context)
+    if mode not in REFERENCE_MODES:
+        raise RuntimeError(f"reference_mode must be one of {REFERENCE_MODES}")
+    start_manager = parse_launch_bool(
+        LaunchConfiguration("start_reference_manager").perform(context),
+        "start_reference_manager",
+    )
+    if mode == "external_target" and start_manager:
+        raise RuntimeError("reference_mode=external_target cannot be combined with start_reference_manager=true")
+    return []
 
 
 def generate_launch_description():
@@ -58,6 +72,9 @@ def generate_launch_description():
         PythonExpression(
             [
                 "'",
+                reference_mode,
+                "' != 'external_target' and (",
+                "'",
                 start_reference_manager,
                 "'.lower() == 'true' or '",
                 reference_mode,
@@ -67,7 +84,7 @@ def generate_launch_description():
                 enable_cylindrical_lumen,
                 "'.lower() == 'true' or '",
                 enable_curved_lumen,
-                "'.lower() == 'true')",
+                "'.lower() == 'true'))",
             ]
         )
     )
@@ -97,7 +114,7 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "reference_mode",
                 default_value="fixed_target",
-                description="Reference operating mode: fixed_target or trajectory.",
+                description="Reference operating mode: fixed_target, trajectory, or external_target.",
             ),
             DeclareLaunchArgument(
                 "reference_type",
@@ -179,6 +196,7 @@ def generate_launch_description():
                 default_value="",
                 description="Optional evaluation run role metadata.",
             ),
+            OpaqueFunction(function=_validate_reference_launch_arguments),
             Node(
                 package="ctr_bringup",
                 executable="parameter_validator_node",
@@ -189,6 +207,14 @@ def generate_launch_description():
                         "config_paths": _config_paths(),
                         "runtime_mode": runtime_mode,
                         "enable_hardware_io": False,
+                        "reference_mode": reference_mode,
+                        "reference_type": reference_type,
+                        "enable_cylindrical_lumen": enable_cylindrical_lumen,
+                        "enable_curved_lumen": enable_curved_lumen,
+                        "curved_lumen_type": curved_lumen_type,
+                        "cylinder_profile": cylinder_profile,
+                        "cylinder_target_position": cylinder_target_position,
+                        "mppi_random_seed": mppi_random_seed,
                     }
                 ],
             ),

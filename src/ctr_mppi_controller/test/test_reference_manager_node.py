@@ -11,7 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PACKAGE_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "src" / "ctr_bringup"))
 
-from ctr_bringup.parameter_validation import load_parameter_files, validate_or_raise  # noqa: E402
+from ctr_bringup.parameter_validation import load_parameter_files, project_config_with_overrides, validate_or_raise  # noqa: E402
 from ctr_mppi_controller.cylindrical_lumen import config_with_cylinder_overrides, goal_position_from_config  # noqa: E402
 from ctr_mppi_controller.lumen_factory import config_with_lumen_overrides, lumen_mode_from_config  # noqa: E402
 from ctr_mppi_controller.nodes.reference_manager_node import (  # noqa: E402
@@ -22,6 +22,7 @@ from ctr_mppi_controller.nodes.reference_manager_node import (  # noqa: E402
     reference_settings_from_config,
     trajectory_start_time_from_policy,
 )
+from ctr_mppi_controller.reference_validation import EXTERNAL_TARGET  # noqa: E402
 
 
 CONFIG_FILES = [
@@ -59,6 +60,43 @@ class ReferenceManagerNodeHelpersTest(unittest.TestCase):
         self.assertEqual("ellipse", trajectory.trajectory_type)
         self.assertEqual("base_link", trajectory.frame_id)
         self.assertTrue(np.all(np.isfinite(trajectory.points)))
+
+    def test_reference_settings_accept_external_target_mode(self):
+        config = make_config()
+        settings = reference_settings_from_config(config, mode_override=EXTERNAL_TARGET, type_override="circle")
+        self.assertEqual(EXTERNAL_TARGET, settings.mode)
+        self.assertEqual("base_link", settings.frame_id)
+
+    def test_reference_manager_source_rejects_external_target_publishing(self):
+        source = (PACKAGE_ROOT / "ctr_mppi_controller" / "nodes" / "reference_manager_node.py").read_text(encoding="utf-8")
+        self.assertIn("external_target mode", source)
+        self.assertIn("must not publish", source)
+
+    def test_reference_manager_applies_reference_override_before_config_validation(self):
+        source = (PACKAGE_ROOT / "ctr_mppi_controller" / "nodes" / "reference_manager_node.py").read_text(encoding="utf-8")
+        self.assertLess(
+            source.index("reference_config = project_config_with_overrides("),
+            source.index("validate_or_raise(self.config)"),
+        )
+        self.assertLess(
+            source.index("validate_or_raise(self.config)"),
+            source.index("self.settings = reference_settings_from_config("),
+        )
+
+    def test_reference_manager_reference_override_ignores_invalid_fixed_placeholder(self):
+        config = make_config()
+        config["reference"]["mode"] = "fixed_target"
+        config["goal"]["position"] = [float("nan"), 0.0]
+
+        external_config = project_config_with_overrides(config, reference_mode=EXTERNAL_TARGET)
+        validate_or_raise(external_config)
+        external_settings = reference_settings_from_config(external_config)
+        self.assertEqual(EXTERNAL_TARGET, external_settings.mode)
+
+        trajectory_config = project_config_with_overrides(config, reference_mode="trajectory")
+        validate_or_raise(trajectory_config)
+        trajectory_settings = reference_settings_from_config(trajectory_config)
+        self.assertEqual("trajectory", trajectory_settings.mode)
 
     def test_cylinder_fixed_target_uses_goal_override(self):
         config = config_with_cylinder_overrides(

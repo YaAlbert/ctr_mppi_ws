@@ -55,7 +55,7 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "reference_mode",
                 default_value="trajectory",
-                description="Reference mode for the evaluation MPPI controller.",
+                description="Reference mode for the evaluation MPPI controller: fixed_target, trajectory, or external_target.",
             ),
             DeclareLaunchArgument(
                 "reference_type",

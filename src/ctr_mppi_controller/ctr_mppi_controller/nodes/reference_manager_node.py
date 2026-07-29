@@ -13,12 +13,14 @@ from nav_msgs.msg import Path as NavPath
 from ctr_bringup.parameter_validation import (
     load_parameter_files,
     parse_launch_bool,
+    project_config_with_overrides,
     validate_config_paths,
     validate_or_raise,
 )
 from ctr_bringup.placeholder_node import run_node_until_shutdown
 from ctr_mppi_controller.cylindrical_lumen import goal_position_from_config
 from ctr_mppi_controller.lumen_factory import config_with_lumen_overrides, lumen_mode_from_config
+from ctr_mppi_controller.reference_validation import EXTERNAL_TARGET, FIXED_TARGET, REFERENCE_MODES, TRAJECTORY
 from ctr_mppi_controller.reference_trajectory import (
     ReferenceTrajectory,
     generate_circle,
@@ -29,7 +31,6 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 
 
-REFERENCE_MODES = ("fixed_target", "trajectory")
 TRAJECTORY_TYPES = ("circle", "ellipse", "helix")
 COMPLETION_BEHAVIORS = ("loop", "hold_final")
 TRAJECTORY_START_POLICIES = ("node_start", "scheduled_time")
@@ -77,12 +78,17 @@ class ReferenceManagerNode(Node):
             self.get_parameter("enable_curved_lumen").value,
             "enable_curved_lumen",
         )
-        self.config = config_with_lumen_overrides(
+        reference_config = project_config_with_overrides(
             raw_config,
+            reference_mode=self.get_parameter("reference_mode").value,
+            reference_type=self.get_parameter("reference_type").value,
+            cylinder_target_position=self.get_parameter("cylinder_target_position").value,
+        )
+        self.config = config_with_lumen_overrides(
+            reference_config,
             enable_cylindrical_lumen=enable_lumen,
             enable_curved_lumen=enable_curved_lumen,
             curved_lumen_type=str(self.get_parameter("curved_lumen_type").value or ""),
-            target=_optional_vector3_parameter(self.get_parameter("cylinder_target_position").value),
             cylinder_profile=str(self.get_parameter("cylinder_profile").value or ""),
             random_seed=_optional_seed(self.get_parameter("mppi_random_seed").value),
         )
@@ -91,14 +97,16 @@ class ReferenceManagerNode(Node):
 
         self.settings = reference_settings_from_config(
             self.config,
-            mode_override=self.get_parameter("reference_mode").value,
-            type_override=self.get_parameter("reference_type").value,
+            mode_override="",
+            type_override="",
         )
-        if self.lumen_mode != "none" and self.settings.mode == "fixed_target":
+        if self.settings.mode == EXTERNAL_TARGET:
+            raise ValueError("reference_manager_node must not publish references in external_target mode")
+        if self.settings.mode == FIXED_TARGET:
             self.settings = replace(self.settings, fixed_target=goal_position_from_config(self.config))
         self.trajectory = (
             build_reference_trajectory(self.config, settings=self.settings)
-            if self.settings.mode == "trajectory"
+            if self.settings.mode == TRAJECTORY
             else None
         )
 
@@ -150,7 +158,7 @@ class ReferenceManagerNode(Node):
         self.last_time_s = now_s
         stamp = now.to_msg()
 
-        if self.settings.mode == "fixed_target":
+        if self.settings.mode == FIXED_TARGET:
             self._publish_fixed_target(stamp)
             return
 
