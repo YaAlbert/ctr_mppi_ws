@@ -91,6 +91,96 @@ class ParameterValidationTest(unittest.TestCase):
         validate_or_raise(config)
         self.assertEqual([], validate_project_config(config))
 
+    def test_simulation_visualization_defaults_validate(self):
+        config = load_parameter_files(CONFIG_FILES)
+        visualization = config["simulation"]["visualization"]
+        self.assertIs(True, visualization["publish_lumen_markers"])
+        self.assertEqual(1, visualization["centerline_stride"])
+        self.assertEqual(4, visualization["ring_stride"])
+        self.assertEqual(20, visualization["ring_segments"])
+        self.assertEqual(5.0, visualization["marker_publish_rate"])
+        self.assertEqual([], [error for error in validate_project_config(config) if "simulation.visualization" in error])
+
+    def test_simulation_visualization_publish_lumen_markers_requires_bool(self):
+        for value in ("true", 1, 0, None):
+            with self.subTest(value=value):
+                config = load_parameter_files(CONFIG_FILES)
+                config["simulation"]["visualization"]["publish_lumen_markers"] = value
+                errors = validate_project_config(config)
+                self.assertTrue(
+                    any("simulation.visualization.publish_lumen_markers" in error for error in errors),
+                    errors,
+                )
+
+    def test_simulation_visualization_stride_values_require_exact_positive_ints(self):
+        cases = (
+            ("centerline_stride", 1, (0, -1, True, 1.0, "1")),
+            ("ring_stride", 1, (0, -1, True, 1.0, "1")),
+        )
+        for key, valid_value, invalid_values in cases:
+            config = load_parameter_files(CONFIG_FILES)
+            config["simulation"]["visualization"][key] = valid_value
+            self.assertEqual(
+                [],
+                [error for error in validate_project_config(config) if f"simulation.visualization.{key}" in error],
+            )
+            for value in invalid_values:
+                with self.subTest(key=key, value=value):
+                    config = load_parameter_files(CONFIG_FILES)
+                    config["simulation"]["visualization"][key] = value
+                    errors = validate_project_config(config)
+                    self.assertTrue(any(f"simulation.visualization.{key}" in error for error in errors), errors)
+
+    def test_simulation_visualization_ring_segments_bounds(self):
+        for value in (8, 20, 128):
+            with self.subTest(valid=value):
+                config = load_parameter_files(CONFIG_FILES)
+                config["simulation"]["visualization"]["ring_segments"] = value
+                self.assertEqual(
+                    [],
+                    [
+                        error
+                        for error in validate_project_config(config)
+                        if "simulation.visualization.ring_segments" in error
+                    ],
+                )
+        for value in (7, 129, True, 20.0, "20"):
+            with self.subTest(invalid=value):
+                config = load_parameter_files(CONFIG_FILES)
+                config["simulation"]["visualization"]["ring_segments"] = value
+                errors = validate_project_config(config)
+                self.assertTrue(any("simulation.visualization.ring_segments" in error for error in errors), errors)
+
+    def test_simulation_visualization_marker_publish_rate_must_be_positive_and_finite(self):
+        for value in (0.1, 5.0, 100):
+            with self.subTest(valid=value):
+                config = load_parameter_files(CONFIG_FILES)
+                config["simulation"]["visualization"]["marker_publish_rate"] = value
+                self.assertEqual(
+                    [],
+                    [
+                        error
+                        for error in validate_project_config(config)
+                        if "simulation.visualization.marker_publish_rate" in error
+                    ],
+                )
+        for value in (0.0, -1.0, float("nan"), float("inf"), True):
+            with self.subTest(invalid=value):
+                config = load_parameter_files(CONFIG_FILES)
+                config["simulation"]["visualization"]["marker_publish_rate"] = value
+                errors = validate_project_config(config)
+                self.assertTrue(
+                    any("simulation.visualization.marker_publish_rate" in error for error in errors),
+                    errors,
+                )
+
+    def test_visualization_disabled_still_validates_supplied_sampling_values(self):
+        config = load_parameter_files(CONFIG_FILES)
+        config["simulation"]["visualization"]["publish_lumen_markers"] = False
+        config["simulation"]["visualization"]["ring_segments"] = 7
+        errors = validate_project_config(config)
+        self.assertTrue(any("simulation.visualization.ring_segments" in error for error in errors), errors)
+
     def test_config_paths_reject_previous_concatenated_scalar_failure(self):
         concatenated = f"{CONFIG_FILES[0]}{CONFIG_FILES[1]}"
         with self.assertRaises(ParameterValidationError) as context:
@@ -527,10 +617,16 @@ class ParameterValidationTest(unittest.TestCase):
         validator_index = source.index('executable="parameter_validator_node"')
         simulator_index = source.index('executable="simulator_node"')
         validator_block = source[validator_index:simulator_index]
-        self.assertIn('"reference_mode": reference_mode', validator_block)
-        self.assertIn('"reference_type": reference_type', validator_block)
-        self.assertIn('"enable_cylindrical_lumen": enable_cylindrical_lumen', validator_block)
-        self.assertIn('"enable_curved_lumen": enable_curved_lumen', validator_block)
+        self.assertIn('"reference_mode": ParameterValue(reference_mode, value_type=str)', validator_block)
+        self.assertIn('"reference_type": ParameterValue(reference_type, value_type=str)', validator_block)
+        self.assertIn(
+            '"enable_cylindrical_lumen": ParameterValue(enable_cylindrical_lumen, value_type=str)',
+            validator_block,
+        )
+        self.assertIn(
+            '"enable_curved_lumen": ParameterValue(enable_curved_lumen, value_type=str)',
+            validator_block,
+        )
         self.assertIn('"cylinder_target_position": cylinder_target_position', validator_block)
 
     def test_reference_zero_helix_height_is_rejected(self):

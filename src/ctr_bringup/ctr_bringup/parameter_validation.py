@@ -908,6 +908,42 @@ def _validate_simulation(simulation: Any) -> list[str]:
     comms = simulation.get("communication", {})
     for key in ("command_dropout_probability", "state_dropout_probability"):
         errors.extend(_require_probability(comms, key, "simulation.communication"))
+    errors.extend(_validate_simulation_visualization(simulation.get("visualization", {})))
+    return errors
+
+
+def _validate_simulation_visualization(visualization: Any) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(visualization, dict):
+        return ["`simulation.visualization` must be a map."]
+    if not isinstance(visualization.get("publish_lumen_markers"), bool):
+        errors.append("`simulation.visualization.publish_lumen_markers` must be a boolean.")
+    errors.extend(
+        _require_exact_int(
+            visualization,
+            "centerline_stride",
+            "simulation.visualization",
+            minimum=1,
+        )
+    )
+    errors.extend(
+        _require_exact_int(
+            visualization,
+            "ring_stride",
+            "simulation.visualization",
+            minimum=1,
+        )
+    )
+    errors.extend(
+        _require_exact_int(
+            visualization,
+            "ring_segments",
+            "simulation.visualization",
+            minimum=8,
+            maximum=128,
+        )
+    )
+    errors.extend(_require_positive_number(visualization, "marker_publish_rate", "simulation.visualization"))
     return errors
 
 
@@ -974,6 +1010,27 @@ def _require_probability(container: Any, key: str, prefix: str) -> list[str]:
     value = _as_finite_number(container[key])
     if value is None or value < 0 or value > 1:
         return [f"`{prefix}.{key}` must be in [0, 1]."]
+    return []
+
+
+def _require_exact_int(
+    container: Any,
+    key: str,
+    prefix: str,
+    *,
+    minimum: int,
+    maximum: int | None = None,
+) -> list[str]:
+    if not isinstance(container, dict) or key not in container:
+        return [f"Missing `{prefix}.{key}`."]
+    value = container[key]
+    label = f"`{prefix}.{key}`"
+    if isinstance(value, bool) or not isinstance(value, int):
+        return [f"{label} must be an integer."]
+    if value < minimum:
+        return [f"{label} must be >= {minimum}."]
+    if maximum is not None and value > maximum:
+        return [f"{label} must be <= {maximum}."]
     return []
 
 

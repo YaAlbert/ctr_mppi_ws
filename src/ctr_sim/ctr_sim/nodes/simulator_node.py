@@ -23,12 +23,22 @@ from ctr_bringup.parameter_validation import (
 from ctr_bringup.placeholder_node import run_node_until_shutdown
 from ctr_interfaces.msg import CtrBackbone, CtrJointCommand, CtrJointState, CtrState
 from ctr_model.approximate_model import ApproximateCTRModel
+from ctr_mppi_controller.curved_lumen import CurvedLumen
 from ctr_mppi_controller.cylindrical_lumen import CylindricalLumen, goal_position_from_config
 from ctr_mppi_controller.lumen_factory import (
     config_with_lumen_overrides,
+    lumen_geometry_fingerprint,
     lumen_geometry_log_line,
     lumen_geometry_from_config,
     lumen_mode_from_config,
+)
+from ctr_sim.lumen_markers import (
+    LumenMarkerConfig,
+    build_curved_static_lumen_markers,
+    build_static_lumen_delete_markers,
+    marker_keys,
+    markers_with_stamp,
+    static_lumen_cache_key,
 )
 from ctr_sim.simulation_core import CTRSimulationCore
 from rclpy.node import Node
@@ -76,6 +86,7 @@ class CTRSimulatorNode(Node):
         simulation = self.config["simulation"]
         self.update_frequency = float(simulation["update_frequency"])
         self.dt = 1.0 / self.update_frequency
+        self.lumen_marker_config = LumenMarkerConfig.from_mapping(simulation.get("visualization", {}))
         self.command_timeout = float(self.get_parameter("command_timeout").value)
         self.frame_id = self.config["robot"]["frames"]["base"]
         self.world_frame_id = self.config["robot"]["frames"]["world"]
@@ -87,6 +98,13 @@ class CTRSimulatorNode(Node):
         )
         self.lumen_geometry = lumen_geometry_from_config(self.config)
         self.lumen = self.lumen_geometry
+        self._static_lumen_cache_key = None
+        self._static_lumen_markers: list[Marker] = []
+        self._static_lumen_marker_keys: tuple[tuple[str, int], ...] = ()
+        self._static_lumen_marker_frame_id = self.frame_id
+        self._last_static_lumen_publish_time_s: float | None = None
+        self._static_lumen_build_count = 0
+        self._static_lumen_cache_hit_logged = False
 
         self.latest_command = np.zeros(6, dtype=float)
         self.command_valid = False
@@ -120,8 +138,6 @@ class CTRSimulatorNode(Node):
             "CTR simulator started: /ctr/safe_command -> /ctr/joint_state, /ctr/backbone, /ctr/tip, /ctr/state."
         )
         self.get_logger().info(lumen_geometry_log_line(self.config, role="simulator"))
-        if self.lumen_mode == "curved":
-            self.get_logger().info("Curved lumen boundary markers are deferred to Milestone 6B-C3.")
 
     def _on_safe_command(self, msg: CtrJointCommand) -> None:
         try:
@@ -297,9 +313,151 @@ class CTRSimulatorNode(Node):
         target.pose.orientation.w = 1.0
 
         markers = [backbone, tip, target]
+        markers.extend(self._static_lumen_markers_for_publish(stamp))
         if self.lumen_mode == "cylindrical" and isinstance(self.lumen, CylindricalLumen):
             markers.extend(self._lumen_markers(stamp, backbone_array))
         return MarkerArray(markers=markers)
+
+    def _static_lumen_markers_for_publish(self, stamp) -> list[Marker]:
+        config = getattr(self, "lumen_marker_config", LumenMarkerConfig())
+        if self.lumen_mode != "curved" or not isinstance(self.lumen, CurvedLumen):
+            return self._clear_static_lumen_markers(stamp, reason=f"mode_{self.lumen_mode}")
+        if not config.publish_lumen_markers:
+            return self._clear_static_lumen_markers(stamp, reason="visualization_disabled")
+
+        fingerprint = lumen_geometry_fingerprint(getattr(self, "config", self.lumen))
+        cache_key = static_lumen_cache_key(fingerprint, config)
+        if cache_key != self._static_lumen_cache_key:
+            deletes = self._clear_static_lumen_markers(stamp, reason="cache_rebuild")
+            try:
+                markers = build_curved_static_lumen_markers(
+                    self.lumen,
+                    fingerprint,
+                    self.lumen.frame_id,
+                    config,
+                    stamp,
+                )
+            except ValueError as exc:
+                self._static_lumen_cache_key = None
+                self._static_lumen_markers = []
+                self._static_lumen_marker_keys = ()
+                self._static_lumen_marker_frame_id = self.lumen.frame_id
+                self._log_lumen_markers(
+                    mode="curved",
+                    frame=self.lumen.frame_id,
+                    fingerprint=fingerprint,
+                    centerline_points=int(self.lumen.centerline_points.shape[0]),
+                    rings=0,
+                    segments=config.ring_segments,
+                    cached=False,
+                    reason=f"generation_failed:{exc}",
+                )
+                return deletes
+            self._static_lumen_cache_key = cache_key
+            self._static_lumen_markers = markers
+            self._static_lumen_marker_keys = marker_keys(markers)
+            self._static_lumen_marker_frame_id = self.lumen.frame_id
+            self._static_lumen_build_count += 1
+            self._static_lumen_cache_hit_logged = False
+            self._last_static_lumen_publish_time_s = _stamp_seconds(stamp)
+            self._log_lumen_markers(
+                mode="curved",
+                frame=self.lumen.frame_id,
+                fingerprint=fingerprint,
+                centerline_points=int(self.lumen.centerline_points.shape[0]),
+                rings=self._static_lumen_ring_count(config),
+                segments=config.ring_segments,
+                cached=False,
+                reason="built",
+            )
+            return deletes + markers_with_stamp(markers, stamp)
+
+        if not self._static_lumen_publish_due(stamp, config):
+            return []
+        if not self._static_lumen_cache_hit_logged:
+            self._log_lumen_markers(
+                mode="curved",
+                frame=self.lumen.frame_id,
+                fingerprint=fingerprint,
+                centerline_points=int(self.lumen.centerline_points.shape[0]),
+                rings=self._static_lumen_ring_count(config),
+                segments=config.ring_segments,
+                cached=True,
+                reason="cache_hit",
+            )
+            self._static_lumen_cache_hit_logged = True
+        return markers_with_stamp(self._static_lumen_markers, stamp)
+
+    def _static_lumen_publish_due(self, stamp, config: LumenMarkerConfig) -> bool:
+        stamp_s = _stamp_seconds(stamp)
+        last_publish = self._last_static_lumen_publish_time_s
+        period = 1.0 / config.marker_publish_rate
+        if last_publish is None or stamp_s < last_publish or stamp_s - last_publish >= period - 1.0e-12:
+            self._last_static_lumen_publish_time_s = stamp_s
+            return True
+        return False
+
+    def _clear_static_lumen_markers(self, stamp, *, reason: str) -> list[Marker]:
+        keys = tuple(getattr(self, "_static_lumen_marker_keys", ()))
+        if not keys:
+            self._static_lumen_cache_key = None
+            self._static_lumen_markers = []
+            self._static_lumen_marker_keys = ()
+            self._last_static_lumen_publish_time_s = None
+            return []
+        frame = getattr(self, "_static_lumen_marker_frame_id", self.frame_id)
+        deletes = build_static_lumen_delete_markers(keys, frame, stamp)
+        self._log_lumen_markers(
+            mode=self.lumen_mode,
+            frame=frame,
+            fingerprint="none",
+            centerline_points=0,
+            rings=0,
+            segments=getattr(getattr(self, "lumen_marker_config", None), "ring_segments", 0),
+            cached=False,
+            reason=reason,
+        )
+        self._static_lumen_cache_key = None
+        self._static_lumen_markers = []
+        self._static_lumen_marker_keys = ()
+        self._last_static_lumen_publish_time_s = None
+        self._static_lumen_cache_hit_logged = False
+        return deletes
+
+    def _static_lumen_ring_count(self, config: LumenMarkerConfig) -> int:
+        if not isinstance(self.lumen, CurvedLumen):
+            return 0
+        point_count = int(self.lumen.centerline_points.shape[0])
+        return len(tuple(dict.fromkeys(list(range(0, point_count, config.ring_stride)) + [point_count - 1])))
+
+    def _log_lumen_markers(
+        self,
+        *,
+        mode: str,
+        frame: str,
+        fingerprint: str,
+        centerline_points: int,
+        rings: int,
+        segments: int,
+        cached: bool,
+        reason: str,
+    ) -> None:
+        try:
+            logger = self.get_logger()
+        except Exception:
+            return
+        logger.info(
+            "LUMEN_MARKERS "
+            f"mode={mode} "
+            f"frame={frame} "
+            f"fingerprint={fingerprint} "
+            f"centerline_points={centerline_points} "
+            f"rings={rings} "
+            f"segments={segments} "
+            f"cached={str(cached).lower()} "
+            f"build_count={self._static_lumen_build_count} "
+            f"reason={reason}"
+        )
 
     def _lumen_markers(self, stamp, backbone_array: np.ndarray) -> list[Marker]:
         assert self.lumen is not None
@@ -395,6 +553,10 @@ def _optional_vector3_parameter(values) -> list[float] | None:
     if isinstance(values, (list, tuple)) and len(values) == 0:
         return None
     return [float(value) for value in _vector3(values, "cylinder_target_position")]
+
+
+def _stamp_seconds(stamp) -> float:
+    return float(getattr(stamp, "sec", 0)) + 1.0e-9 * float(getattr(stamp, "nanosec", 0))
 
 
 def _quaternion_from_z_axis(axis: np.ndarray) -> tuple[float, float, float, float]:
