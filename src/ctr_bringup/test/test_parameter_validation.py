@@ -95,6 +95,7 @@ class ParameterValidationTest(unittest.TestCase):
         config = load_parameter_files(CONFIG_FILES)
         visualization = config["simulation"]["visualization"]
         self.assertIs(True, visualization["publish_lumen_markers"])
+        self.assertIs(True, visualization["publish_lumen_diagnostics"])
         self.assertEqual(1, visualization["centerline_stride"])
         self.assertEqual(4, visualization["ring_stride"])
         self.assertEqual(20, visualization["ring_segments"])
@@ -109,6 +110,29 @@ class ParameterValidationTest(unittest.TestCase):
                 errors = validate_project_config(config)
                 self.assertTrue(
                     any("simulation.visualization.publish_lumen_markers" in error for error in errors),
+                    errors,
+                )
+
+    def test_simulation_visualization_publish_lumen_diagnostics_requires_bool(self):
+        for value in (True, False):
+            with self.subTest(valid=value):
+                config = load_parameter_files(CONFIG_FILES)
+                config["simulation"]["visualization"]["publish_lumen_diagnostics"] = value
+                self.assertEqual(
+                    [],
+                    [
+                        error
+                        for error in validate_project_config(config)
+                        if "simulation.visualization.publish_lumen_diagnostics" in error
+                    ],
+                )
+        for value in ("true", "false", 1, 0, 1.0, None):
+            with self.subTest(invalid=value):
+                config = load_parameter_files(CONFIG_FILES)
+                config["simulation"]["visualization"]["publish_lumen_diagnostics"] = value
+                errors = validate_project_config(config)
+                self.assertTrue(
+                    any("simulation.visualization.publish_lumen_diagnostics" in error for error in errors),
                     errors,
                 )
 

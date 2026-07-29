@@ -14,6 +14,13 @@ from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker
 
 from ctr_mppi_controller.curved_lumen import CurvedLumen
+from ctr_sim.lumen_diagnostics import (
+    LumenRuntimeDiagnostic,
+    STATUS_COLLISION,
+    STATUS_MARGIN,
+    STATUS_SAFE,
+    STATUS_UNAVAILABLE,
+)
 
 
 MIN_RING_SEGMENTS = 8
@@ -34,10 +41,22 @@ CURVED_STATIC_LUMEN_MARKER_KEYS = (
     LUMEN_OUTLET_KEY,
 )
 
+LUMEN_CLOSEST_LINE_KEY = ("lumen_closest_pair", 0)
+LUMEN_BACKBONE_WITNESS_KEY = ("lumen_closest_pair", 1)
+LUMEN_BOUNDARY_WITNESS_KEY = ("lumen_closest_pair", 2)
+LUMEN_STATUS_KEY = ("lumen_status", 0)
+DYNAMIC_LUMEN_MARKER_KEYS = (
+    LUMEN_CLOSEST_LINE_KEY,
+    LUMEN_BACKBONE_WITNESS_KEY,
+    LUMEN_BOUNDARY_WITNESS_KEY,
+    LUMEN_STATUS_KEY,
+)
+
 
 @dataclass(frozen=True)
 class LumenMarkerConfig:
     publish_lumen_markers: bool = True
+    publish_lumen_diagnostics: bool = True
     centerline_stride: int = 1
     ring_stride: int = 4
     ring_segments: int = 20
@@ -53,6 +72,10 @@ class LumenMarkerConfig:
             publish_lumen_markers=_bool_value(
                 values.get("publish_lumen_markers", cls.publish_lumen_markers),
                 "simulation.visualization.publish_lumen_markers",
+            ),
+            publish_lumen_diagnostics=_bool_value(
+                values.get("publish_lumen_diagnostics", cls.publish_lumen_diagnostics),
+                "simulation.visualization.publish_lumen_diagnostics",
             ),
             centerline_stride=_int_value(
                 values.get("centerline_stride", cls.centerline_stride),
@@ -264,6 +287,75 @@ def build_static_lumen_delete_markers(
     return markers
 
 
+def build_dynamic_lumen_diagnostic_markers(
+    diagnostic: LumenRuntimeDiagnostic,
+    stamp: Any,
+) -> list[Marker]:
+    """Build dynamic C4 markers from one validated runtime diagnostic."""
+
+    if not isinstance(diagnostic, LumenRuntimeDiagnostic):
+        raise ValueError("diagnostic must be a LumenRuntimeDiagnostic")
+    if not diagnostic.valid or diagnostic.status == STATUS_UNAVAILABLE:
+        return []
+    color = _diagnostic_color(diagnostic.status)
+    markers: list[Marker] = []
+    if diagnostic.witness_available:
+        markers.append(
+            _line_list_marker(
+                ns=LUMEN_CLOSEST_LINE_KEY[0],
+                marker_id=LUMEN_CLOSEST_LINE_KEY[1],
+                frame_id=diagnostic.frame_id,
+                stamp=stamp,
+                points=np.asarray([diagnostic.ctr_surface_point, diagnostic.lumen_boundary_point], dtype=np.float64),
+                scale=0.0020,
+                color=color,
+            )
+        )
+        markers.append(
+            _sphere_marker(
+                ns=LUMEN_BACKBONE_WITNESS_KEY[0],
+                marker_id=LUMEN_BACKBONE_WITNESS_KEY[1],
+                frame_id=diagnostic.frame_id,
+                stamp=stamp,
+                position=diagnostic.ctr_surface_point,
+                diameter=0.0060,
+                color=color,
+            )
+        )
+        markers.append(
+            _sphere_marker(
+                ns=LUMEN_BOUNDARY_WITNESS_KEY[0],
+                marker_id=LUMEN_BOUNDARY_WITNESS_KEY[1],
+                frame_id=diagnostic.frame_id,
+                stamp=stamp,
+                position=diagnostic.lumen_boundary_point,
+                diameter=0.0060,
+                color=color,
+            )
+        )
+    markers.append(
+        _status_text_marker(
+            ns=LUMEN_STATUS_KEY[0],
+            marker_id=LUMEN_STATUS_KEY[1],
+            frame_id=diagnostic.frame_id,
+            stamp=stamp,
+            position=diagnostic.backbone_center_point + np.array([0.0, 0.0, 0.014], dtype=np.float64),
+            text=_diagnostic_text(diagnostic),
+            color=color,
+        )
+    )
+    _validate_markers(markers)
+    return markers
+
+
+def build_dynamic_lumen_delete_markers(
+    previous_marker_keys: Iterable[tuple[str, int]],
+    frame_id: str,
+    stamp: Any,
+) -> list[Marker]:
+    return build_static_lumen_delete_markers(previous_marker_keys, frame_id, stamp)
+
+
 def static_lumen_cache_key(
     geometry_fingerprint: str,
     visualization_config: LumenMarkerConfig | dict[str, Any],
@@ -312,6 +404,24 @@ def _line_strip_marker(
     return marker
 
 
+def _line_list_marker(
+    *,
+    ns: str,
+    marker_id: int,
+    frame_id: str,
+    stamp: Any,
+    points: np.ndarray,
+    scale: float,
+    color: ColorRGBA,
+) -> Marker:
+    point_array = np.asarray(points, dtype=np.float64)
+    if point_array.shape != (2, 3):
+        raise ValueError(f"{ns} requires exactly two line endpoint points")
+    marker = _base_marker(ns, marker_id, frame_id, stamp, Marker.LINE_LIST, scale, color)
+    marker.points = [_point_from_array(point) for point in point_array]
+    return marker
+
+
 def _ring_list_marker(
     *,
     ns: str,
@@ -356,6 +466,50 @@ def _single_ring_marker(
     return marker
 
 
+def _sphere_marker(
+    *,
+    ns: str,
+    marker_id: int,
+    frame_id: str,
+    stamp: Any,
+    position: np.ndarray,
+    diameter: float,
+    color: ColorRGBA,
+) -> Marker:
+    marker = _base_marker(ns, marker_id, frame_id, stamp, Marker.SPHERE, diameter, color)
+    marker.scale.y = marker.scale.x
+    marker.scale.z = marker.scale.x
+    marker.pose.position = _point_from_array(position)
+    return marker
+
+
+def _status_text_marker(
+    *,
+    ns: str,
+    marker_id: int,
+    frame_id: str,
+    stamp: Any,
+    position: np.ndarray,
+    text: str,
+    color: ColorRGBA,
+) -> Marker:
+    marker = Marker()
+    marker.header.stamp = stamp
+    marker.header.frame_id = _non_empty_string(frame_id, "frame_id")
+    marker.ns = str(ns)
+    marker.id = int(marker_id)
+    marker.type = Marker.TEXT_VIEW_FACING
+    marker.action = Marker.ADD
+    marker.pose.position = _point_from_array(position)
+    marker.pose.orientation.w = 1.0
+    marker.scale.z = 0.0060
+    marker.color = color
+    marker.text = str(text)
+    if not marker.text:
+        raise ValueError(f"{ns}.text must be non-empty")
+    return marker
+
+
 def _base_marker(
     ns: str,
     marker_id: int,
@@ -376,6 +530,26 @@ def _base_marker(
     marker.scale.x = _positive_number(scale, f"{ns}.scale.x")
     marker.color = color
     return marker
+
+
+def _diagnostic_color(status: str) -> ColorRGBA:
+    if status == STATUS_SAFE:
+        return ColorRGBA(r=0.0, g=0.8, b=0.2, a=1.0)
+    if status == STATUS_MARGIN:
+        return ColorRGBA(r=1.0, g=0.62, b=0.0, a=1.0)
+    if status == STATUS_COLLISION:
+        return ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)
+    raise ValueError(f"unsupported diagnostic status {status}")
+
+
+def _diagnostic_text(diagnostic: LumenRuntimeDiagnostic) -> str:
+    return (
+        f"state={diagnostic.status}\n"
+        f"physical_clearance={diagnostic.physical_clearance:.6f} m\n"
+        f"safety_clearance={diagnostic.safety_clearance:.6f} m\n"
+        f"constraint={diagnostic.constraint_type}\n"
+        f"backbone_index={diagnostic.backbone_index}"
+    )
 
 
 def _estimate_tangents(points: np.ndarray) -> np.ndarray:
@@ -474,6 +648,8 @@ def _radius_profile(geometry: CurvedLumen, expected_count: int) -> np.ndarray:
 def _validate_markers(markers: Iterable[Marker]) -> None:
     for marker in markers:
         _non_empty_string(marker.header.frame_id, f"{marker.ns}.header.frame_id")
+        if marker.action != Marker.ADD:
+            raise ValueError(f"{marker.ns}.action must be Marker.ADD")
         for label, value in (
             ("scale.x", marker.scale.x),
             ("scale.y", marker.scale.y),
@@ -496,6 +672,16 @@ def _validate_markers(markers: Iterable[Marker]) -> None:
             coordinates = (float(point.x), float(point.y), float(point.z))
             if not all(math.isfinite(value) for value in coordinates):
                 raise ValueError(f"{marker.ns}.points[{point_index}] must be finite")
+        if marker.type in {Marker.SPHERE, Marker.TEXT_VIEW_FACING}:
+            coordinates = (
+                float(marker.pose.position.x),
+                float(marker.pose.position.y),
+                float(marker.pose.position.z),
+            )
+            if not all(math.isfinite(value) for value in coordinates):
+                raise ValueError(f"{marker.ns}.pose.position must be finite")
+        if marker.type == Marker.TEXT_VIEW_FACING and not marker.text:
+            raise ValueError(f"{marker.ns}.text must be non-empty")
 
 
 def _points_array(values: Any, label: str) -> np.ndarray:

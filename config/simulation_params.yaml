@@ -21,6 +21,7 @@ simulation:
 
   visualization:
     publish_lumen_markers: true
+    publish_lumen_diagnostics: true
     centerline_stride: 1
     ring_stride: 4
     ring_segments: 20

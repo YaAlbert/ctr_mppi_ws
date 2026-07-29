@@ -33,6 +33,8 @@ from ctr_mppi_controller.lumen_factory import (
     lumen_mode_from_config,
 )
 from ctr_sim.lumen_markers import (
+    build_dynamic_lumen_delete_markers,
+    build_dynamic_lumen_diagnostic_markers,
     LumenMarkerConfig,
     build_curved_static_lumen_markers,
     build_static_lumen_delete_markers,
@@ -40,6 +42,7 @@ from ctr_sim.lumen_markers import (
     markers_with_stamp,
     static_lumen_cache_key,
 )
+from ctr_sim.lumen_diagnostics import LumenRuntimeDiagnostic, build_lumen_runtime_diagnostic
 from ctr_sim.simulation_core import CTRSimulationCore
 from rclpy.node import Node
 from rclpy.parameter import Parameter
@@ -105,6 +108,10 @@ class CTRSimulatorNode(Node):
         self._last_static_lumen_publish_time_s: float | None = None
         self._static_lumen_build_count = 0
         self._static_lumen_cache_hit_logged = False
+        self._dynamic_lumen_marker_keys: tuple[tuple[str, int], ...] = ()
+        self._dynamic_lumen_marker_frame_id = self.frame_id
+        self._last_lumen_diagnostic_log_signature: tuple[str, ...] | None = None
+        self._lumen_diagnostic_update_count = 0
 
         self.latest_command = np.zeros(6, dtype=float)
         self.command_valid = False
@@ -314,6 +321,7 @@ class CTRSimulatorNode(Node):
 
         markers = [backbone, tip, target]
         markers.extend(self._static_lumen_markers_for_publish(stamp))
+        markers.extend(self._dynamic_lumen_markers_for_publish(stamp, backbone_array))
         if self.lumen_mode == "cylindrical" and isinstance(self.lumen, CylindricalLumen):
             markers.extend(self._lumen_markers(stamp, backbone_array))
         return MarkerArray(markers=markers)
@@ -456,6 +464,102 @@ class CTRSimulatorNode(Node):
             f"segments={segments} "
             f"cached={str(cached).lower()} "
             f"build_count={self._static_lumen_build_count} "
+            f"reason={reason}"
+        )
+
+    def _dynamic_lumen_markers_for_publish(self, stamp, backbone_array: np.ndarray) -> list[Marker]:
+        config = getattr(self, "lumen_marker_config", LumenMarkerConfig())
+        if not config.publish_lumen_markers:
+            return self._clear_dynamic_lumen_markers(stamp, reason="visualization_disabled")
+        if not config.publish_lumen_diagnostics:
+            return self._clear_dynamic_lumen_markers(stamp, reason="diagnostics_disabled")
+        if self.lumen_mode != "curved" or not isinstance(self.lumen, CurvedLumen):
+            return self._clear_dynamic_lumen_markers(stamp, reason=f"mode_{self.lumen_mode}")
+
+        try:
+            diagnostic = build_lumen_runtime_diagnostic(self.lumen, backbone_array, self.lumen_mode)
+            markers = build_dynamic_lumen_diagnostic_markers(diagnostic, stamp)
+        except ValueError as exc:
+            self._log_lumen_diagnostic_unavailable(
+                mode=self.lumen_mode,
+                frame=getattr(self.lumen, "frame_id", self.frame_id),
+                reason=f"generation_failed:{exc}",
+            )
+            return self._clear_dynamic_lumen_markers(stamp, reason="generation_failed")
+
+        new_keys = marker_keys(markers)
+        old_keys = tuple(getattr(self, "_dynamic_lumen_marker_keys", ()))
+        obsolete_keys = tuple(key for key in old_keys if key not in new_keys)
+        deletes: list[Marker] = []
+        if obsolete_keys:
+            deletes = build_dynamic_lumen_delete_markers(
+                obsolete_keys,
+                getattr(self, "_dynamic_lumen_marker_frame_id", diagnostic.frame_id),
+                stamp,
+            )
+        self._dynamic_lumen_marker_keys = new_keys
+        self._dynamic_lumen_marker_frame_id = diagnostic.frame_id
+        self._lumen_diagnostic_update_count += 1
+        self._log_lumen_diagnostic(diagnostic, reason="updated")
+        return deletes + markers
+
+    def _clear_dynamic_lumen_markers(self, stamp, *, reason: str) -> list[Marker]:
+        keys = tuple(getattr(self, "_dynamic_lumen_marker_keys", ()))
+        if not keys:
+            return []
+        frame = getattr(self, "_dynamic_lumen_marker_frame_id", self.frame_id)
+        deletes = build_dynamic_lumen_delete_markers(keys, frame, stamp)
+        self._dynamic_lumen_marker_keys = ()
+        self._log_lumen_diagnostic_unavailable(mode=self.lumen_mode, frame=frame, reason=reason)
+        return deletes
+
+    def _log_lumen_diagnostic(self, diagnostic: LumenRuntimeDiagnostic, *, reason: str) -> None:
+        signature = (
+            diagnostic.geometry_mode,
+            diagnostic.constraint_type,
+            diagnostic.status,
+        )
+        if signature == self._last_lumen_diagnostic_log_signature:
+            return
+        self._last_lumen_diagnostic_log_signature = signature
+        try:
+            logger = self.get_logger()
+        except Exception:
+            return
+        logger.info(
+            "LUMEN_DIAGNOSTIC "
+            f"mode={diagnostic.geometry_mode} "
+            f"constraint={diagnostic.constraint_type} "
+            f"state={diagnostic.status} "
+            f"backbone_index={diagnostic.backbone_index} "
+            f"physical_clearance={diagnostic.physical_clearance:.9f} "
+            f"safety_clearance={diagnostic.safety_clearance:.9f} "
+            f"collision={str(diagnostic.physical_collision).lower()} "
+            f"margin_violation={str(diagnostic.safety_margin_violation).lower()} "
+            f"frame={diagnostic.frame_id} "
+            f"reason={reason}"
+        )
+
+    def _log_lumen_diagnostic_unavailable(self, *, mode: str, frame: str, reason: str) -> None:
+        signature = (str(mode), "unavailable", str(reason))
+        if signature == self._last_lumen_diagnostic_log_signature:
+            return
+        self._last_lumen_diagnostic_log_signature = signature
+        try:
+            logger = self.get_logger()
+        except Exception:
+            return
+        logger.info(
+            "LUMEN_DIAGNOSTIC "
+            f"mode={mode} "
+            "constraint=unavailable "
+            "state=UNAVAILABLE "
+            "backbone_index=-1 "
+            "physical_clearance=unavailable "
+            "safety_clearance=unavailable "
+            "collision=false "
+            "margin_violation=false "
+            f"frame={frame} "
             f"reason={reason}"
         )
 

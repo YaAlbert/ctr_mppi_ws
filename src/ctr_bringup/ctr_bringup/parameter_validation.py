@@ -918,6 +918,8 @@ def _validate_simulation_visualization(visualization: Any) -> list[str]:
         return ["`simulation.visualization` must be a map."]
     if not isinstance(visualization.get("publish_lumen_markers"), bool):
         errors.append("`simulation.visualization.publish_lumen_markers` must be a boolean.")
+    if not isinstance(visualization.get("publish_lumen_diagnostics"), bool):
+        errors.append("`simulation.visualization.publish_lumen_diagnostics` must be a boolean.")
     errors.extend(
         _require_exact_int(
             visualization,

@@ -22,13 +22,26 @@ from ctr_mppi_controller.curved_lumen import (  # noqa: E402
 )
 from ctr_sim.lumen_markers import (  # noqa: E402
     CURVED_STATIC_LUMEN_MARKER_KEYS,
+    DYNAMIC_LUMEN_MARKER_KEYS,
     LumenMarkerConfig,
+    build_dynamic_lumen_delete_markers,
+    build_dynamic_lumen_diagnostic_markers,
     build_curved_static_lumen_markers,
     build_static_lumen_delete_markers,
     compute_parallel_transport_frames,
     marker_keys,
     sample_ring,
     static_lumen_cache_key,
+)
+from ctr_sim.lumen_diagnostics import (  # noqa: E402
+    CONSTRAINT_INLET,
+    CONSTRAINT_OUTLET,
+    CONSTRAINT_WALL,
+    STATUS_COLLISION,
+    STATUS_MARGIN,
+    STATUS_SAFE,
+    LumenRuntimeDiagnostic,
+    unavailable_lumen_runtime_diagnostic,
 )
 
 
@@ -85,6 +98,40 @@ def marker_by_namespace(markers: list[Marker], namespace: str) -> Marker:
 
 def marker_points(marker: Marker) -> np.ndarray:
     return np.asarray([[point.x, point.y, point.z] for point in marker.points], dtype=float)
+
+
+def marker_position(marker: Marker) -> np.ndarray:
+    return np.asarray([marker.pose.position.x, marker.pose.position.y, marker.pose.position.z], dtype=float)
+
+
+def diagnostic(
+    *,
+    status: str = STATUS_SAFE,
+    constraint_type: str = CONSTRAINT_WALL,
+    physical_clearance: float = 0.004,
+    safety_clearance: float = 0.002,
+    witness_available: bool = True,
+) -> LumenRuntimeDiagnostic:
+    physical_collision = status == STATUS_COLLISION
+    margin_violation = status in {STATUS_COLLISION, STATUS_MARGIN}
+    return LumenRuntimeDiagnostic(
+        frame_id="base_link",
+        geometry_mode="curved",
+        constraint_type=constraint_type,
+        backbone_index=4,
+        backbone_center_point=np.array([0.010, 0.0, 0.050], dtype=float),
+        ctr_surface_point=np.array([0.0115, 0.0, 0.050], dtype=float),
+        lumen_reference_point=np.array([0.0, 0.0, 0.050], dtype=float),
+        lumen_boundary_point=np.array([0.030, 0.0, 0.050], dtype=float),
+        physical_clearance=physical_clearance,
+        safety_clearance=safety_clearance,
+        physical_collision=physical_collision,
+        safety_margin_violation=margin_violation,
+        status=status,
+        valid=True,
+        reason="updated",
+        witness_available=witness_available,
+    )
 
 
 class ParallelTransportFrameTest(unittest.TestCase):
@@ -259,7 +306,15 @@ class CurvedMarkerConstructionTest(unittest.TestCase):
     def test_cache_key_uses_geometry_and_visual_settings_only(self):
         config = LumenMarkerConfig(centerline_stride=1, ring_stride=4, ring_segments=20, marker_publish_rate=5.0)
         same_content = LumenMarkerConfig(centerline_stride=1, ring_stride=4, ring_segments=20, marker_publish_rate=10.0)
+        diagnostic_disabled = LumenMarkerConfig(
+            centerline_stride=1,
+            ring_stride=4,
+            ring_segments=20,
+            marker_publish_rate=5.0,
+            publish_lumen_diagnostics=False,
+        )
         self.assertEqual(static_lumen_cache_key("abc", config), static_lumen_cache_key("abc", same_content))
+        self.assertEqual(static_lumen_cache_key("abc", config), static_lumen_cache_key("abc", diagnostic_disabled))
         self.assertNotEqual(static_lumen_cache_key("abc", config), static_lumen_cache_key("def", config))
         self.assertNotEqual(
             static_lumen_cache_key("abc", config),
@@ -277,6 +332,128 @@ class CurvedMarkerConstructionTest(unittest.TestCase):
         for marker in deletes:
             self.assertEqual(Marker.DELETE, marker.action)
             self.assertNotEqual(Marker.DELETEALL, marker.action)
+
+
+class DynamicLumenMarkerTest(unittest.TestCase):
+    def test_dynamic_markers_have_expected_namespaces_ids_types_and_frame(self):
+        markers = build_dynamic_lumen_diagnostic_markers(diagnostic(), Time())
+        self.assertEqual(DYNAMIC_LUMEN_MARKER_KEYS, marker_keys(markers))
+        expected_types = {
+            ("lumen_closest_pair", 0): Marker.LINE_LIST,
+            ("lumen_closest_pair", 1): Marker.SPHERE,
+            ("lumen_closest_pair", 2): Marker.SPHERE,
+            ("lumen_status", 0): Marker.TEXT_VIEW_FACING,
+        }
+        for marker in markers:
+            self.assertEqual("base_link", marker.header.frame_id)
+            self.assertEqual(expected_types[(marker.ns, marker.id)], marker.type)
+            self.assertEqual(Marker.ADD, marker.action)
+            self.assertGreater(marker.color.a, 0.0)
+            self.assertLessEqual(marker.color.a, 1.0)
+            self.assertNotIn((marker.ns, marker.id), CURVED_STATIC_LUMEN_MARKER_KEYS)
+            self.assertNotIn(marker.ns, {"ctr_backbone", "ctr_tip", "ctr_target", "collision_status", "safety_status"})
+
+    def test_dynamic_line_and_witness_positions_are_exact(self):
+        markers = build_dynamic_lumen_diagnostic_markers(diagnostic(), Time())
+        line = [marker for marker in markers if marker.ns == "lumen_closest_pair" and marker.id == 0][0]
+        backbone = [marker for marker in markers if marker.ns == "lumen_closest_pair" and marker.id == 1][0]
+        boundary = [marker for marker in markers if marker.ns == "lumen_closest_pair" and marker.id == 2][0]
+        np.testing.assert_allclose(marker_points(line), [[0.0115, 0.0, 0.050], [0.030, 0.0, 0.050]])
+        np.testing.assert_allclose(marker_position(backbone), [0.0115, 0.0, 0.050])
+        np.testing.assert_allclose(marker_position(boundary), [0.030, 0.0, 0.050])
+
+    def test_dynamic_marker_colors_encode_status(self):
+        cases = (
+            (STATUS_SAFE, 0.0, 0.8, 0.2),
+            (STATUS_MARGIN, 1.0, 0.62, 0.0),
+            (STATUS_COLLISION, 1.0, 0.0, 0.0),
+        )
+        for status, red, green, blue in cases:
+            with self.subTest(status=status):
+                markers = build_dynamic_lumen_diagnostic_markers(
+                    diagnostic(
+                        status=status,
+                        physical_clearance=-0.001 if status == STATUS_COLLISION else 0.001,
+                        safety_clearance=-0.001 if status != STATUS_SAFE else 0.003,
+                    ),
+                    Time(),
+                )
+                for marker in markers:
+                    self.assertAlmostEqual(red, marker.color.r)
+                    self.assertAlmostEqual(green, marker.color.g)
+                    self.assertAlmostEqual(blue, marker.color.b)
+
+    def test_status_text_is_compact_and_preserves_negative_values(self):
+        markers = build_dynamic_lumen_diagnostic_markers(
+            diagnostic(
+                status=STATUS_COLLISION,
+                constraint_type=CONSTRAINT_OUTLET,
+                physical_clearance=-0.004321,
+                safety_clearance=-0.006321,
+            ),
+            Time(),
+        )
+        text = [marker.text for marker in markers if marker.ns == "lumen_status"][0]
+        self.assertIn("state=PHYSICAL_COLLISION", text)
+        self.assertIn("physical_clearance=-0.004321 m", text)
+        self.assertIn("safety_clearance=-0.006321 m", text)
+        self.assertIn("constraint=outlet", text)
+        self.assertIn("backbone_index=4", text)
+        self.assertNotIn("[[", text)
+
+    def test_inlet_and_outlet_diagnostics_keep_constraint_text(self):
+        for constraint_type in (CONSTRAINT_INLET, CONSTRAINT_OUTLET):
+            with self.subTest(constraint_type=constraint_type):
+                markers = build_dynamic_lumen_diagnostic_markers(
+                    diagnostic(status=STATUS_COLLISION, constraint_type=constraint_type, physical_clearance=-0.002),
+                    Time(),
+                )
+                text = [marker.text for marker in markers if marker.ns == "lumen_status"][0]
+                self.assertIn(f"constraint={constraint_type}", text)
+
+    def test_unavailable_witness_publishes_status_only(self):
+        markers = build_dynamic_lumen_diagnostic_markers(diagnostic(witness_available=False), Time())
+        self.assertEqual((("lumen_status", 0),), marker_keys(markers))
+        self.assertEqual(Marker.TEXT_VIEW_FACING, markers[0].type)
+
+    def test_unavailable_diagnostic_returns_no_active_markers(self):
+        self.assertEqual(
+            [],
+            build_dynamic_lumen_diagnostic_markers(
+                unavailable_lumen_runtime_diagnostic(geometry_mode="curved", reason="disabled"),
+                Time(),
+            ),
+        )
+
+    def test_dynamic_delete_markers_are_targeted_and_never_delete_all(self):
+        deletes = build_dynamic_lumen_delete_markers(
+            [("lumen_status", 0), ("lumen_closest_pair", 2), ("lumen_status", 0)],
+            "base_link",
+            Time(),
+        )
+        self.assertEqual((("lumen_status", 0), ("lumen_closest_pair", 2)), marker_keys(deletes))
+        for marker in deletes:
+            self.assertEqual(Marker.DELETE, marker.action)
+            self.assertNotEqual(Marker.DELETEALL, marker.action)
+
+    def test_dynamic_marker_points_scales_and_positions_are_finite(self):
+        markers = build_dynamic_lumen_diagnostic_markers(diagnostic(), Time())
+        for marker in markers:
+            self.assertTrue(np.isfinite([marker.scale.x, marker.scale.y, marker.scale.z]).all())
+            self.assertTrue(np.isfinite([marker.color.r, marker.color.g, marker.color.b, marker.color.a]).all())
+            self.assertTrue(np.isfinite(marker_position(marker)).all())
+            for point in marker.points:
+                self.assertTrue(np.isfinite([point.x, point.y, point.z]).all())
+
+    def test_dynamic_marker_calls_are_deterministic(self):
+        first = build_dynamic_lumen_diagnostic_markers(diagnostic(), Time())
+        second = build_dynamic_lumen_diagnostic_markers(diagnostic(), Time())
+        self.assertEqual(marker_keys(first), marker_keys(second))
+        for left, right in zip(first, second):
+            self.assertEqual(left.type, right.type)
+            self.assertEqual(left.text, right.text)
+            np.testing.assert_allclose(marker_points(left), marker_points(right))
+            np.testing.assert_allclose(marker_position(left), marker_position(right))
 
 
 if __name__ == "__main__":
