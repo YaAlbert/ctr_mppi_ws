@@ -22,8 +22,19 @@ try:
 except ImportError:
     ctr_interfaces_module = types.ModuleType("ctr_interfaces")
     ctr_interfaces_msg_module = types.ModuleType("ctr_interfaces.msg")
-    ctr_interfaces_msg_module.CtrControllerMetrics = type("CtrControllerMetrics", (), {})
-    ctr_interfaces_msg_module.CtrJointCommand = type("CtrJointCommand", (), {})
+    class CtrControllerMetrics:
+        def __init__(self):
+            self.header = SimpleNamespace(stamp=None, frame_id="")
+
+    class CtrJointCommand:
+        def __init__(self):
+            self.header = SimpleNamespace(stamp=None, frame_id="")
+            self.q_dot = []
+            self.valid = False
+            self.diagnostic_status = ""
+
+    ctr_interfaces_msg_module.CtrControllerMetrics = CtrControllerMetrics
+    ctr_interfaces_msg_module.CtrJointCommand = CtrJointCommand
     ctr_interfaces_msg_module.CtrState = type("CtrState", (), {})
     sys.modules["ctr_interfaces"] = ctr_interfaces_module
     sys.modules["ctr_interfaces.msg"] = ctr_interfaces_msg_module
@@ -46,9 +57,12 @@ from ctr_mppi_controller.reference_validation import (  # noqa: E402
     FIXED_TARGET,
     INVALID_REFERENCE,
     NO_ACTIVE_REFERENCE,
+    SOURCE_TRAJECTORY_HORIZON,
+    TRAJECTORY,
     VALID_REFERENCE,
     accept_point_reference,
     initial_reference,
+    initial_trajectory_reference,
     reference_state_log_line,
     validate_reference_point,
 )
@@ -107,12 +121,14 @@ class FakePublisher:
 class FakeCore:
     def __init__(self):
         self.solve_calls = 0
+        self.solve_kwargs = []
         self.horizon = 3
         self.dt = 0.05
         self.control_dimension = 6
 
     def solve(self, **kwargs):
         self.solve_calls += 1
+        self.solve_kwargs.append(kwargs)
         return SimpleNamespace(
             command=np.zeros(6),
             solve_time=0.001,
@@ -132,7 +148,10 @@ def controller_shell(*, mode=EXTERNAL_TARGET, lumen_geometry=None):
     node.reference_stale_timeout = 0.20
     node.lumen_geometry = lumen_geometry
     node.active_reference = initial_reference(mode)
+    node.active_trajectory_reference = initial_trajectory_reference()
     node.target_tip = np.zeros(3)
+    node.latest_reference_horizon = None
+    node.latest_reference_horizon_stamp_s = None
     node.latest_state = SimpleNamespace(q=[0.0] * 6, q_dot=[0.0] * 6)
     node.core = FakeCore()
     node.command_pub = FakePublisher()
@@ -145,7 +164,8 @@ def controller_shell(*, mode=EXTERNAL_TARGET, lumen_geometry=None):
     node._warned_missing_horizon = False
     node._warned_missing_reference = False
     node._last_invalid_reference_warning_s = None
-    node.get_logger = lambda: FakeLogger()
+    node._fake_logger = FakeLogger()
+    node.get_logger = lambda: node._fake_logger
     node.get_clock = lambda: FakeClock()
     return node
 
@@ -534,11 +554,146 @@ class MPPIControllerNodeHelpersTest(unittest.TestCase):
                 self.assertTrue(np.allclose(target, kwargs["target_tip"]))
 
     def test_trajectory_mode_still_requires_horizon_before_solve(self):
-        node = controller_shell(mode="trajectory")
+        node = controller_shell(mode=TRAJECTORY)
         node.latest_reference_horizon = None
         node.latest_reference_horizon_stamp_s = None
         with self.assertRaisesRegex(ValueError, "horizon"):
             node._timer_reference_kwargs(current_time_s=10.0)
+        node._on_timer()
+        self.assertEqual(0, node.core.solve_calls)
+        self.assertEqual([], node.command_pub.messages)
+        self.assertEqual([], node.safe_command_pub.messages)
+
+    def test_trajectory_valid_horizon_installs_snapshot_and_enables_solve(self):
+        node = controller_shell(mode=TRAJECTORY)
+        points = np.array([[0.0192, 0.0, 0.08], [0.0193, 0.0, 0.08], [0.0194, 0.0, 0.08]])
+        msg = horizon_path(points, stamp_s=10.0)
+        node._on_reference_horizon(msg)
+        self.assertEqual(VALID_REFERENCE, node.active_trajectory_reference.state)
+        self.assertEqual(SOURCE_TRAJECTORY_HORIZON, node.active_trajectory_reference.source)
+        self.assertEqual(1, node.active_trajectory_reference.revision)
+        self.assertEqual("base_link", node.active_trajectory_reference.frame_id)
+        self.assertTrue(np.array_equal(points, node.active_trajectory_reference.points))
+        self.assertFalse(node.active_trajectory_reference.points.flags.writeable)
+        self.assertTrue(np.array_equal(points[0], node.target_tip))
+
+        msg.poses[0].pose.position.x = 9.0
+        self.assertNotEqual(9.0, node.active_trajectory_reference.points[0, 0])
+
+        kwargs = node._timer_reference_kwargs(current_time_s=10.05)
+        self.assertTrue(np.array_equal(points, kwargs["target_tip_sequence"]))
+        node._on_timer()
+        self.assertEqual(1, node.core.solve_calls)
+        self.assertTrue(np.array_equal(points, node.core.solve_kwargs[0]["target_tip_sequence"]))
+        self.assertEqual(1, len(node.command_pub.messages))
+        self.assertEqual(1, len(node.safe_command_pub.messages))
+
+    def test_trajectory_invalid_first_horizon_leaves_no_active_snapshot(self):
+        node = controller_shell(mode=TRAJECTORY)
+        invalid = horizon_path(np.array([[0.0192, 0.0, 0.08], [0.0193, 0.0, 0.08], [0.0194, 0.0, 0.08]]))
+        invalid.poses[1].pose.position.x = float("nan")
+        node._on_reference_horizon(invalid)
+        self.assertEqual(INVALID_REFERENCE, node.active_trajectory_reference.state)
+        self.assertEqual(0, node.active_trajectory_reference.revision)
+        self.assertIsNone(node.active_trajectory_reference.points)
+        self.assertIsNone(node.latest_reference_horizon)
+        node._on_timer()
+        self.assertEqual(0, node.core.solve_calls)
+        self.assertEqual([], node.command_pub.messages)
+        self.assertEqual([], node.safe_command_pub.messages)
+
+        valid = horizon_path(np.array([[0.0192, 0.0, 0.08], [0.0193, 0.0, 0.08], [0.0194, 0.0, 0.08]]))
+        node._on_reference_horizon(valid)
+        self.assertEqual(VALID_REFERENCE, node.active_trajectory_reference.state)
+        self.assertEqual(1, node.active_trajectory_reference.revision)
+
+    def test_trajectory_rejects_wrong_length_and_mixed_pose_frame(self):
+        node = controller_shell(mode=TRAJECTORY)
+        with self.assertRaisesRegex(ValueError, "shape"):
+            target_sequence_from_path(
+                horizon_path(np.zeros((2, 3))),
+                expected_horizon=3,
+                expected_frame_id="base_link",
+                current_time_s=10.0,
+                stale_timeout=0.20,
+            )
+        mixed = horizon_path(np.zeros((3, 3)))
+        mixed.poses[1].header.frame_id = "world"
+        node._on_reference_horizon(mixed)
+        self.assertEqual(INVALID_REFERENCE, node.active_trajectory_reference.state)
+        self.assertEqual(0, node.active_trajectory_reference.revision)
+
+    def test_trajectory_geometry_invalid_first_horizon_is_rejected(self):
+        node = controller_shell(mode=TRAJECTORY, lumen_geometry=cylinder_lumen())
+        points = np.array([[0.0, 0.0, 0.020], [0.040, 0.0, 0.050], [0.0, 0.0, 0.080]])
+        node._on_reference_horizon(horizon_path(points))
+        self.assertEqual(INVALID_REFERENCE, node.active_trajectory_reference.state)
+        self.assertEqual(0, node.active_trajectory_reference.revision)
+        self.assertIsNone(node.active_trajectory_reference.points)
+        self.assertIn("point[1]", node.active_trajectory_reference.last_validation_error)
+
+    def test_trajectory_invalid_replacement_retains_previous_snapshot_and_solve_input(self):
+        node = controller_shell(mode=TRAJECTORY)
+        node.get_clock = lambda: FakeClock(10.11)
+        first_points = np.array([[0.0192, 0.0, 0.08], [0.0193, 0.0, 0.08], [0.0194, 0.0, 0.08]])
+        node._on_reference_horizon(horizon_path(first_points, stamp_s=10.0))
+        previous_revision = node.active_trajectory_reference.revision
+        previous_points = node.active_trajectory_reference.points.copy()
+        invalid = horizon_path(np.array([[0.010, 0.0, 0.08], [0.011, 0.0, 0.08], [0.012, 0.0, 0.08]]), stamp_s=10.1)
+        invalid.poses[1].pose.position.y = float("inf")
+        node._on_reference_horizon(invalid)
+        self.assertEqual(VALID_REFERENCE, node.active_trajectory_reference.state)
+        self.assertEqual(previous_revision, node.active_trajectory_reference.revision)
+        self.assertTrue(np.array_equal(previous_points, node.active_trajectory_reference.points))
+        self.assertTrue(np.array_equal(previous_points, node.latest_reference_horizon))
+        node._on_timer()
+        self.assertEqual(1, node.core.solve_calls)
+        self.assertTrue(np.array_equal(previous_points, node.core.solve_kwargs[0]["target_tip_sequence"]))
+
+    def test_trajectory_valid_replacement_duplicate_and_timestamp_policy(self):
+        node = controller_shell(mode=TRAJECTORY)
+        node.get_clock = lambda: FakeClock(10.11)
+        first_points = np.array([[0.0192, 0.0, 0.08], [0.0193, 0.0, 0.08], [0.0194, 0.0, 0.08]])
+        second_points = np.array([[0.0193, 0.0, 0.08], [0.0194, 0.0, 0.08], [0.0195, 0.0, 0.08]])
+        node._on_reference_horizon(horizon_path(first_points, stamp_s=10.0))
+        node._on_reference_horizon(horizon_path(second_points, stamp_s=10.05))
+        self.assertEqual(2, node.active_trajectory_reference.revision)
+        self.assertTrue(np.array_equal(second_points, node.active_trajectory_reference.points))
+        node._on_reference_horizon(horizon_path(second_points, stamp_s=10.10))
+        self.assertEqual(2, node.active_trajectory_reference.revision)
+        self.assertAlmostEqual(10.10, node.active_trajectory_reference.stamp_s)
+        node._on_timer()
+        self.assertTrue(np.array_equal(second_points, node.core.solve_kwargs[-1]["target_tip_sequence"]))
+
+    def test_trajectory_tip_callback_cannot_bypass_or_mutate_horizon_snapshot(self):
+        node = controller_shell(mode=TRAJECTORY)
+        node._on_target(pose_from_point([0.010, 0.000, 0.090], "base_link"))
+        self.assertFalse(node.active_trajectory_reference.has_valid_horizon)
+        self.assertEqual(0, node.active_trajectory_reference.revision)
+        points = np.array([[0.0192, 0.0, 0.08], [0.0193, 0.0, 0.08], [0.0194, 0.0, 0.08]])
+        node._on_reference_horizon(horizon_path(points))
+        previous = node.active_trajectory_reference.points.copy()
+        node._on_target(pose_from_point([0.010, 0.000, 0.090], "base_link"))
+        self.assertEqual(1, node.active_trajectory_reference.revision)
+        self.assertTrue(np.array_equal(previous, node.active_trajectory_reference.points))
+
+    def test_trajectory_stale_active_snapshot_gates_solve_without_clearing_snapshot(self):
+        node = controller_shell(mode=TRAJECTORY)
+        points = np.array([[0.0192, 0.0, 0.08], [0.0193, 0.0, 0.08], [0.0194, 0.0, 0.08]])
+        node._on_reference_horizon(horizon_path(points, stamp_s=10.0))
+        with self.assertRaisesRegex(ValueError, "stale"):
+            node._timer_reference_kwargs(current_time_s=10.30)
+        self.assertEqual(VALID_REFERENCE, node.active_trajectory_reference.state)
+        self.assertTrue(np.array_equal(points, node.active_trajectory_reference.points))
+
+    def test_hold_final_repeated_horizon_is_valid_and_duplicate_does_not_churn_revision(self):
+        node = controller_shell(mode=TRAJECTORY)
+        node.get_clock = lambda: FakeClock(10.06)
+        final_points = np.array([[0.0192, 0.0, 0.08], [0.0192, 0.0, 0.08], [0.0192, 0.0, 0.08]])
+        node._on_reference_horizon(horizon_path(final_points, stamp_s=10.0))
+        node._on_reference_horizon(horizon_path(final_points, stamp_s=10.05))
+        self.assertEqual(1, node.active_trajectory_reference.revision)
+        self.assertTrue(np.array_equal(final_points, node.active_trajectory_reference.points))
 
     def test_metrics_publish_rate_gate(self):
         self.assertTrue(should_publish_metrics(last_publish_time_s=None, current_time_s=1.0, publish_frequency=5.0))

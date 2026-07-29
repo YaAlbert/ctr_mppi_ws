@@ -33,13 +33,19 @@ from ctr_mppi_controller.reference_validation import (
     REFERENCE_MODES,
     TRAJECTORY,
     VALID_REFERENCE,
+    accept_trajectory_reference,
     accept_point_reference,
     initial_reference,
+    initial_trajectory_reference,
     reference_kwargs_from_active,
     reference_state_log_line,
     reject_reference_update,
+    reject_trajectory_update,
+    trajectory_kwargs_from_active,
+    trajectory_state_log_line,
     validate_reference_mode,
     validate_reference_point,
+    validate_reference_sequence,
 )
 from ctr_mppi_controller.trajectory_metrics import TrajectoryMetricsAccumulator, TrajectoryMetricsConfig
 from rclpy.node import Node
@@ -100,6 +106,7 @@ class MPPIControllerNode(Node):
         self.reference_frame_id = str(self.config.get("reference", {}).get("frame_id", self.frame_id))
         self.reference_stale_timeout = float(self.config.get("reference", {}).get("stale_timeout", 0.20))
         self.active_reference = initial_reference(self.reference_mode)
+        self.active_trajectory_reference = initial_trajectory_reference()
         self.target_tip = np.zeros(3, dtype=float)
         target_validation_status = self._initialize_active_reference()
         self.core = MPPICore(
@@ -261,6 +268,7 @@ class MPPIControllerNode(Node):
         if self.reference_mode != "trajectory":
             return
         now_s = ros_time_seconds(self.get_clock().now())
+        previous = self.active_trajectory_reference
         try:
             sequence, stamp_s = target_sequence_from_path(
                 msg,
@@ -268,16 +276,46 @@ class MPPIControllerNode(Node):
                 expected_frame_id=self.reference_frame_id,
                 current_time_s=now_s,
                 stale_timeout=self.reference_stale_timeout,
+                lumen_geometry=self.lumen_geometry,
             )
         except ValueError as exc:
-            self.latest_reference_horizon = None
-            self.latest_reference_horizon_stamp_s = None
-            self.get_logger().warn(f"Ignoring malformed /ctr/reference/horizon message: {exc}")
+            should_log_state = (
+                (not previous.has_valid_horizon and previous.state != VALID_REFERENCE and not previous.last_validation_error)
+                or (previous.has_valid_horizon and not previous.last_validation_error)
+            )
+            self.active_trajectory_reference = reject_trajectory_update(previous, str(exc))
+            if self.active_trajectory_reference.has_valid_horizon:
+                self.latest_reference_horizon = self.active_trajectory_reference.points.copy()
+                self.latest_reference_horizon_stamp_s = self.active_trajectory_reference.stamp_s
+                reason = "invalid_trajectory_horizon_retained_previous"
+            else:
+                self.latest_reference_horizon = None
+                self.latest_reference_horizon_stamp_s = None
+                reason = "invalid_trajectory_horizon"
+            self._warn_invalid_reference(f"Rejected /ctr/reference/horizon: {exc}")
+            if should_log_state:
+                self._log_reference_state(reason=reason)
             return
 
-        self.latest_reference_horizon = sequence
-        self.latest_reference_horizon_stamp_s = stamp_s
+        self.active_trajectory_reference = accept_trajectory_reference(
+            previous,
+            points=sequence,
+            frame=self.reference_frame_id,
+            stamp_s=stamp_s,
+        )
+        self.latest_reference_horizon = self.active_trajectory_reference.points.copy()
+        self.latest_reference_horizon_stamp_s = self.active_trajectory_reference.stamp_s
+        self.target_tip = self.active_trajectory_reference.points[0].copy()
         self._warned_missing_horizon = False
+        reason = "trajectory_horizon_accepted"
+        if previous.has_valid_horizon:
+            reason = (
+                "trajectory_horizon_duplicate"
+                if self.active_trajectory_reference.revision == previous.revision
+                else "trajectory_horizon_replaced"
+            )
+        if reason != "trajectory_horizon_duplicate":
+            self._log_reference_state(reason=reason)
 
     def _on_timer(self) -> None:
         if self.latest_state is None:
@@ -377,6 +415,12 @@ class MPPIControllerNode(Node):
             if self.active_reference.state != VALID_REFERENCE:
                 raise ValueError(f"{self.reference_mode} mode is waiting for a valid active reference")
             return reference_kwargs_from_active(self.active_reference)
+        if self.reference_mode == TRAJECTORY:
+            return trajectory_kwargs_from_active(
+                self.active_trajectory_reference,
+                current_time_s=current_time_s,
+                stale_timeout=self.reference_stale_timeout,
+            )
         return solve_reference_kwargs(
             reference_mode=self.reference_mode,
             target_tip=self.target_tip,
@@ -387,6 +431,9 @@ class MPPIControllerNode(Node):
         )
 
     def _log_reference_state(self, *, reason: str) -> None:
+        if self.reference_mode == TRAJECTORY:
+            self.get_logger().info(trajectory_state_log_line(self.active_trajectory_reference, reason=reason))
+            return
         self.get_logger().info(reference_state_log_line(self.active_reference, reason=reason))
 
     def _warn_invalid_reference(self, message: str) -> None:
@@ -426,6 +473,7 @@ def target_sequence_from_path(
     expected_frame_id: str,
     current_time_s: float,
     stale_timeout: float,
+    lumen_geometry=None,
 ) -> tuple[np.ndarray, float]:
     if expected_horizon <= 0:
         raise ValueError("expected_horizon must be positive")
@@ -433,10 +481,9 @@ def target_sequence_from_path(
         raise ValueError("expected_frame_id must be non-empty")
     now_s = _finite_float(current_time_s, "current_time_s")
     timeout = _positive_float(stale_timeout, "stale_timeout")
-    if msg.header.frame_id != expected_frame_id:
-        raise ValueError(f"horizon frame_id must be `{expected_frame_id}`")
-    if len(msg.poses) != expected_horizon:
-        raise ValueError(f"horizon must contain exactly {expected_horizon} poses")
+    frame_id = msg.header.frame_id
+    if frame_id != expected_frame_id:
+        raise ValueError(f"horizon frame mismatch: expected `{expected_frame_id}`, got `{frame_id}`")
 
     stamp_s = ros_time_seconds(msg.header.stamp)
     age_s = now_s - stamp_s
@@ -448,8 +495,8 @@ def target_sequence_from_path(
     points = []
     for index, pose_stamped in enumerate(msg.poses):
         pose_frame = pose_stamped.header.frame_id
-        if pose_frame and pose_frame != expected_frame_id:
-            raise ValueError(f"horizon pose {index} frame_id must be `{expected_frame_id}`")
+        if pose_frame and pose_frame != frame_id:
+            raise ValueError(f"horizon pose {index} frame_id must be `{frame_id}`")
         points.append(
             [
                 pose_stamped.pose.position.x,
@@ -457,10 +504,15 @@ def target_sequence_from_path(
                 pose_stamped.pose.position.z,
             ]
         )
-    array = np.asarray(points, dtype=float)
-    if array.shape != (expected_horizon, 3) or not np.all(np.isfinite(array)):
-        raise ValueError(f"horizon positions must have shape ({expected_horizon}, 3) and contain finite values")
-    return array, stamp_s
+    sequence = validate_reference_sequence(
+        points,
+        received_frame=frame_id,
+        expected_frame=expected_frame_id,
+        lumen_geometry=lumen_geometry,
+        expected_count=expected_horizon,
+        label="reference horizon",
+    )
+    return sequence, stamp_s
 
 
 def solve_reference_kwargs(
