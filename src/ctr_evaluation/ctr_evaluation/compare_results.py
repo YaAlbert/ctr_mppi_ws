@@ -20,22 +20,63 @@ def compare_result_dirs(
     initial_state_tolerance: float,
     near_zero_epsilon: float,
 ) -> dict[str, Any]:
-    candidate_summary = read_json(candidate_dir / "summary.json")
-    baseline_summary = read_json(baseline_dir / "summary.json")
-    candidate_metadata = read_result_metadata(candidate_dir)
-    baseline_metadata = read_result_metadata(baseline_dir)
-    result = compare_summaries(
-        candidate_summary=candidate_summary,
-        baseline_summary=baseline_summary,
-        candidate_metadata=candidate_metadata,
-        baseline_metadata=baseline_metadata,
-        duration_tolerance=duration_tolerance,
-        initial_state_tolerance=initial_state_tolerance,
-        near_zero_epsilon=near_zero_epsilon,
-    ).to_dict()
-    write_json(candidate_dir / "comparison.json", result)
-    write_comparison_markdown(candidate_dir / "comparison.md", result, candidate_dir, baseline_dir)
+    try:
+        candidate_summary = read_json(candidate_dir / "summary.json")
+        baseline_summary = read_json(baseline_dir / "summary.json")
+        candidate_metadata = read_result_metadata(candidate_dir)
+        baseline_metadata = read_result_metadata(baseline_dir)
+        result = compare_summaries(
+            candidate_summary=candidate_summary,
+            baseline_summary=baseline_summary,
+            candidate_metadata=candidate_metadata,
+            baseline_metadata=baseline_metadata,
+            duration_tolerance=duration_tolerance,
+            initial_state_tolerance=initial_state_tolerance,
+            near_zero_epsilon=near_zero_epsilon,
+        ).to_dict()
+    except FileNotFoundError:
+        raise
+    except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+        result = _comparison_failure(candidate_dir, baseline_dir, exc)
+    if candidate_dir.is_dir():
+        write_json(candidate_dir / "comparison.json", result)
+        write_comparison_markdown(candidate_dir / "comparison.md", result, candidate_dir, baseline_dir)
     return result
+
+
+def _comparison_failure(candidate_dir: Path, baseline_dir: Path, error: Exception) -> dict[str, Any]:
+    missing_candidate = not (candidate_dir / "summary.json").is_file()
+    missing_baseline = not (baseline_dir / "summary.json").is_file()
+    if missing_candidate:
+        role = "candidate"
+        code = "candidate_summary_missing"
+    elif missing_baseline:
+        role = "baseline"
+        code = "baseline_summary_missing"
+    elif isinstance(error, json.JSONDecodeError):
+        role = "candidate_or_baseline"
+        code = "summary_malformed"
+    else:
+        role = "candidate_or_baseline"
+        code = "comparison_input_invalid"
+    return {
+        "comparison_schema_version": "curved_comparison_v1",
+        "compatibility_valid": False,
+        "pair_identity_compatible": False,
+        "comparison_valid": False,
+        "compatibility_reasons": [code],
+        "compatibility_details": {
+            "comparison_error": {"code": code, "role": role},
+        },
+        "baseline_run_valid": None if missing_baseline is False else False,
+        "candidate_run_valid": None if missing_candidate is False else False,
+        "baseline_invalid_reasons": [code] if role == "baseline" else [],
+        "candidate_invalid_reasons": [code] if role == "candidate" else [],
+        "improvement_evaluated": False,
+        "improvement_pass": None,
+        "metric_comparisons": [],
+        "boolean_comparisons": [],
+    }
 
 
 def write_comparison_markdown(path: Path, comparison: dict[str, Any], candidate_dir: Path, baseline_dir: Path) -> None:

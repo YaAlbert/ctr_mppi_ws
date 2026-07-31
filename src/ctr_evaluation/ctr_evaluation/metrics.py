@@ -63,6 +63,68 @@ METRIC_DIRECTIONS = {
     "path_efficiency": "higher",
 }
 
+CURVED_LUMEN_TASK = "curved_lumen_navigation"
+CURVED_LUMEN_SCHEMA_VERSION = "lumen_evaluation_v1"
+COMPARISON_SCHEMA_VERSION = "curved_comparison_v1"
+CURVED_NUMERIC_COMPARISON_METRICS = (
+    ("curved_final_target_error", ("goal", "final_goal_error"), "lower"),
+    ("curved_rms_target_error", ("goal", "rmse"), "lower"),
+    (
+        "curved_minimum_physical_clearance",
+        ("lumen_evaluation", "physical_safety", "minimum_physical_clearance_m"),
+        "higher",
+    ),
+    (
+        "curved_collision_duration",
+        ("lumen_evaluation", "physical_safety", "collision_duration_s"),
+        "lower",
+    ),
+    (
+        "curved_minimum_safety_clearance",
+        ("lumen_evaluation", "safety_margin", "minimum_safety_clearance_m"),
+        "higher",
+    ),
+    (
+        "curved_safety_margin_violation_duration",
+        ("lumen_evaluation", "safety_margin", "violation_duration_s"),
+        "lower",
+    ),
+    (
+        "curved_final_normalized_progress",
+        ("lumen_evaluation", "progress", "final_normalized_progress"),
+        "higher",
+    ),
+    (
+        "curved_maximum_normalized_progress",
+        ("lumen_evaluation", "progress", "maximum_normalized_progress"),
+        "higher",
+    ),
+)
+CURVED_BOOLEAN_COMPARISON_FIELDS = (
+    ("goal_success", ("navigation", "goal_success")),
+    ("physical_safety_pass", ("lumen_evaluation", "physical_safety", "physical_safety_pass")),
+    ("safety_margin_pass", ("lumen_evaluation", "safety_margin", "safety_margin_pass")),
+    ("navigation_success", ("navigation", "navigation_success")),
+)
+CURVED_IDENTITY_FIELDS = (
+    "task",
+    "reference_mode",
+    "curved_lumen_type",
+    "scenario_id",
+    "scenario_policy_version",
+    "scenario_fingerprint",
+    "geometry_frame",
+    "geometry_fingerprint",
+    "expected_geometry_fingerprint",
+    "reconstructed_geometry_fingerprint",
+    "geometry_fingerprint_match",
+    "shared_environment_hash",
+    "derived_target",
+    "requested_target",
+    "executed_target",
+    "override_used",
+)
+
 
 @dataclass(frozen=True)
 class EvaluationThresholds:
@@ -257,11 +319,31 @@ class MetricComparison:
 
 
 @dataclass(frozen=True)
+class BooleanMetricComparison:
+    metric: str
+    candidate_value: bool | None
+    baseline_value: bool | None
+    comparison_valid: bool
+    improved: bool | None
+    reason: str
+
+
+@dataclass(frozen=True)
 class ComparisonResult:
     compatibility_valid: bool
     compatibility_reasons: list[str]
     compatibility_details: dict[str, Any]
     metric_comparisons: list[MetricComparison]
+    comparison_schema_version: str = COMPARISON_SCHEMA_VERSION
+    pair_identity_compatible: bool = True
+    baseline_run_valid: bool | None = None
+    candidate_run_valid: bool | None = None
+    baseline_invalid_reasons: list[str] = field(default_factory=list)
+    candidate_invalid_reasons: list[str] = field(default_factory=list)
+    comparison_valid: bool = True
+    improvement_evaluated: bool = False
+    improvement_pass: bool | None = None
+    boolean_comparisons: list[BooleanMetricComparison] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return dataclass_to_plain(self)
@@ -673,45 +755,563 @@ def compare_summaries(
         duration_tolerance=duration_tolerance,
         initial_state_tolerance=initial_state_tolerance,
     )
-    compatibility_reasons = compatibility["reasons"]
-    compatibility_valid = not compatibility_reasons
+    compatibility_reasons = list(compatibility["reasons"])
+    curved_comparison = _curved_comparison_requested(candidate_metadata, baseline_metadata)
+    baseline_validity = _curved_run_validity(baseline_summary, baseline_metadata, "baseline") if curved_comparison else _validity_result(True)
+    candidate_validity = _curved_run_validity(candidate_summary, candidate_metadata, "candidate") if curved_comparison else _validity_result(True)
+    if curved_comparison:
+        curved_compatibility = _curved_compatibility_report(
+            candidate_summary=candidate_summary,
+            baseline_summary=baseline_summary,
+            candidate_metadata=candidate_metadata,
+            baseline_metadata=baseline_metadata,
+            candidate_validity=candidate_validity,
+            baseline_validity=baseline_validity,
+            duration_tolerance=duration_tolerance,
+            initial_state_tolerance=initial_state_tolerance,
+        )
+        compatibility_reasons.extend(curved_compatibility["reasons"])
+        if any(
+            reason.startswith("required_curved_identity_")
+            or reason in {"geometry_fingerprint_not_valid", "geometry_fingerprint_inconsistent"}
+            for reason in baseline_validity["reasons"] + candidate_validity["reasons"]
+        ):
+            compatibility_reasons.append("curved_identity_unavailable")
+        compatibility["details"]["curved_mismatch_details"] = curved_compatibility["details"]
+    compatibility_reasons = _unique_strings(compatibility_reasons)
+    pair_identity_compatible = not compatibility_reasons
+    comparison_valid = pair_identity_compatible and baseline_validity["valid"] and candidate_validity["valid"]
     metric_pairs = _flatten_numeric_metrics(candidate_summary)
     baseline_pairs = _flatten_numeric_metrics(baseline_summary)
     comparisons: list[MetricComparison] = []
-    for name, candidate_value in sorted(metric_pairs.items()):
-        if name not in baseline_pairs or name not in METRIC_DIRECTIONS:
+    boolean_comparisons: list[BooleanMetricComparison] = []
+    if not curved_comparison or comparison_valid:
+        if curved_comparison:
+            comparisons = _curved_metric_comparisons(
+                candidate_summary=candidate_summary,
+                baseline_summary=baseline_summary,
+                near_zero_epsilon=near_zero_epsilon,
+            )
+            boolean_comparisons = _curved_boolean_comparisons(candidate_summary, baseline_summary)
+        else:
+            for name, candidate_value in sorted(metric_pairs.items()):
+                if name not in baseline_pairs or name not in METRIC_DIRECTIONS:
+                    continue
+                direction = METRIC_DIRECTIONS[name]
+                baseline_value = baseline_pairs[name]
+                improvement, valid, reason = relative_improvement_percent(
+                    candidate_value=candidate_value,
+                    baseline_value=baseline_value,
+                    lower_is_better=direction == "lower",
+                    near_zero_epsilon=near_zero_epsilon,
+                )
+                comparisons.append(
+                    MetricComparison(
+                        metric=name,
+                        direction=direction,
+                        candidate_value=float(candidate_value),
+                        baseline_value=float(baseline_value),
+                        absolute_difference=float(candidate_value - baseline_value),
+                        relative_improvement_percent=improvement,
+                        comparison_valid=bool(valid and pair_identity_compatible),
+                        compatibility_valid=pair_identity_compatible,
+                        reason=reason if pair_identity_compatible else "; ".join(compatibility_reasons),
+                    )
+                )
+    improvement_evaluated = bool(comparisons or boolean_comparisons) and comparison_valid
+    return ComparisonResult(
+        compatibility_valid=pair_identity_compatible,
+        compatibility_reasons=compatibility_reasons,
+        compatibility_details=compatibility["details"],
+        metric_comparisons=comparisons,
+        pair_identity_compatible=pair_identity_compatible,
+        baseline_run_valid=baseline_validity["valid"] if curved_comparison else None,
+        candidate_run_valid=candidate_validity["valid"] if curved_comparison else None,
+        baseline_invalid_reasons=baseline_validity["reasons"] if curved_comparison else [],
+        candidate_invalid_reasons=candidate_validity["reasons"] if curved_comparison else [],
+        comparison_valid=comparison_valid,
+        improvement_evaluated=improvement_evaluated,
+        improvement_pass=None,
+        boolean_comparisons=boolean_comparisons,
+    )
+
+
+def _curved_comparison_requested(candidate_metadata: dict[str, Any], baseline_metadata: dict[str, Any]) -> bool:
+    return candidate_metadata.get("task") == CURVED_LUMEN_TASK or baseline_metadata.get("task") == CURVED_LUMEN_TASK
+
+
+def _validity_result(valid: bool, reasons: list[str] | None = None) -> dict[str, Any]:
+    return {"valid": valid, "reasons": [] if reasons is None else _unique_strings(reasons), "details": {}}
+
+
+def _curved_run_validity(summary: dict[str, Any], metadata: dict[str, Any], role: str) -> dict[str, Any]:
+    reasons: list[str] = []
+    details: dict[str, Any] = {}
+    values: dict[str, Any] = {}
+    if not isinstance(summary, dict):
+        reasons.append("summary_malformed")
+        return _validity_result(False, reasons)
+    if metadata.get("task") != CURVED_LUMEN_TASK:
+        reasons.append("task_mismatch")
+    lumen = summary.get("lumen_evaluation")
+    if not isinstance(lumen, dict):
+        reasons.append("lumen_evaluation_missing")
+        return _validity_result(False, reasons)
+    if lumen.get("schema_version") != CURVED_LUMEN_SCHEMA_VERSION:
+        reasons.append("unsupported_lumen_schema")
+    if lumen.get("available") is not True:
+        reasons.append("lumen_evaluation_unavailable")
+    if lumen.get("run_valid") is not True:
+        reasons.append("run_invalid")
+    identity = lumen.get("identity")
+    if not isinstance(identity, dict):
+        reasons.append("required_curved_identity_missing")
+        identity = {}
+    for field_name in CURVED_IDENTITY_FIELDS:
+        kind = "bool" if field_name in {"geometry_fingerprint_match", "override_used"} else (
+            "vector" if field_name in {"derived_target", "requested_target", "executed_target"} else "string"
+        )
+        _validate_required_curved_field(
+            field_name,
+            identity.get(field_name),
+            kind=kind,
+            reasons=reasons,
+            values=values,
+            details=details,
+            vector_length=3 if kind == "vector" else None,
+        )
+    if identity.get("geometry_fingerprint_match") is not True:
+        reasons.append("geometry_fingerprint_not_valid")
+
+    geometry = lumen.get("geometry")
+    if not isinstance(geometry, dict):
+        reasons.append("required_curved_identity_missing:geometry")
+        geometry = {}
+    for field_name in (
+        "fingerprint",
+        "ctr_outer_radius_m",
+        "safety_margin_m",
+        "minimum_lumen_radius_m",
+        "maximum_lumen_radius_m",
+    ):
+        kind = "string" if field_name == "fingerprint" else "number"
+        _validate_required_curved_field(
+            f"geometry.{field_name}",
+            geometry.get(field_name),
+            kind=kind,
+            reasons=reasons,
+            values=values,
+            details=details,
+        )
+    expected_fingerprint = values.get("expected_geometry_fingerprint")
+    reconstructed_fingerprint = values.get("reconstructed_geometry_fingerprint")
+    geometry_fingerprint = values.get("geometry.fingerprint")
+    if (
+        expected_fingerprint is not None
+        and reconstructed_fingerprint is not None
+        and geometry_fingerprint is not None
+        and (
+            expected_fingerprint != reconstructed_fingerprint
+            or expected_fingerprint != geometry_fingerprint
+        )
+    ):
+        reasons.append("geometry_fingerprint_inconsistent")
+        details["geometry_fingerprint_inconsistent"] = {
+            "expected": sanitize_for_json(expected_fingerprint),
+            "reconstructed": sanitize_for_json(reconstructed_fingerprint),
+            "geometry": sanitize_for_json(geometry_fingerprint),
+        }
+
+    configuration = metadata.get("configuration")
+    if not isinstance(configuration, dict):
+        configuration = {}
+        reasons.append("required_curved_identity_missing:configuration")
+    goal_configuration = configuration.get("goal")
+    if not isinstance(goal_configuration, dict):
+        goal_configuration = {}
+        reasons.append("required_curved_identity_missing:target_tolerance")
+    _validate_required_curved_field(
+        "target_tolerance",
+        goal_configuration.get("tolerance"),
+        kind="number",
+        reasons=reasons,
+        values=values,
+        details=details,
+    )
+    _validate_required_curved_field(
+        "evaluation_window_duration_s",
+        metadata.get("evaluation_window_duration_s"),
+        kind="number",
+        reasons=reasons,
+        values=values,
+        details=details,
+    )
+    for field_name in (
+        "model_configuration_hash",
+        "frame_id",
+        "software_mode",
+        "configured_control_period",
+        "reference_sample_period",
+    ):
+        kind = "number" if field_name in {"configured_control_period", "reference_sample_period"} else "string"
+        _validate_required_curved_field(
+            f"configuration.{field_name}",
+            configuration.get(field_name),
+            kind=kind,
+            reasons=reasons,
+            values=values,
+            details=details,
+        )
+    for field_name, value in (
+        ("initial_state_q", metadata.get("initial_state_q")),
+        ("initial_tip_position", metadata.get("initial_tip_position")),
+    ):
+        _validate_required_curved_field(
+            field_name,
+            value,
+            kind="vector",
+            reasons=reasons,
+            values=values,
+            details=details,
+            vector_length=6 if field_name == "initial_state_q" else 3,
+        )
+    goal = summary.get("goal")
+    if not isinstance(goal, dict):
+        reasons.append("goal_metrics_missing")
+    physical = lumen.get("physical_safety")
+    if not isinstance(physical, dict) or physical.get("physical_safety_pass") is None:
+        reasons.append("physical_safety_metrics_missing")
+    for metric_name, path, _direction in CURVED_NUMERIC_COMPARISON_METRICS:
+        value = _nested_value(summary, path)
+        if value is None:
+            reasons.append(f"required_metric_missing:{metric_name}")
+        elif not _is_finite_number(value):
+            reasons.append(f"required_metric_nonfinite:{metric_name}")
+    for metric_name, path in CURVED_BOOLEAN_COMPARISON_FIELDS:
+        value = _nested_value(summary, path)
+        if not isinstance(value, bool):
+            reasons.append(f"required_boolean_metric_missing:{metric_name}")
+    details["role"] = role
+    details["unavailable_reasons"] = lumen.get("unavailable_reasons", [])
+    return {
+        "valid": not _unique_strings(reasons),
+        "reasons": _unique_strings(reasons),
+        "details": details,
+        "values": values,
+    }
+
+
+def _validate_required_curved_field(
+    field_name: str,
+    value: Any,
+    *,
+    kind: str,
+    reasons: list[str],
+    values: dict[str, Any],
+    details: dict[str, Any],
+    vector_length: int | None = None,
+) -> None:
+    if value is None or (isinstance(value, str) and value == ""):
+        reasons.append(f"required_curved_identity_missing:{field_name}")
+        return
+    if kind == "string":
+        if not isinstance(value, str):
+            reasons.append(f"required_curved_identity_malformed:{field_name}")
+            return
+        values[field_name] = value
+        return
+    if kind == "bool":
+        if not isinstance(value, bool):
+            reasons.append(f"required_curved_identity_malformed:{field_name}")
+            return
+        values[field_name] = value
+        return
+    if kind == "number":
+        if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
+            reasons.append(f"required_curved_identity_malformed:{field_name}")
+            return
+        if not _is_finite_number(value):
+            reasons.append(f"required_curved_identity_nonfinite:{field_name}")
+            return
+        values[field_name] = float(value)
+        return
+    if kind == "vector":
+        try:
+            array = np.asarray(value, dtype=float)
+        except (TypeError, ValueError):
+            reasons.append(f"required_curved_identity_malformed:{field_name}")
+            return
+        if vector_length is not None and array.shape != (vector_length,):
+            reasons.append(f"required_curved_identity_malformed:{field_name}")
+            return
+        if not np.all(np.isfinite(array)):
+            reasons.append(f"required_curved_identity_nonfinite:{field_name}")
+            return
+        values[field_name] = array.tolist()
+        return
+    raise ValueError(f"unsupported curved required-field kind: {kind}")
+
+
+def _curved_compatibility_report(
+    *,
+    candidate_summary: dict[str, Any],
+    baseline_summary: dict[str, Any],
+    candidate_metadata: dict[str, Any],
+    baseline_metadata: dict[str, Any],
+    candidate_validity: dict[str, Any],
+    baseline_validity: dict[str, Any],
+    duration_tolerance: float,
+    initial_state_tolerance: float,
+) -> dict[str, Any]:
+    reasons: list[str] = []
+    details: list[dict[str, Any]] = []
+    candidate_lumen = candidate_summary.get("lumen_evaluation", {}) if isinstance(candidate_summary, dict) else {}
+    baseline_lumen = baseline_summary.get("lumen_evaluation", {}) if isinstance(baseline_summary, dict) else {}
+    candidate_identity = candidate_lumen.get("identity", {}) if isinstance(candidate_lumen, dict) else {}
+    baseline_identity = baseline_lumen.get("identity", {}) if isinstance(baseline_lumen, dict) else {}
+
+    candidate_values = candidate_validity.get("values", {})
+    baseline_values = baseline_validity.get("values", {})
+    required_fields = (
+        "geometry.fingerprint",
+        "target_tolerance",
+        "evaluation_window_duration_s",
+        "configuration.model_configuration_hash",
+        "configuration.frame_id",
+        "configuration.software_mode",
+        "configuration.configured_control_period",
+        "configuration.reference_sample_period",
+        "geometry.ctr_outer_radius_m",
+        "geometry.safety_margin_m",
+        "geometry.minimum_lumen_radius_m",
+        "geometry.maximum_lumen_radius_m",
+        "initial_state_q",
+        "initial_tip_position",
+    )
+    for field_name in required_fields:
+        candidate_value = candidate_values.get(field_name)
+        baseline_value = baseline_values.get(field_name)
+        if candidate_value is None or baseline_value is None:
+            reasons.append(f"required_curved_identity_unavailable:{field_name}")
+            details.append(
+                _mismatch_detail(
+                    "required_curved_identity_unavailable",
+                    field_name,
+                    baseline_value,
+                    candidate_value,
+                )
+            )
             continue
-        direction = METRIC_DIRECTIONS[name]
-        baseline_value = baseline_pairs[name]
+        tolerance = (
+            duration_tolerance
+            if field_name == "evaluation_window_duration_s"
+            else initial_state_tolerance
+            if field_name in {"initial_state_q", "initial_tip_position"}
+            else TARGET_IDENTITY_ATOL
+            if field_name in {
+                "target_tolerance",
+                "configuration.configured_control_period",
+                "configuration.reference_sample_period",
+                "geometry.ctr_outer_radius_m",
+                "geometry.safety_margin_m",
+                "geometry.minimum_lumen_radius_m",
+                "geometry.maximum_lumen_radius_m",
+            }
+            else None
+        )
+        if not _values_match(candidate_value, baseline_value, tolerance=tolerance):
+            code = "duration_mismatch" if field_name == "evaluation_window_duration_s" else (
+                "shared_environment_hash_mismatch"
+                if field_name == "shared_environment_hash"
+                else "geometry_fingerprint_mismatch"
+                if field_name == "geometry.fingerprint"
+                else "simulator_config_mismatch"
+                if field_name.startswith("configuration.")
+                else f"{field_name}_mismatch"
+            )
+            reasons.append(code)
+            details.append(_mismatch_detail(code, field_name, baseline_value, candidate_value, tolerance))
+
+    for field_name in CURVED_IDENTITY_FIELDS:
+        candidate_value = _curved_identity_value(field_name, candidate_identity, candidate_metadata)
+        baseline_value = _curved_identity_value(field_name, baseline_identity, baseline_metadata)
+        tolerance = TARGET_IDENTITY_ATOL if field_name in {"derived_target", "requested_target", "executed_target"} else None
+        if not _values_match(candidate_value, baseline_value, tolerance=tolerance):
+            code = _curved_mismatch_code(field_name)
+            reasons.append(code)
+            details.append(_mismatch_detail(code, field_name, baseline_value, candidate_value, tolerance))
+
+    candidate_schema = candidate_lumen.get("schema_version") if isinstance(candidate_lumen, dict) else None
+    baseline_schema = baseline_lumen.get("schema_version") if isinstance(baseline_lumen, dict) else None
+    if candidate_schema != baseline_schema:
+        reasons.append("lumen_schema_mismatch")
+        details.append(_mismatch_detail("lumen_schema_mismatch", "lumen_evaluation.schema_version", baseline_schema, candidate_schema))
+
+    candidate_summary_schema = candidate_summary.get("schema_version") if isinstance(candidate_summary, dict) else None
+    baseline_summary_schema = baseline_summary.get("schema_version") if isinstance(baseline_summary, dict) else None
+    if candidate_summary_schema is not None or baseline_summary_schema is not None:
+        if candidate_summary_schema != baseline_summary_schema:
+            reasons.append("summary_schema_mismatch")
+            details.append(_mismatch_detail("summary_schema_mismatch", "summary.schema_version", baseline_summary_schema, candidate_summary_schema))
+
+    candidate_target_tolerance = _target_tolerance(candidate_metadata)
+    baseline_target_tolerance = _target_tolerance(baseline_metadata)
+    if not _values_match(candidate_target_tolerance, baseline_target_tolerance, tolerance=TARGET_IDENTITY_ATOL):
+        reasons.append("target_tolerance_mismatch")
+        details.append(_mismatch_detail("target_tolerance_mismatch", "configuration.goal.tolerance", baseline_target_tolerance, candidate_target_tolerance, TARGET_IDENTITY_ATOL))
+
+    for field_name, path in (
+        ("ctr_outer_radius_m", ("geometry", "ctr_outer_radius_m")),
+        ("safety_margin_m", ("geometry", "safety_margin_m")),
+    ):
+        candidate_value = _nested_value(candidate_lumen, path)
+        baseline_value = _nested_value(baseline_lumen, path)
+        if candidate_value is None or baseline_value is None:
+            continue
+        if not _values_match(candidate_value, baseline_value, tolerance=TARGET_IDENTITY_ATOL):
+            reasons.append("geometry_fingerprint_mismatch")
+            details.append(_mismatch_detail("geometry_fingerprint_mismatch", f"lumen_evaluation.{field_name}", baseline_value, candidate_value, TARGET_IDENTITY_ATOL))
+
+    for field_name, candidate_value, baseline_value in (
+        ("evaluation_window_duration_s", candidate_metadata.get("evaluation_window_duration_s"), baseline_metadata.get("evaluation_window_duration_s")),
+        ("actual_evaluation_window_duration_s", candidate_metadata.get("actual_evaluation_window_duration_s"), baseline_metadata.get("actual_evaluation_window_duration_s")),
+    ):
+        if candidate_value is not None and baseline_value is not None and not _values_match(candidate_value, baseline_value, tolerance=duration_tolerance):
+            reasons.append("duration_mismatch")
+            details.append(_mismatch_detail("duration_mismatch", field_name, baseline_value, candidate_value, duration_tolerance))
+
+    return {"reasons": _unique_strings(reasons), "details": details}
+
+
+def _curved_metric_comparisons(*, candidate_summary: dict[str, Any], baseline_summary: dict[str, Any], near_zero_epsilon: float) -> list[MetricComparison]:
+    comparisons: list[MetricComparison] = []
+    for name, path, direction in CURVED_NUMERIC_COMPARISON_METRICS:
+        candidate_value = float(_nested_value(candidate_summary, path))
+        baseline_value = float(_nested_value(baseline_summary, path))
         improvement, valid, reason = relative_improvement_percent(
             candidate_value=candidate_value,
             baseline_value=baseline_value,
             lower_is_better=direction == "lower",
             near_zero_epsilon=near_zero_epsilon,
         )
-        if not compatibility_valid:
-            valid = False
-            reason = "; ".join(compatibility_reasons)
-            improvement = None
         comparisons.append(
             MetricComparison(
                 metric=name,
                 direction=direction,
-                candidate_value=float(candidate_value),
-                baseline_value=float(baseline_value),
-                absolute_difference=float(candidate_value - baseline_value),
+                candidate_value=candidate_value,
+                baseline_value=baseline_value,
+                absolute_difference=candidate_value - baseline_value,
                 relative_improvement_percent=improvement,
-                comparison_valid=bool(valid),
-                compatibility_valid=compatibility_valid,
+                comparison_valid=valid,
+                compatibility_valid=True,
                 reason=reason,
             )
         )
-    return ComparisonResult(
-        compatibility_valid=compatibility_valid,
-        compatibility_reasons=compatibility_reasons,
-        compatibility_details=compatibility["details"],
-        metric_comparisons=comparisons,
-    )
+    return comparisons
+
+
+def _curved_boolean_comparisons(candidate_summary: dict[str, Any], baseline_summary: dict[str, Any]) -> list[BooleanMetricComparison]:
+    comparisons: list[BooleanMetricComparison] = []
+    for name, path in CURVED_BOOLEAN_COMPARISON_FIELDS:
+        candidate_value = _nested_value(candidate_summary, path)
+        baseline_value = _nested_value(baseline_summary, path)
+        improved = candidate_value and not baseline_value
+        comparisons.append(
+            BooleanMetricComparison(
+                metric=name,
+                candidate_value=candidate_value,
+                baseline_value=baseline_value,
+                comparison_valid=True,
+                improved=bool(improved) if isinstance(improved, bool) else None,
+                reason="ok",
+            )
+        )
+    return comparisons
+
+
+def _curved_identity_value(field_name: str, identity: dict[str, Any], metadata: dict[str, Any]) -> Any:
+    if field_name == "task":
+        return metadata.get("task")
+    if field_name in identity:
+        return identity.get(field_name)
+    return metadata.get(field_name)
+
+
+def _curved_mismatch_code(field_name: str) -> str:
+    return {
+        "task": "task_mismatch",
+        "reference_mode": "reference_mode_mismatch",
+        "curved_lumen_type": "curved_lumen_type_mismatch",
+        "scenario_id": "scenario_id_mismatch",
+        "scenario_policy_version": "scenario_policy_version_mismatch",
+        "scenario_fingerprint": "scenario_fingerprint_mismatch",
+        "geometry_frame": "geometry_frame_mismatch",
+        "geometry_fingerprint": "geometry_fingerprint_mismatch",
+        "expected_geometry_fingerprint": "geometry_fingerprint_mismatch",
+        "reconstructed_geometry_fingerprint": "geometry_fingerprint_mismatch",
+        "geometry_fingerprint_match": "geometry_fingerprint_not_valid",
+        "shared_environment_hash": "shared_environment_hash_mismatch",
+        "derived_target": "derived_target_mismatch",
+        "requested_target": "requested_target_mismatch",
+        "executed_target": "executed_target_mismatch",
+        "override_used": "override_state_mismatch",
+    }[field_name]
+
+
+def _mismatch_detail(code: str, field: str, baseline: Any, candidate: Any, tolerance: float | None = None) -> dict[str, Any]:
+    detail = {"code": code, "field": field, "baseline": sanitize_for_json(baseline), "candidate": sanitize_for_json(candidate)}
+    if tolerance is not None:
+        detail["tolerance"] = float(tolerance)
+    return detail
+
+
+def _nested_value(value: Any, path: tuple[str, ...]) -> Any:
+    current = value
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return None
+        current = current[key]
+    return current
+
+
+def _configuration_value(metadata: dict[str, Any], key: str) -> Any:
+    configuration = metadata.get("configuration", {})
+    return configuration.get(key) if isinstance(configuration, dict) else None
+
+
+def _target_tolerance(metadata: dict[str, Any]) -> Any:
+    configuration = metadata.get("configuration", {})
+    goal = configuration.get("goal", {}) if isinstance(configuration, dict) else {}
+    if isinstance(goal, dict) and goal.get("tolerance") is not None:
+        return goal.get("tolerance")
+    return metadata.get("target_identity_tolerance")
+
+
+def _values_match(candidate: Any, baseline: Any, *, tolerance: float | None) -> bool:
+    if candidate is None or baseline is None:
+        return candidate is baseline
+    if tolerance is None:
+        return candidate == baseline
+    try:
+        candidate_array = np.asarray(candidate, dtype=float)
+        baseline_array = np.asarray(baseline, dtype=float)
+        if candidate_array.shape != baseline_array.shape or not np.all(np.isfinite(candidate_array)) or not np.all(np.isfinite(baseline_array)):
+            return False
+        return bool(np.allclose(candidate_array, baseline_array, atol=tolerance, rtol=0.0))
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_finite_number(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float, np.integer, np.floating)) and math.isfinite(float(value))
+
+
+def _unique_strings(values: Iterable[str]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        if value not in result:
+            result.append(value)
+    return result
 
 
 def relative_improvement_percent(
