@@ -93,10 +93,13 @@ def generate_report(
 
     if comparison is not None:
         lines.extend(["", "## Baseline Comparison", ""])
+        comparison_valid = bool(comparison.get("comparison_valid", comparison.get("compatibility_valid", False)))
         if not comparison.get("compatibility_valid", False):
             lines.append("Comparison is not compatibility-valid.")
             for reason in comparison.get("compatibility_reasons", []):
                 lines.append(f"- {reason}")
+        if not comparison_valid:
+            lines.append("Comparison is not valid; improvement was not evaluated.")
         details = comparison.get("compatibility_details", {})
         if details:
             lines.extend(["", "Compatibility details:"])

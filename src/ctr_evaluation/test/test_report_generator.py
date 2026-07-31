@@ -95,6 +95,7 @@ class ReportGeneratorTest(unittest.TestCase):
                 },
                 comparison={
                     "compatibility_valid": True,
+                    "comparison_valid": True,
                     "compatibility_reasons": [],
                     "metric_comparisons": [
                         {
@@ -114,6 +115,56 @@ class ReportGeneratorTest(unittest.TestCase):
             self.assertIn("Topic Status", text)
             self.assertIn("Baseline Comparison", text)
             self.assertIn("Warnings And Limitations", text)
+
+    def test_invalid_comparison_is_reported_without_improvement_claim(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            report = generate_report(
+                run_dir=run_dir,
+                metadata={},
+                summary={},
+                comparison={
+                    "compatibility_valid": True,
+                    "comparison_valid": False,
+                    "improvement_evaluated": False,
+                    "improvement_pass": None,
+                    "compatibility_reasons": [],
+                    "metric_comparisons": [],
+                },
+                plot_paths=[],
+            )
+            text = report.read_text(encoding="utf-8")
+            self.assertIn("Comparison is not valid; improvement was not evaluated.", text)
+            self.assertNotIn("candidate improved", text.lower())
+
+    def test_legacy_comparison_without_validity_field_uses_compatibility_fallback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            report = generate_report(
+                run_dir=run_dir,
+                metadata={},
+                summary={},
+                comparison={
+                    "compatibility_valid": True,
+                    "compatibility_reasons": [],
+                    "metric_comparisons": [
+                        {
+                            "metric": "rmse",
+                            "candidate_value": 0.1,
+                            "baseline_value": 0.2,
+                            "absolute_difference": -0.1,
+                            "relative_improvement_percent": 50.0,
+                            "comparison_valid": True,
+                        }
+                    ],
+                },
+                plot_paths=[],
+            )
+            text = report.read_text(encoding="utf-8")
+            self.assertIn("Baseline Comparison", text)
+            self.assertIn("| rmse | 0.1 | 0.2 | -0.1 | 50 | True |", text)
+            self.assertNotIn("Comparison is not compatibility-valid.", text)
+            self.assertNotIn("Comparison is not valid; improvement was not evaluated.", text)
 
 
 if __name__ == "__main__":

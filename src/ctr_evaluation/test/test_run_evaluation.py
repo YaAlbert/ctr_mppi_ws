@@ -455,7 +455,9 @@ class RunEvaluationHelpersTest(unittest.TestCase):
         self.assertEqual(first, second)
 
     def test_default_cli_success_allows_worse_performance(self):
-        original = patch_fake_orchestrator({"comparison": {"compatibility_valid": True}, "baseline_improvement_pass": False})
+        original = patch_fake_orchestrator(
+            {"comparison": {"compatibility_valid": True, "comparison_valid": True}, "baseline_improvement_pass": False}
+        )
         try:
             code = main(["--experiment-group", "g", "--duration", "12.0"])
         finally:
@@ -463,7 +465,9 @@ class RunEvaluationHelpersTest(unittest.TestCase):
         self.assertEqual(0, code)
 
     def test_require_improvement_returns_nonzero_for_valid_worse_performance(self):
-        original = patch_fake_orchestrator({"comparison": {"compatibility_valid": True}, "baseline_improvement_pass": False})
+        original = patch_fake_orchestrator(
+            {"comparison": {"compatibility_valid": True, "comparison_valid": True}, "baseline_improvement_pass": False}
+        )
         try:
             code = main(["--experiment-group", "g", "--duration", "12.0", "--require-improvement"])
         finally:
@@ -471,9 +475,21 @@ class RunEvaluationHelpersTest(unittest.TestCase):
         self.assertEqual(4, code)
 
     def test_invalid_comparison_returns_nonzero(self):
-        original = patch_fake_orchestrator({"comparison": {"compatibility_valid": False}, "baseline_improvement_pass": True})
+        original = patch_fake_orchestrator(
+            {"comparison": {"compatibility_valid": True, "comparison_valid": False}, "baseline_improvement_pass": True}
+        )
         try:
             code = main(["--experiment-group", "g", "--duration", "12.0"])
+        finally:
+            restore_orchestrator(original)
+        self.assertEqual(3, code)
+
+    def test_require_improvement_rejects_identity_compatible_invalid_comparison(self):
+        original = patch_fake_orchestrator(
+            {"comparison": {"compatibility_valid": True, "comparison_valid": False}, "baseline_improvement_pass": True}
+        )
+        try:
+            code = main(["--experiment-group", "g", "--duration", "12.0", "--require-improvement"])
         finally:
             restore_orchestrator(original)
         self.assertEqual(3, code)

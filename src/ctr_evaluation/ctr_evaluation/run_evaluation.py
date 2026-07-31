@@ -237,9 +237,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ctr_run_evaluation failed: {exc}\n{trace}")
         return 2
 
-    comparison_valid = bool(result["comparison"].get("compatibility_valid", False))
+    comparison_valid = bool(result["comparison"].get("comparison_valid", False))
     if not comparison_valid:
-        print("ctr_run_evaluation failed: comparison is not compatibility-valid")
+        print("ctr_run_evaluation failed: comparison is not valid")
         return 3
     if args.require_improvement and not result["baseline_improvement_pass"]:
         print("ctr_run_evaluation failed: --require-improvement was set and baseline_improvement_pass is false")
@@ -354,7 +354,7 @@ class EvaluationOrchestrator:
             initial_state_tolerance=self.settings.baseline_candidate_q_tolerance,
             near_zero_epsilon=float(self.project_config["evaluation"]["near_zero_baseline_epsilon"]),
         )
-        candidate.orchestration["comparison_valid"] = comparison.get("compatibility_valid", False)
+        candidate.orchestration["comparison_valid"] = comparison.get("comparison_valid", False)
         write_json(candidate.run_dir / "orchestration.json", candidate.orchestration)
         candidate_summary = read_json(candidate.run_dir / "summary.json")
         baseline_improvement_pass = bool(candidate_summary.get("acceptance", {}).get("baseline_improvement_pass", False))
@@ -364,7 +364,7 @@ class EvaluationOrchestrator:
             "baseline_dir": str(baseline.run_dir),
             "candidate_dir": str(candidate.run_dir),
             "comparison": comparison,
-            "comparison_valid": bool(comparison.get("compatibility_valid", False)),
+            "comparison_valid": bool(comparison.get("comparison_valid", False)),
             "baseline_improvement_pass": baseline_improvement_pass,
             "timing_pass": bool(candidate_summary.get("acceptance", {}).get("timing_pass", False)),
             "real_time_pass": bool(candidate_summary.get("acceptance", {}).get("real_time_pass", False)),
