@@ -23,6 +23,12 @@ import yaml
 
 from ctr_bringup.parameter_validation import load_parameter_files, validate_config_paths, validate_or_raise
 from ctr_evaluation.compare_results import compare_result_dirs, read_json, write_json
+from ctr_evaluation.curved_lumen_scenarios import (
+    CENTERLINE_TARGET,
+    CURVED_LUMEN_SCENARIO_IDS,
+    CurvedLumenScenario,
+    resolve_curved_lumen_scenario,
+)
 from ctr_evaluation.metrics import sanitize_for_json, stable_hash
 from ctr_model.approximate_model import ApproximateCTRModel
 from ctr_mppi_controller.cylindrical_lumen import (
@@ -31,8 +37,17 @@ from ctr_mppi_controller.cylindrical_lumen import (
     goal_position_from_config,
     goal_tolerance_from_config,
 )
+from ctr_mppi_controller.lumen_factory import CURVED_LUMEN_TYPES, config_with_lumen_overrides
 from ctr_sim.simulation_core import CTRSimulationCore
 
+
+TASK_TRAJECTORY = "trajectory"
+TASK_CYLINDER_NAVIGATION = "cylinder_navigation"
+TASK_CURVED_LUMEN_NAVIGATION = "curved_lumen_navigation"
+TASK_CHOICES = (TASK_TRAJECTORY, TASK_CYLINDER_NAVIGATION, TASK_CURVED_LUMEN_NAVIGATION)
+FIXED_TARGET_TASKS = (TASK_CYLINDER_NAVIGATION, TASK_CURVED_LUMEN_NAVIGATION)
+DEFAULT_CURVED_LUMEN_TYPE = "circular_arc"
+DEFAULT_CURVED_SCENARIO = CENTERLINE_TARGET
 
 CONFIG_NAMES = (
     "robot_params.yaml",
@@ -186,8 +201,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a deterministic zero-command baseline and MPPI candidate evaluation pair.")
     parser.add_argument("--experiment-group", required=True)
     parser.add_argument("--trajectory", default="circle", choices=("circle", "ellipse", "helix"))
-    parser.add_argument("--task", default="trajectory", choices=("trajectory", "cylinder_navigation"))
+    parser.add_argument("--task", default=TASK_TRAJECTORY, choices=TASK_CHOICES)
     parser.add_argument("--target", nargs=3, type=float, default=None)
+    parser.add_argument("--curved-lumen-type", choices=CURVED_LUMEN_TYPES, default=None)
+    parser.add_argument("--scenario", choices=CURVED_LUMEN_SCENARIO_IDS, default=None)
     parser.add_argument("--mppi-profile", default="")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--baseline", default="zero_command")
@@ -231,39 +248,100 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def is_fixed_target_task(task: str) -> bool:
+    return task in FIXED_TARGET_TASKS
+
+
+def is_curved_lumen_task(task: str) -> bool:
+    return task == TASK_CURVED_LUMEN_NAVIGATION
+
+
+def reference_mode_for_task(task: str) -> str:
+    return "fixed_target" if is_fixed_target_task(task) else "trajectory"
+
+
+def validate_task_options(args: argparse.Namespace) -> None:
+    if not is_curved_lumen_task(args.task):
+        if args.curved_lumen_type is not None:
+            raise OrchestrationError("--curved-lumen-type is only valid with --task curved_lumen_navigation")
+        if args.scenario is not None:
+            raise OrchestrationError("--scenario is only valid with --task curved_lumen_navigation")
+
+
 class EvaluationOrchestrator:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         if not math.isfinite(args.duration) or args.duration <= 0.0:
             raise OrchestrationError("--duration must be positive and finite")
+        validate_task_options(args)
         self.experiment_group = validate_experiment_group(args.experiment_group)
         self.config_paths = default_config_paths(args.config_path)
         raw_config = load_parameter_files(self.config_paths)
-        self.project_config = config_with_cylinder_overrides(
-            raw_config,
-            enabled=args.task == "cylinder_navigation",
-            target_position=args.target,
-            mppi_profile=args.mppi_profile,
-            random_seed="" if args.seed is None else args.seed,
-        )
+        self.curved_lumen_type = args.curved_lumen_type or DEFAULT_CURVED_LUMEN_TYPE
+        self.curved_scenario_id = args.scenario or DEFAULT_CURVED_SCENARIO
+        self.curved_scenario: CurvedLumenScenario | None = None
+        if is_curved_lumen_task(args.task):
+            self.project_config = self._resolve_curved_project_config(raw_config)
+        else:
+            self.project_config = config_with_cylinder_overrides(
+                raw_config,
+                enabled=args.task == TASK_CYLINDER_NAVIGATION,
+                target_position=args.target,
+                mppi_profile=args.mppi_profile,
+                random_seed="" if args.seed is None else args.seed,
+            )
         validate_or_raise(self.project_config)
         self.output_root = output_root_from_config(self.project_config, args.output_root)
         self.settings = orchestration_settings_from_config(self.project_config)
         self.orchestration_id = f"m5d1_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}"
         self.process_manager = ProcessManager(Path.cwd())
         self.used_domain_ids: set[int] = set()
-        self.cylinder_setup = self._validate_cylinder_setup() if args.task == "cylinder_navigation" else {}
+        self.cylinder_setup = self._validate_cylinder_setup() if args.task == TASK_CYLINDER_NAVIGATION else {}
+
+    def _resolve_curved_project_config(self, raw_config: dict[str, Any]) -> dict[str, Any]:
+        reference = raw_config.get("reference", {})
+        configured_mode = str(reference.get("mode", "fixed_target")) if isinstance(reference, dict) else ""
+        if configured_mode != "fixed_target":
+            raise OrchestrationError(
+                "curved_lumen_navigation requires reference.mode=fixed_target in the effective configuration"
+            )
+        effective_config = config_with_lumen_overrides(
+            raw_config,
+            enable_cylindrical_lumen=False,
+            enable_curved_lumen=True,
+            curved_lumen_type=self.curved_lumen_type,
+            cylinder_profile=self.args.mppi_profile,
+            random_seed="" if self.args.seed is None else self.args.seed,
+        )
+        effective_config.setdefault("reference", {})["mode"] = "fixed_target"
+        self.curved_scenario = resolve_curved_lumen_scenario(
+            effective_config,
+            self.curved_scenario_id,
+            target_override=self.args.target,
+            curved_lumen_type=self.curved_lumen_type,
+        )
+        effective_config = config_with_lumen_overrides(
+            effective_config,
+            enable_cylindrical_lumen=False,
+            enable_curved_lumen=True,
+            curved_lumen_type=self.curved_lumen_type,
+            cylinder_profile=self.args.mppi_profile,
+            target=self.curved_scenario.validated_target,
+            random_seed="" if self.args.seed is None else self.args.seed,
+        )
+        effective_config.setdefault("reference", {})["mode"] = "fixed_target"
+        return effective_config
 
     def run_pair(self) -> dict[str, Any]:
         baseline = self._run_one(role="baseline", controller_label=self.args.baseline, baseline_dir=None)
-        if self.args.task == "cylinder_navigation":
+        if is_fixed_target_task(self.args.task):
             validate_target_identity_metadata(
                 {**baseline.metadata, **baseline.orchestration},
                 expected_target=self._target_position_for_launch(),
                 label="baseline",
             )
         candidate = self._run_one(role="candidate", controller_label=self.args.candidate, baseline_dir=baseline.run_dir)
-        if self.args.task == "cylinder_navigation":
+        if is_fixed_target_task(self.args.task):
             validate_target_identity_metadata(
                 {**candidate.metadata, **candidate.orchestration},
                 expected_target=self._target_position_for_launch(),
@@ -307,6 +385,7 @@ class EvaluationOrchestrator:
                 output_root=self.output_root,
                 task=self.args.task,
                 target_position=self._target_position_for_launch(),
+                curved_lumen_type=self.curved_lumen_type,
                 mppi_profile=self.args.mppi_profile,
                 random_seed=self.args.seed,
                 run_role=role,
@@ -359,50 +438,21 @@ class EvaluationOrchestrator:
             if started_run_id != run_id:
                 raise OrchestrationError(f"evaluator started unexpected run ID {started_run_id}; expected {run_id}")
 
-            reference_mode = "fixed_target" if self.args.task == "cylinder_navigation" else "trajectory"
-            reference_command = [
-                "ros2",
-                "launch",
-                "ctr_bringup",
-                "evaluation_reference.launch.py",
-                "runtime_mode:=simulation",
-                f"reference_mode:={reference_mode}",
-                f"reference_type:={self.args.trajectory}",
-            ]
-            if self.args.task == "trajectory":
-                reference_command.extend(
-                    [
-                        "trajectory_start_policy:=scheduled_time",
-                        f"scheduled_reference_epoch:={reference_epoch:.9f}",
-                    ]
-                )
-            else:
-                reference_command.extend(self._cylinder_launch_arguments())
+            reference_command = self._reference_command(reference_epoch)
             records.append(self.process_manager.start(role=f"{role}_reference", command=reference_command, env=env))
-            monitor.wait_for_reference(self.settings.reference_ready_timeout, require_horizon=self.args.task == "trajectory")
-            if self.args.task == "cylinder_navigation":
+            monitor.wait_for_reference(self.settings.reference_ready_timeout, require_horizon=self.args.task == TASK_TRAJECTORY)
+            if is_fixed_target_task(self.args.task):
                 monitor.verify_fixed_reference_target(self._target_position_for_launch(), TARGET_IDENTITY_ATOL)
-            if role == "baseline" and self.args.task == "trajectory":
+            if role == "baseline" and self.args.task == TASK_TRAJECTORY:
                 monitor.verify_pre_epoch_reference(
                     reference_epoch,
                     self.settings.reference_ready_timeout,
                     expected_first_point=expected_first_reference_point(self.project_config, self.args.trajectory),
                 )
             if role == "candidate":
-                if self.args.task == "cylinder_navigation":
+                if is_fixed_target_task(self.args.task):
                     monitor.spin_until_time(reference_epoch)
-                controller_command = [
-                    "ros2",
-                    "launch",
-                    "ctr_bringup",
-                    "evaluation_mppi_controller.launch.py",
-                    "runtime_mode:=simulation",
-                    f"reference_mode:={reference_mode}",
-                    f"reference_type:={self.args.trajectory}",
-                    "publish_safe_command_for_simulation:=true",
-                ]
-                if self.args.task == "cylinder_navigation":
-                    controller_command.extend(self._cylinder_launch_arguments())
+                controller_command = self._controller_command()
                 records.append(self.process_manager.start(role=f"{role}_controller", command=controller_command, env=env))
                 first_command = monitor.wait_for_first_command(self.settings.startup_timeout)
                 if self.settings.require_recording_before_candidate_command and first_command.timestamp < recording_start_time:
@@ -491,12 +541,17 @@ class EvaluationOrchestrator:
         records: list[ProcessRecord],
     ) -> dict[str, Any]:
         reference_config = self.project_config["reference"]
+        reference_mode = reference_mode_for_task(self.args.task)
+        reference_start_policy = "fixed_target_window_epoch" if is_fixed_target_task(self.args.task) else "scheduled_time"
+        reference_pre_epoch_behavior = "fixed_target_ready" if is_fixed_target_task(self.args.task) else "first_trajectory_point"
+        policy_reference_start = "fixed_target_window_epoch" if is_curved_lumen_task(self.args.task) else "scheduled_time"
+        policy_pre_epoch = "fixed_target_ready" if is_curved_lumen_task(self.args.task) else "first_trajectory_point"
         orchestration_policy = {
             "initial_stability_duration": self.settings.initial_stability_duration,
             "initial_stability_samples": self.settings.initial_stability_samples,
             "reference_lead_time": self.settings.reference_lead_time,
-            "reference_start_policy": "scheduled_time",
-            "reference_pre_epoch_behavior": "first_trajectory_point",
+            "reference_start_policy": policy_reference_start,
+            "reference_pre_epoch_behavior": policy_pre_epoch,
             "formal_window": "reference_epoch_to_reference_epoch_plus_duration",
         }
         shared_environment_hash = build_shared_environment_hash(
@@ -505,10 +560,9 @@ class EvaluationOrchestrator:
             trajectory=self.args.trajectory,
             duration=self.args.duration,
             reference_lead_time=self.settings.reference_lead_time,
+            curved_scenario=self.curved_scenario,
         )
         controller_hash = build_controller_configuration_hash(self.project_config, controller_label)
-        reference_start_policy = "fixed_target_window_epoch" if self.args.task == "cylinder_navigation" else "scheduled_time"
-        reference_pre_epoch_behavior = "fixed_target_ready" if self.args.task == "cylinder_navigation" else "first_trajectory_point"
         target_identity = self._target_identity_metadata()
         return {
             "requested_run_id": run_id,
@@ -547,15 +601,16 @@ class EvaluationOrchestrator:
             **target_identity,
             "reference_configuration": {
                 "task": self.args.task,
-                "reference_mode": "fixed_target" if self.args.task == "cylinder_navigation" else "trajectory",
+                "reference_mode": reference_mode,
                 "trajectory_type": self.args.trajectory,
                 "trajectory_parameters": reference_config.get(self.args.trajectory, {}),
                 "sample_period": reference_config.get("sample_period"),
                 "frame_id": reference_config.get("frame_id"),
                 "loop": reference_config.get("loop"),
                 "completion_behavior": reference_config.get("completion_behavior"),
-                "goal_position": None if self.args.task != "cylinder_navigation" else self._target_position_for_launch(),
+                "goal_position": None if not is_fixed_target_task(self.args.task) else self._target_position_for_launch(),
                 "cylinder_setup": self.cylinder_setup,
+                "curved_scenario": None if self.curved_scenario is None else self._curved_scenario_identity_metadata(),
                 "reference_window_policy": reference_start_policy,
             },
             "processes_at_start": [record.to_dict() for record in records],
@@ -563,12 +618,18 @@ class EvaluationOrchestrator:
         }
 
     def _target_position_for_launch(self) -> list[float]:
-        if self.args.task != "cylinder_navigation":
-            return []
-        return [float(value) for value in goal_position_from_config(self.project_config)]
+        if self.args.task == TASK_CYLINDER_NAVIGATION:
+            return [float(value) for value in goal_position_from_config(self.project_config)]
+        if is_curved_lumen_task(self.args.task):
+            if self.curved_scenario is None:
+                raise OrchestrationError("curved_lumen_navigation target requested before scenario resolution")
+            return [float(value) for value in self.curved_scenario.validated_target]
+        return []
 
     def _target_identity_metadata(self) -> dict[str, Any]:
-        if self.args.task != "cylinder_navigation":
+        if is_curved_lumen_task(self.args.task):
+            return self._curved_scenario_identity_metadata()
+        if self.args.task != TASK_CYLINDER_NAVIGATION:
             return {}
         requested = self.cylinder_setup.get("requested_target", self._target_position_for_launch())
         executed = self.cylinder_setup.get("executed_target", self._target_position_for_launch())
@@ -591,6 +652,38 @@ class EvaluationOrchestrator:
                 identity[key] = reachability[key]
         return identity
 
+    def _curved_scenario_identity_metadata(self) -> dict[str, Any]:
+        if self.curved_scenario is None:
+            raise OrchestrationError("curved_lumen_navigation metadata requested before scenario resolution")
+        scenario = self.curved_scenario
+        requested = [float(value) for value in scenario.requested_target]
+        executed = [float(value) for value in scenario.validated_target]
+        return {
+            "requested_target": requested,
+            "executed_target": executed,
+            "validated_target": list(executed),
+            "derived_target": [float(value) for value in scenario.derived_target],
+            "target_replaced": False,
+            "target_identity_valid": True,
+            "target_identity_tolerance": TARGET_IDENTITY_ATOL,
+            "override_used": bool(scenario.override_used),
+            "target_override_used": bool(scenario.override_used),
+            "reference_mode": "fixed_target",
+            "curved_lumen_type": scenario.curved_lumen_type,
+            "scenario_id": scenario.scenario_id,
+            "scenario_policy_version": scenario.policy_version,
+            "scenario_fingerprint": scenario.scenario_fingerprint,
+            "geometry_frame": scenario.geometry_frame,
+            "geometry_fingerprint": scenario.geometry_fingerprint,
+            "centerline_fraction": float(scenario.centerline_fraction),
+            "centerline_arc_length": float(scenario.centerline_arc_length),
+            "radial_offset": float(scenario.radial_offset),
+            "local_radius": float(scenario.local_radius),
+            "preferred_radius": float(scenario.preferred_radius),
+            "boundary_guard": float(scenario.boundary_guard),
+            "near_boundary": bool(scenario.near_boundary),
+        }
+
     def _cylinder_launch_arguments(self) -> list[str]:
         target = self._target_position_for_launch()
         args = [
@@ -604,6 +697,64 @@ class EvaluationOrchestrator:
         if self.args.seed is not None:
             args.append(f"mppi_random_seed:={self.args.seed}")
         return args
+
+    def _fixed_target_launch_arguments(self) -> list[str]:
+        if self.args.task == TASK_CYLINDER_NAVIGATION:
+            return self._cylinder_launch_arguments()
+        if not is_curved_lumen_task(self.args.task):
+            raise OrchestrationError(f"{self.args.task} is not a fixed-target task")
+        target = self._target_position_for_launch()
+        args = [
+            "enable_cylindrical_lumen:=false",
+            "enable_curved_lumen:=true",
+            f"curved_lumen_type:={self.curved_lumen_type}",
+            f"cylinder_target_x:={target[0]:.9f}",
+            f"cylinder_target_y:={target[1]:.9f}",
+            f"cylinder_target_z:={target[2]:.9f}",
+        ]
+        if self.args.mppi_profile:
+            args.append(f"cylinder_profile:={self.args.mppi_profile}")
+        if self.args.seed is not None:
+            args.append(f"mppi_random_seed:={self.args.seed}")
+        return args
+
+    def _reference_command(self, reference_epoch: float) -> list[str]:
+        reference_mode = reference_mode_for_task(self.args.task)
+        command = [
+            "ros2",
+            "launch",
+            "ctr_bringup",
+            "evaluation_reference.launch.py",
+            "runtime_mode:=simulation",
+            f"reference_mode:={reference_mode}",
+            f"reference_type:={self.args.trajectory}",
+        ]
+        if self.args.task == TASK_TRAJECTORY:
+            command.extend(
+                [
+                    "trajectory_start_policy:=scheduled_time",
+                    f"scheduled_reference_epoch:={reference_epoch:.9f}",
+                ]
+            )
+        else:
+            command.extend(self._fixed_target_launch_arguments())
+        return command
+
+    def _controller_command(self) -> list[str]:
+        reference_mode = reference_mode_for_task(self.args.task)
+        command = [
+            "ros2",
+            "launch",
+            "ctr_bringup",
+            "evaluation_mppi_controller.launch.py",
+            "runtime_mode:=simulation",
+            f"reference_mode:={reference_mode}",
+            f"reference_type:={self.args.trajectory}",
+            "publish_safe_command_for_simulation:=true",
+        ]
+        if is_fixed_target_task(self.args.task):
+            command.extend(self._fixed_target_launch_arguments())
+        return command
 
     def _validate_cylinder_setup(self) -> dict[str, Any]:
         lumen = CylindricalLumen.from_config(self.project_config)
@@ -702,7 +853,7 @@ class EvaluationOrchestrator:
             "processes": [record.to_dict() for record in records],
         }
         runtime_metadata.update(self._target_identity_metadata())
-        if self.args.task == "cylinder_navigation":
+        if is_fixed_target_task(self.args.task):
             runtime_metadata.update(monitor.fixed_reference_target_identity(self._target_position_for_launch(), TARGET_IDENTITY_ATOL))
         return runtime_metadata
 
@@ -812,7 +963,7 @@ class RosRunMonitor:
         identity = self.fixed_reference_target_identity(expected_target, atol)
         if identity["reference_matches_requested_target"] is not True:
             raise OrchestrationError(
-                "published fixed reference target does not match requested cylinder target: "
+                "published fixed reference target does not match requested target: "
                 f"{identity}"
             )
 
@@ -1321,9 +1472,35 @@ def build_shared_environment_hash(
     trajectory: str,
     duration: float,
     reference_lead_time: float,
+    curved_scenario: CurvedLumenScenario | None = None,
 ) -> str:
     reference = config["reference"]
     robot = config["robot"]
+    if is_curved_lumen_task(task):
+        if curved_scenario is None:
+            raise OrchestrationError("curved_lumen_navigation shared environment hash requires a resolved scenario")
+        return stable_hash(
+            {
+                "task": task,
+                "model": config["model"],
+                "simulation": config["simulation"],
+                "reference": {
+                    "mode": "fixed_target",
+                    "sample_period": reference["sample_period"],
+                    "frame_id": reference["frame_id"],
+                    "loop": reference["loop"],
+                    "completion_behavior": reference["completion_behavior"],
+                    "duration": reference["duration"],
+                    "reference_lead_time": reference_lead_time,
+                },
+                "curved_lumen": config.get("curved_lumen", {}),
+                "goal": config.get("goal", {}),
+                "scenario": curved_scenario_hash_payload(curved_scenario),
+                "frames": robot["frames"],
+                "software_mode": "simulation",
+                "evaluation_window_duration": duration,
+            }
+        )
     cylinder = config.get("cylindrical_lumen", {}) if task == "cylinder_navigation" else None
     goal = config.get("goal", {}) if task == "cylinder_navigation" else None
     return stable_hash(
@@ -1351,6 +1528,22 @@ def build_shared_environment_hash(
     )
 
 
+def curved_scenario_hash_payload(scenario: CurvedLumenScenario) -> dict[str, Any]:
+    return {
+        "policy_version": scenario.policy_version,
+        "scenario_id": scenario.scenario_id,
+        "curved_lumen_type": scenario.curved_lumen_type,
+        "geometry_frame": scenario.geometry_frame,
+        "geometry_fingerprint": scenario.geometry_fingerprint,
+        "scenario_fingerprint": scenario.scenario_fingerprint,
+        "centerline_fraction": float(scenario.centerline_fraction),
+        "derived_target": [float(value) for value in scenario.derived_target],
+        "requested_target": [float(value) for value in scenario.requested_target],
+        "validated_target": [float(value) for value in scenario.validated_target],
+        "override_used": bool(scenario.override_used),
+    }
+
+
 def build_controller_configuration_hash(config: dict[str, Any], controller_label: str) -> str:
     return stable_hash({"controller_label": controller_label, "mppi": config["mppi"]})
 
@@ -1376,6 +1569,7 @@ def build_base_simulation_command(
     output_root: Path | None = None,
     task: str = "trajectory",
     target_position: list[float] | None = None,
+    curved_lumen_type: str = "",
     mppi_profile: str = "",
     random_seed: int | None = None,
     run_role: str = "",
@@ -1396,13 +1590,35 @@ def build_base_simulation_command(
     ]
     if output_root is not None:
         command.append(f"evaluation_output_root:={output_root}")
-    if task == "cylinder_navigation":
+    if task == TASK_CYLINDER_NAVIGATION:
         target = target_position or []
         if len(target) != 3:
             raise OrchestrationError("cylinder_navigation launch requires a 3D target position")
         command.extend(
             [
                 "enable_cylindrical_lumen:=true",
+                f"cylinder_target_x:={float(target[0]):.9f}",
+                f"cylinder_target_y:={float(target[1]):.9f}",
+                f"cylinder_target_z:={float(target[2]):.9f}",
+            ]
+        )
+        if mppi_profile:
+            command.append(f"cylinder_profile:={mppi_profile}")
+        if random_seed is not None:
+            command.append(f"mppi_random_seed:={int(random_seed)}")
+    elif is_curved_lumen_task(task):
+        lumen_type = curved_lumen_type or DEFAULT_CURVED_LUMEN_TYPE
+        if lumen_type not in CURVED_LUMEN_TYPES:
+            raise OrchestrationError(f"curved_lumen_navigation launch requires a supported curved lumen type: {lumen_type}")
+        target = target_position or []
+        if len(target) != 3:
+            raise OrchestrationError("curved_lumen_navigation launch requires a 3D target position")
+        command.extend(
+            [
+                "enable_cylindrical_lumen:=false",
+                "enable_curved_lumen:=true",
+                f"curved_lumen_type:={lumen_type}",
+                "reference_mode:=fixed_target",
                 f"cylinder_target_x:={float(target[0]):.9f}",
                 f"cylinder_target_y:={float(target[1]):.9f}",
                 f"cylinder_target_z:={float(target[2]):.9f}",
