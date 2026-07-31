@@ -11,12 +11,18 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+import tempfile
 import uuid
 from typing import Any
 
 import numpy as np
 import yaml
 
+from ctr_evaluation.curved_lumen_scenarios import (
+    CURVED_LUMEN_SCENARIO_IDS,
+    CURVED_SCENARIO_POLICY_VERSION,
+)
+from ctr_evaluation.lumen_metrics import LumenEvaluationMetrics, compute_lumen_evaluation_metrics
 from ctr_evaluation.metrics import (
     AcceptanceResults,
     ControlMetrics,
@@ -44,6 +50,13 @@ from ctr_mppi_controller.cylindrical_lumen import (
     goal_position_from_config,
     goal_tolerance_from_config,
 )
+from ctr_mppi_controller.lumen_factory import (
+    CURVED_LUMEN_TYPES,
+    config_with_lumen_overrides,
+    lumen_geometry_fingerprint,
+    lumen_geometry_fingerprint_payload,
+    lumen_geometry_from_config,
+)
 from ctr_evaluation.time_alignment import (
     AlignmentConfig,
     AlignmentResult,
@@ -64,6 +77,33 @@ STATE_IDLE = "IDLE"
 STATE_RECORDING = "RECORDING"
 STATE_FINALIZING = "FINALIZING"
 STATE_COMPLETED = "COMPLETED"
+
+TASK_CURVED_LUMEN_NAVIGATION = "curved_lumen_navigation"
+REFERENCE_MODE_FIXED_TARGET = "fixed_target"
+LUMEN_EVALUATION_SCHEMA_VERSION = "lumen_evaluation_v1"
+TIP_BACKBONE_CONSISTENCY_TOLERANCE = 1.0e-9
+LUMEN_EVALUATION_CSV_FIELDS = [
+    "timestamp_s",
+    "physical_clearance_m",
+    "safety_clearance_m",
+    "physical_collision",
+    "safety_margin_violation",
+    "selected_constraint_type",
+    "closest_backbone_index",
+    "wall_penetration_m",
+    "inlet_penetration_m",
+    "outlet_penetration_m",
+    "tip_centerline_x",
+    "tip_centerline_y",
+    "tip_centerline_z",
+    "tip_centerline_segment_index",
+    "tip_centerline_interpolation_fraction",
+    "centerline_arc_length_m",
+    "normalized_progress",
+    "tip_progress_out_of_extent",
+    "radial_offset_m",
+    "local_radius_m",
+]
 
 
 @dataclass(frozen=True)
@@ -249,6 +289,21 @@ class FinalizationResult:
     output_files: list[Path]
 
 
+@dataclass(frozen=True)
+class LumenBackboneData:
+    timestamps: np.ndarray
+    backbones: tuple[np.ndarray, ...]
+    tip_points: np.ndarray
+    data_quality: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class LumenRecorderResult:
+    required: bool
+    section: dict[str, Any] | None = None
+    csv_rows: tuple[dict[str, Any], ...] = ()
+
+
 class ExperimentRecorder:
     """Record experiment samples and finalize them into an evaluation run."""
 
@@ -388,7 +443,9 @@ class ExperimentRecorder:
                 else 0.0
             )
             self._write_raw_files(partial_dir)
-            summary = self._summary(alignment=alignment, metadata=metadata)
+            lumen_result = self._lumen_evaluation_result(alignment=alignment, metadata=metadata)
+            lumen_result = self._write_lumen_evaluation_csv_if_available(partial_dir, lumen_result)
+            summary = self._summary(alignment=alignment, metadata=metadata, lumen_result=lumen_result)
             write_yaml(partial_dir / "metadata.yaml", metadata)
             write_json(partial_dir / "summary.json", summary)
             write_aligned_csv(partial_dir / "aligned_samples.csv", alignment)
@@ -731,7 +788,13 @@ class ExperimentRecorder:
             return []
         return [sample for sample in self.states if window_start <= sample.timestamp <= window_end]
 
-    def _summary(self, *, alignment: AlignmentResult, metadata: dict[str, Any]) -> dict[str, Any]:
+    def _summary(
+        self,
+        *,
+        alignment: AlignmentResult,
+        metadata: dict[str, Any],
+        lumen_result: LumenRecorderResult | None = None,
+    ) -> dict[str, Any]:
         arrays = aligned_arrays(alignment.samples)
         timestamps = arrays["timestamps"]
         progress = arrays["reference_progress"]
@@ -824,6 +887,26 @@ class ExperimentRecorder:
                 goal_position=self.config.goal_position,
                 control=control,
             )
+        elif _is_curved_lumen_run(metadata):
+            curved_goal = _curved_executed_target(metadata)
+            if curved_goal is not None:
+                goal_metrics = compute_goal_metrics(
+                    times=timestamps,
+                    tip_positions=arrays["tip_positions"],
+                    goal_position=curved_goal,
+                    tolerance=_positive_number(self.project_config["goal"]["tolerance"], "goal.tolerance"),
+                    required_hold_duration=_nonnegative_number(
+                        self.project_config["goal"]["required_hold_duration"],
+                        "goal.required_hold_duration",
+                    ),
+                )
+                motion = compute_motion_metrics(
+                    times=timestamps,
+                    tip_positions=arrays["tip_positions"],
+                    q_values=arrays["q"],
+                    goal_position=curved_goal,
+                    control=control,
+                )
         acceptance = compute_acceptance(
             tracking=tracking,
             control=control,
@@ -853,6 +936,14 @@ class ExperimentRecorder:
             summary["motion"] = dataclass_to_plain(motion)
         summary["alignment_rejection_reasons"] = alignment.diagnostics.rejection_reasons
         summary["topic_status"] = self._topic_status()
+        if lumen_result is not None and lumen_result.required and lumen_result.section is not None:
+            summary["lumen_evaluation"] = lumen_result.section
+            summary["navigation"] = _curved_navigation_summary(lumen_result.section, goal_metrics)
+            summary["acceptance"] = _acceptance_with_curved_lumen(
+                summary["acceptance"],
+                lumen_result.section,
+                goal_metrics,
+            )
         return summary
 
     def _apply_baseline_acceptance(self, summary: dict[str, Any], comparison: dict[str, Any]) -> dict[str, Any]:
@@ -869,6 +960,189 @@ class ExperimentRecorder:
         acceptance["reasons"] = reasons
         updated["acceptance"] = acceptance
         return updated
+
+    def _lumen_evaluation_result(self, *, alignment: AlignmentResult, metadata: dict[str, Any]) -> LumenRecorderResult:
+        if not _has_curved_lumen_metadata(metadata):
+            return LumenRecorderResult(required=False)
+
+        identity, identity_reasons = _curved_lumen_identity(metadata)
+        data_quality = _base_lumen_data_quality(alignment.samples)
+        if identity_reasons:
+            return LumenRecorderResult(
+                required=True,
+                section=_unavailable_lumen_section(identity=identity, data_quality=data_quality, reasons=identity_reasons),
+            )
+
+        backbone_data, backbone_reasons = _curved_lumen_backbone_data(alignment.samples)
+        data_quality = backbone_data.data_quality
+        if backbone_reasons:
+            return LumenRecorderResult(
+                required=True,
+                section=_unavailable_lumen_section(identity=identity, data_quality=data_quality, reasons=backbone_reasons),
+            )
+
+        try:
+            geometry, geometry_payload, reconstructed_fingerprint = self._reconstruct_lumen_geometry(identity)
+        except Exception as exc:
+            return LumenRecorderResult(
+                required=True,
+                section=_unavailable_lumen_section(
+                    identity=identity,
+                    data_quality=data_quality,
+                    reasons=[f"geometry_construction_failed: {exc}"],
+                ),
+            )
+
+        expected_fingerprint = str(identity["geometry_fingerprint"])
+        geometry_frame = str(getattr(geometry, "frame_id", ""))
+        if geometry_frame != identity["geometry_frame"]:
+            updated = dict(identity)
+            updated["reconstructed_geometry_fingerprint"] = reconstructed_fingerprint
+            updated["geometry_fingerprint_match"] = False
+            return LumenRecorderResult(
+                required=True,
+                section=_unavailable_lumen_section(
+                    identity=updated,
+                    data_quality={**data_quality, "geometry_fingerprint_match": False},
+                    reasons=[
+                        "geometry_fingerprint_mismatch: reconstructed geometry frame does not match metadata"
+                    ],
+                ),
+            )
+        if reconstructed_fingerprint != expected_fingerprint:
+            updated = dict(identity)
+            updated["reconstructed_geometry_fingerprint"] = reconstructed_fingerprint
+            updated["geometry_fingerprint_match"] = False
+            return LumenRecorderResult(
+                required=True,
+                section=_unavailable_lumen_section(
+                    identity=updated,
+                    data_quality={**data_quality, "geometry_fingerprint_match": False},
+                    reasons=[
+                        "geometry_fingerprint_mismatch: reconstructed geometry fingerprint does not match metadata"
+                    ],
+                ),
+            )
+
+        try:
+            metrics = compute_lumen_evaluation_metrics(
+                geometry=geometry,
+                times=backbone_data.timestamps,
+                backbone_points=backbone_data.backbones,
+                tip_points=backbone_data.tip_points,
+                compute_centerline_tracking_rmse=identity["scenario_id"] == "centerline_target",
+                tip_backbone_tolerance=TIP_BACKBONE_CONSISTENCY_TOLERANCE,
+            )
+        except Exception as exc:
+            updated = dict(identity)
+            updated["reconstructed_geometry_fingerprint"] = reconstructed_fingerprint
+            updated["geometry_fingerprint_match"] = True
+            return LumenRecorderResult(
+                required=True,
+                section=_unavailable_lumen_section(
+                    identity=updated,
+                    data_quality={
+                        **data_quality,
+                        "geometry_fingerprint_match": True,
+                        "metric_computation_success": False,
+                    },
+                    reasons=[f"lumen_metric_computation_failed: {exc}"],
+                ),
+            )
+
+        updated_identity = dict(identity)
+        updated_identity["reconstructed_geometry_fingerprint"] = reconstructed_fingerprint
+        updated_identity["geometry_fingerprint_match"] = True
+        section = _available_lumen_section(
+            identity=updated_identity,
+            geometry=geometry,
+            geometry_payload=geometry_payload,
+            metrics=metrics,
+            data_quality={
+                **data_quality,
+                "geometry_fingerprint_match": True,
+                "metric_computation_success": True,
+            },
+        )
+        return LumenRecorderResult(
+            required=True,
+            section=section,
+            csv_rows=tuple(_lumen_sample_csv_rows(metrics)),
+        )
+
+    def _reconstruct_lumen_geometry(
+        self,
+        identity: dict[str, Any],
+    ) -> tuple[Any, dict[str, Any], str]:
+        effective_config = config_with_lumen_overrides(
+            self.project_config,
+            enable_cylindrical_lumen=False,
+            enable_curved_lumen=True,
+            curved_lumen_type=str(identity["curved_lumen_type"]),
+            target=identity["executed_target"],
+        )
+        effective_config.setdefault("reference", {})["mode"] = REFERENCE_MODE_FIXED_TARGET
+        geometry = lumen_geometry_from_config(effective_config)
+        if geometry is None:
+            raise ValueError("effective curved configuration did not produce a lumen geometry")
+        payload = lumen_geometry_fingerprint_payload(geometry)
+        fingerprint = lumen_geometry_fingerprint(geometry)
+        return geometry, payload, fingerprint
+
+    def _write_lumen_evaluation_csv_if_available(
+        self,
+        run_dir: Path,
+        result: LumenRecorderResult,
+    ) -> LumenRecorderResult:
+        if not result.required or result.section is None or not result.csv_rows:
+            return result
+        try:
+            self._write_lumen_evaluation_csv(run_dir, result.csv_rows)
+        except Exception as exc:
+            identity = dict(result.section.get("identity", {}))
+            data_quality = dict(result.section.get("data_quality", {}))
+            data_quality["metric_computation_success"] = False
+            data_quality["lumen_csv_written"] = False
+            section = _unavailable_lumen_section(
+                identity=identity,
+                data_quality=data_quality,
+                reasons=[f"lumen_csv_write_failed: {exc}"],
+            )
+            return LumenRecorderResult(required=True, section=section)
+        data_quality = dict(result.section.get("data_quality", {}))
+        data_quality["lumen_csv_written"] = True
+        section = dict(result.section)
+        section["data_quality"] = data_quality
+        return LumenRecorderResult(required=True, section=section, csv_rows=result.csv_rows)
+
+    def _write_lumen_evaluation_csv(self, run_dir: Path, rows: tuple[dict[str, Any], ...]) -> None:
+        destination = run_dir / "lumen_evaluation.csv"
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                newline="",
+                dir=run_dir,
+                prefix=f".{destination.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+                writer = csv.writer(handle)
+                writer.writerow(LUMEN_EVALUATION_CSV_FIELDS)
+                for row in rows:
+                    writer.writerow([row.get(field, "") for field in LUMEN_EVALUATION_CSV_FIELDS])
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, destination)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink()
+                except FileNotFoundError:
+                    pass
 
     def _write_raw_files(self, run_dir: Path) -> None:
         write_rows(
@@ -1005,6 +1279,592 @@ class ExperimentRecorder:
                 ]
             )
         return rows
+
+
+def _has_curved_lumen_metadata(metadata: dict[str, Any]) -> bool:
+    return _canonical_orchestration_task(metadata) == TASK_CURVED_LUMEN_NAVIGATION
+
+
+def _is_curved_lumen_run(metadata: dict[str, Any]) -> bool:
+    return _canonical_orchestration_task(metadata) == TASK_CURVED_LUMEN_NAVIGATION
+
+
+def _canonical_orchestration_task(metadata: dict[str, Any]) -> Any:
+    return metadata.get("task")
+
+
+def _curved_lumen_identity(metadata: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    reasons: list[str] = []
+    identity: dict[str, Any] = {
+        "task": _canonical_orchestration_task(metadata),
+        "reference_mode": _metadata_value(metadata, "reference_mode"),
+        "curved_lumen_type": _metadata_value(metadata, "curved_lumen_type"),
+        "scenario_id": _metadata_value(metadata, "scenario_id"),
+        "scenario_policy_version": _metadata_value(metadata, "scenario_policy_version"),
+        "scenario_fingerprint": _metadata_value(metadata, "scenario_fingerprint"),
+        "geometry_frame": _metadata_value(metadata, "geometry_frame"),
+        "geometry_fingerprint": _metadata_value(metadata, "geometry_fingerprint"),
+        "expected_geometry_fingerprint": _metadata_value(metadata, "geometry_fingerprint"),
+        "reconstructed_geometry_fingerprint": None,
+        "geometry_fingerprint_match": False,
+        "shared_environment_hash": _metadata_value(metadata, "shared_environment_hash"),
+        "run_role": _metadata_value(metadata, "run_role"),
+        "derived_target": None,
+        "requested_target": None,
+        "executed_target": None,
+        "validated_target": None,
+        "override_used": None,
+    }
+    for key in (
+        "task",
+        "reference_mode",
+        "curved_lumen_type",
+        "scenario_id",
+        "scenario_policy_version",
+        "scenario_fingerprint",
+        "geometry_frame",
+        "geometry_fingerprint",
+    ):
+        value = identity[key]
+        if value is None or str(value) == "":
+            reasons.append(f"missing_curved_identity:{key}")
+            identity[key] = None
+        else:
+            identity[key] = str(value)
+
+    if identity["task"] is not None and identity["task"] != TASK_CURVED_LUMEN_NAVIGATION:
+        reasons.append("invalid_curved_identity:task")
+    if identity["reference_mode"] is not None and identity["reference_mode"] != REFERENCE_MODE_FIXED_TARGET:
+        reasons.append("invalid_curved_identity:reference_mode")
+    if identity["curved_lumen_type"] is not None and identity["curved_lumen_type"] not in CURVED_LUMEN_TYPES:
+        reasons.append("invalid_curved_identity:curved_lumen_type")
+    if identity["scenario_id"] is not None and identity["scenario_id"] not in CURVED_LUMEN_SCENARIO_IDS:
+        reasons.append("invalid_curved_identity:scenario_id")
+    if (
+        identity["scenario_policy_version"] is not None
+        and identity["scenario_policy_version"] != CURVED_SCENARIO_POLICY_VERSION
+    ):
+        reasons.append("invalid_curved_identity:scenario_policy_version")
+
+    for key in ("derived_target", "requested_target", "executed_target", "validated_target"):
+        raw_value = _metadata_value(metadata, key)
+        if raw_value is None:
+            reasons.append(f"missing_curved_identity:{key}")
+            continue
+        try:
+            identity[key] = _vector3_payload(raw_value, key)
+        except ValueError:
+            reasons.append(f"invalid_curved_identity:{key}")
+
+    override_value = _metadata_value(metadata, "override_used")
+    if override_value is None:
+        override_value = _metadata_value(metadata, "target_override_used")
+    if override_value is None:
+        reasons.append("missing_curved_identity:override_used")
+    elif not isinstance(override_value, bool):
+        reasons.append("invalid_curved_identity:override_used")
+    else:
+        identity["override_used"] = bool(override_value)
+
+    if identity["executed_target"] is not None and identity["validated_target"] is not None:
+        if not _vectors_close(identity["executed_target"], identity["validated_target"], tolerance=1.0e-12):
+            reasons.append("invalid_curved_identity:executed_validated_target_mismatch")
+    return identity, reasons
+
+
+def _curved_executed_target(metadata: dict[str, Any]) -> np.ndarray | None:
+    raw_value = _metadata_value(metadata, "executed_target")
+    if raw_value is None:
+        raw_value = _metadata_value(metadata, "validated_target")
+    try:
+        return np.asarray(_vector3_payload(raw_value, "executed_target"), dtype=float)
+    except (TypeError, ValueError):
+        return None
+
+
+def _metadata_value(metadata: dict[str, Any], key: str) -> Any:
+    if key in metadata:
+        return metadata[key]
+    override = metadata.get("metadata_override")
+    if isinstance(override, dict):
+        if key in override:
+            return override[key]
+        nested = _metadata_value(override, key)
+        if nested is not None:
+            return nested
+    reference = metadata.get("reference_configuration")
+    if isinstance(reference, dict):
+        if key in reference:
+            return reference[key]
+        scenario = reference.get("curved_scenario")
+        if isinstance(scenario, dict) and key in scenario:
+            return scenario[key]
+    scenario = metadata.get("curved_scenario")
+    if isinstance(scenario, dict) and key in scenario:
+        return scenario[key]
+    runtime = metadata.get("orchestration_runtime")
+    if isinstance(runtime, dict) and key in runtime:
+        return runtime[key]
+    return None
+
+
+def _vector3_payload(value: Any, label: str) -> list[float]:
+    array = np.asarray(value, dtype=float)
+    if array.shape != (3,) or not np.all(np.isfinite(array)):
+        raise ValueError(f"{label} must be finite with shape (3,)")
+    return [float(item) for item in array]
+
+
+def _vectors_close(left: Any, right: Any, *, tolerance: float) -> bool:
+    return bool(np.allclose(np.asarray(left, dtype=float), np.asarray(right, dtype=float), atol=tolerance, rtol=0.0))
+
+
+def _base_lumen_data_quality(samples: list[Any]) -> dict[str, Any]:
+    return {
+        "aligned_sample_count": len(samples),
+        "backbone_sample_count": 0,
+        "missing_backbone_count": 0,
+        "malformed_backbone_count": 0,
+        "nonfinite_backbone_count": 0,
+        "minimum_backbone_points": None,
+        "maximum_backbone_points": None,
+        "timestamps_monotonic": True,
+        "duplicate_timestamp_count": 0,
+        "tip_backbone_consistent": True,
+        "tip_backbone_mismatch_count": 0,
+        "geometry_identity_available": False,
+        "geometry_fingerprint_match": False,
+        "target_identity_available": False,
+        "metric_computation_success": False,
+        "lumen_csv_written": False,
+    }
+
+
+def _curved_lumen_backbone_data(samples: list[Any]) -> tuple[LumenBackboneData, list[str]]:
+    reasons: list[str] = []
+    data_quality = _base_lumen_data_quality(samples)
+    timestamps: list[float] = []
+    backbones: list[np.ndarray] = []
+    tips: list[np.ndarray] = []
+    point_counts: list[int] = []
+
+    if not samples:
+        reasons.append("missing_backbone_data:no_aligned_samples")
+
+    previous_timestamp: float | None = None
+    for index, sample in enumerate(samples):
+        timestamp = float(sample.timestamp)
+        timestamps.append(timestamp)
+        if not math.isfinite(timestamp):
+            reasons.append("nonfinite_timestamp")
+        if previous_timestamp is not None:
+            if timestamp < previous_timestamp:
+                data_quality["timestamps_monotonic"] = False
+                reasons.append("nonmonotonic_timestamps")
+            elif timestamp == previous_timestamp:
+                data_quality["duplicate_timestamp_count"] += 1
+        previous_timestamp = timestamp
+
+        points = sample.backbone_points
+        if points is None:
+            data_quality["missing_backbone_count"] += 1
+            reasons.append("missing_backbone_data")
+            continue
+        try:
+            backbone = np.asarray(points, dtype=float)
+        except (TypeError, ValueError):
+            data_quality["malformed_backbone_count"] += 1
+            reasons.append("malformed_backbone_data")
+            continue
+        if backbone.ndim != 2 or backbone.shape[1] != 3 or backbone.shape[0] < 1:
+            data_quality["malformed_backbone_count"] += 1
+            reasons.append("malformed_backbone_data")
+            continue
+        if not np.all(np.isfinite(backbone)):
+            data_quality["nonfinite_backbone_count"] += 1
+            reasons.append("nonfinite_backbone_data")
+            continue
+        try:
+            tip = np.asarray(sample.tip_position, dtype=float)
+        except (TypeError, ValueError):
+            data_quality["malformed_backbone_count"] += 1
+            reasons.append("malformed_tip_data")
+            continue
+        if tip.shape != (3,) or not np.all(np.isfinite(tip)):
+            data_quality["malformed_backbone_count"] += 1
+            reasons.append("malformed_tip_data")
+            continue
+        if not np.allclose(tip, backbone[-1], atol=TIP_BACKBONE_CONSISTENCY_TOLERANCE, rtol=0.0):
+            data_quality["tip_backbone_consistent"] = False
+            data_quality["tip_backbone_mismatch_count"] += 1
+            reasons.append("tip_backbone_mismatch")
+        backbones.append(backbone.astype(float, copy=True))
+        tips.append(tip.astype(float, copy=True))
+        point_counts.append(int(backbone.shape[0]))
+
+    if len(timestamps) != len(backbones):
+        reasons.append("missing_backbone_data:timestamp_backbone_count_mismatch")
+    if point_counts:
+        data_quality["backbone_sample_count"] = len(backbones)
+        data_quality["minimum_backbone_points"] = min(point_counts)
+        data_quality["maximum_backbone_points"] = max(point_counts)
+    if not backbones and "missing_backbone_data:no_aligned_samples" not in reasons:
+        reasons.append("missing_backbone_data")
+
+    data_quality["geometry_identity_available"] = True
+    data_quality["target_identity_available"] = True
+    unique_reasons = _unique_reasons(reasons)
+    return (
+        LumenBackboneData(
+            timestamps=np.asarray(timestamps, dtype=float),
+            backbones=tuple(backbones),
+            tip_points=np.asarray(tips, dtype=float),
+            data_quality=data_quality,
+        ),
+        unique_reasons,
+    )
+
+
+def _available_lumen_section(
+    *,
+    identity: dict[str, Any],
+    geometry: Any,
+    geometry_payload: dict[str, Any],
+    metrics: LumenEvaluationMetrics,
+    data_quality: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": LUMEN_EVALUATION_SCHEMA_VERSION,
+        "available": True,
+        "run_valid": True,
+        "unavailable_reasons": [],
+        "identity": _lumen_identity_section(identity),
+        "geometry": _lumen_geometry_section(identity, geometry, geometry_payload),
+        "data_quality": data_quality,
+        "physical_safety": _physical_safety_section(metrics),
+        "safety_margin": _safety_margin_section(metrics),
+        "constraints": _constraints_section(metrics),
+        "progress": _progress_section(metrics),
+    }
+
+
+def _unavailable_lumen_section(
+    *,
+    identity: dict[str, Any],
+    data_quality: dict[str, Any],
+    reasons: list[str],
+) -> dict[str, Any]:
+    clean_reasons = _unique_reasons(reasons)
+    section_identity = _lumen_identity_section(identity)
+    section_identity.setdefault("geometry_fingerprint_match", False)
+    return {
+        "schema_version": LUMEN_EVALUATION_SCHEMA_VERSION,
+        "available": False,
+        "run_valid": False,
+        "unavailable_reasons": clean_reasons,
+        "identity": section_identity,
+        "geometry": _unavailable_lumen_geometry_section(identity),
+        "data_quality": {
+            **_base_lumen_data_quality([]),
+            **data_quality,
+            "metric_computation_success": False,
+        },
+        "physical_safety": _unavailable_physical_safety_section(),
+        "safety_margin": _unavailable_safety_margin_section(),
+        "constraints": {
+            "wall": _unavailable_constraint_section("wall"),
+            "inlet": _unavailable_constraint_section("inlet"),
+            "outlet": _unavailable_constraint_section("outlet"),
+        },
+        "progress": _unavailable_progress_section(),
+    }
+
+
+def _lumen_identity_section(identity: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "task",
+        "reference_mode",
+        "curved_lumen_type",
+        "scenario_id",
+        "scenario_policy_version",
+        "scenario_fingerprint",
+        "geometry_frame",
+        "geometry_fingerprint",
+        "expected_geometry_fingerprint",
+        "reconstructed_geometry_fingerprint",
+        "geometry_fingerprint_match",
+        "derived_target",
+        "requested_target",
+        "executed_target",
+        "validated_target",
+        "override_used",
+        "shared_environment_hash",
+        "run_role",
+    )
+    return {key: identity.get(key) for key in keys}
+
+
+def _lumen_geometry_section(identity: dict[str, Any], geometry: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    radius_profile = np.asarray(getattr(geometry, "radius_profile", []), dtype=float)
+    return {
+        "mode": "curved",
+        "type": identity.get("curved_lumen_type"),
+        "frame": getattr(geometry, "frame_id", None),
+        "fingerprint": identity.get("reconstructed_geometry_fingerprint"),
+        "fingerprint_payload": sanitize_for_json(payload),
+        "ctr_outer_radius_m": _finite_float_or_none(getattr(geometry, "ctr_outer_radius", None)),
+        "safety_margin_m": _finite_float_or_none(getattr(geometry, "safety_margin", None)),
+        "minimum_lumen_radius_m": (
+            float(np.min(radius_profile)) if radius_profile.size and np.all(np.isfinite(radius_profile)) else None
+        ),
+        "maximum_lumen_radius_m": (
+            float(np.max(radius_profile)) if radius_profile.size and np.all(np.isfinite(radius_profile)) else None
+        ),
+    }
+
+
+def _unavailable_lumen_geometry_section(identity: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "mode": "curved",
+        "type": identity.get("curved_lumen_type"),
+        "frame": identity.get("geometry_frame"),
+        "fingerprint": identity.get("reconstructed_geometry_fingerprint"),
+        "fingerprint_payload": None,
+        "ctr_outer_radius_m": None,
+        "safety_margin_m": None,
+        "minimum_lumen_radius_m": None,
+        "maximum_lumen_radius_m": None,
+    }
+
+
+def _physical_safety_section(metrics: LumenEvaluationMetrics) -> dict[str, Any]:
+    safety = metrics.safety
+    return {
+        "physical_safety_pass": bool(safety.physical_safety_pass),
+        "collision_detected": bool(safety.physical_collision_detected),
+        "collision_sample_count": int(safety.physical_collision_sample_count),
+        "collision_event_count": int(safety.physical_collision_event_count),
+        "collision_duration_s": float(safety.physical_collision_duration),
+        "first_collision_time_s": safety.first_physical_collision_time,
+        "minimum_physical_clearance_m": float(safety.minimum_physical_clearance),
+        "final_physical_clearance_m": float(safety.final_physical_clearance),
+        "worst_constraint": str(safety.worst_physical_constraint),
+        "worst_sample_index": int(safety.worst_physical_sample_index),
+        "worst_backbone_index": int(safety.worst_physical_backbone_index),
+    }
+
+
+def _safety_margin_section(metrics: LumenEvaluationMetrics) -> dict[str, Any]:
+    safety = metrics.safety
+    return {
+        "safety_margin_pass": bool(safety.safety_margin_pass),
+        "margin_violation_detected": bool(safety.safety_margin_violation_detected),
+        "violation_sample_count": int(safety.safety_margin_violation_sample_count),
+        "violation_event_count": int(safety.safety_margin_violation_event_count),
+        "violation_duration_s": float(safety.safety_margin_violation_duration),
+        "first_violation_time_s": safety.first_safety_margin_violation_time,
+        "minimum_safety_clearance_m": float(safety.minimum_safety_clearance),
+        "final_safety_clearance_m": float(safety.final_safety_clearance),
+        "worst_constraint": str(safety.worst_safety_constraint),
+        "worst_sample_index": int(safety.worst_safety_sample_index),
+        "worst_backbone_index": int(safety.worst_safety_backbone_index),
+    }
+
+
+def _constraints_section(metrics: LumenEvaluationMetrics) -> dict[str, Any]:
+    return {
+        str(item.constraint_type): {
+            "physical_violation_sample_count": int(item.physical_violation_sample_count),
+            "physical_violation_event_count": int(item.physical_violation_event_count),
+            "physical_violation_duration_s": float(item.physical_violation_duration),
+            "first_physical_violation_time_s": item.first_physical_violation_time,
+            "maximum_penetration_m": float(item.maximum_penetration),
+            "minimum_physical_clearance_m": float(item.minimum_physical_clearance),
+            "worst_sample_index": int(item.worst_sample_index),
+            "worst_backbone_index": int(item.worst_backbone_index),
+        }
+        for item in metrics.safety.per_constraint_breakdown
+    }
+
+
+def _progress_section(metrics: LumenEvaluationMetrics) -> dict[str, Any]:
+    progress = metrics.progress
+    samples = metrics.samples
+    out_of_extent_count = sum(1 for sample in samples if sample.tip_progress_out_of_extent)
+    return {
+        "initial_centerline_arc_length_m": float(progress.initial_centerline_arc_length),
+        "final_centerline_arc_length_m": float(progress.final_centerline_arc_length),
+        "minimum_centerline_arc_length_m": float(progress.minimum_centerline_arc_length),
+        "maximum_centerline_arc_length_m": float(progress.maximum_centerline_arc_length),
+        "initial_normalized_progress": float(progress.initial_normalized_progress),
+        "final_normalized_progress": float(progress.final_normalized_progress),
+        "maximum_normalized_progress": float(progress.maximum_normalized_progress),
+        "tip_progress_out_of_extent_count": int(out_of_extent_count),
+        "initial_radial_offset_m": float(samples[0].tip_radial_offset) if samples else None,
+        "final_radial_offset_m": float(progress.final_tip_radial_offset),
+        "mean_radial_offset_m": float(progress.mean_tip_radial_offset),
+        "rms_radial_offset_m": float(progress.rms_tip_radial_offset),
+        "maximum_radial_offset_m": float(progress.maximum_tip_radial_offset),
+        "mean_local_radius_m": float(progress.mean_local_lumen_radius),
+        "final_local_radius_m": float(progress.final_local_lumen_radius),
+        "centerline_tracking_rmse_m": progress.centerline_tracking_rmse,
+    }
+
+
+def _unavailable_physical_safety_section() -> dict[str, Any]:
+    return {
+        "physical_safety_pass": False,
+        "collision_detected": None,
+        "collision_sample_count": None,
+        "collision_event_count": None,
+        "collision_duration_s": None,
+        "first_collision_time_s": None,
+        "minimum_physical_clearance_m": None,
+        "final_physical_clearance_m": None,
+        "worst_constraint": None,
+        "worst_sample_index": None,
+        "worst_backbone_index": None,
+    }
+
+
+def _unavailable_safety_margin_section() -> dict[str, Any]:
+    return {
+        "safety_margin_pass": False,
+        "margin_violation_detected": None,
+        "violation_sample_count": None,
+        "violation_event_count": None,
+        "violation_duration_s": None,
+        "first_violation_time_s": None,
+        "minimum_safety_clearance_m": None,
+        "final_safety_clearance_m": None,
+        "worst_constraint": None,
+        "worst_sample_index": None,
+        "worst_backbone_index": None,
+    }
+
+
+def _unavailable_constraint_section(constraint: str) -> dict[str, Any]:
+    return {
+        "constraint_type": constraint,
+        "physical_violation_sample_count": None,
+        "physical_violation_event_count": None,
+        "physical_violation_duration_s": None,
+        "first_physical_violation_time_s": None,
+        "maximum_penetration_m": None,
+        "minimum_physical_clearance_m": None,
+        "worst_sample_index": None,
+        "worst_backbone_index": None,
+    }
+
+
+def _unavailable_progress_section() -> dict[str, Any]:
+    return {
+        "initial_centerline_arc_length_m": None,
+        "final_centerline_arc_length_m": None,
+        "minimum_centerline_arc_length_m": None,
+        "maximum_centerline_arc_length_m": None,
+        "initial_normalized_progress": None,
+        "final_normalized_progress": None,
+        "maximum_normalized_progress": None,
+        "tip_progress_out_of_extent_count": None,
+        "initial_radial_offset_m": None,
+        "final_radial_offset_m": None,
+        "mean_radial_offset_m": None,
+        "rms_radial_offset_m": None,
+        "maximum_radial_offset_m": None,
+        "mean_local_radius_m": None,
+        "final_local_radius_m": None,
+        "centerline_tracking_rmse_m": None,
+    }
+
+
+def _lumen_sample_csv_rows(metrics: LumenEvaluationMetrics) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for sample in metrics.samples:
+        point = np.asarray(sample.tip_centerline_point, dtype=float)
+        rows.append(
+            {
+                "timestamp_s": float(sample.timestamp),
+                "physical_clearance_m": float(sample.physical_clearance),
+                "safety_clearance_m": float(sample.safety_clearance),
+                "physical_collision": bool(sample.physical_collision),
+                "safety_margin_violation": bool(sample.safety_margin_violation),
+                "selected_constraint_type": str(sample.selected_constraint_type),
+                "closest_backbone_index": int(sample.closest_backbone_index),
+                "wall_penetration_m": float(sample.wall_penetration),
+                "inlet_penetration_m": float(sample.inlet_penetration),
+                "outlet_penetration_m": float(sample.outlet_penetration),
+                "tip_centerline_x": float(point[0]),
+                "tip_centerline_y": float(point[1]),
+                "tip_centerline_z": float(point[2]),
+                "tip_centerline_segment_index": int(sample.tip_centerline_segment_index),
+                "tip_centerline_interpolation_fraction": float(sample.tip_centerline_interpolation_fraction),
+                "centerline_arc_length_m": float(sample.tip_centerline_arc_length),
+                "normalized_progress": float(sample.normalized_tip_progress),
+                "tip_progress_out_of_extent": bool(sample.tip_progress_out_of_extent),
+                "radial_offset_m": float(sample.tip_radial_offset),
+                "local_radius_m": float(sample.local_lumen_radius),
+            }
+        )
+    return rows
+
+
+def _curved_navigation_summary(section: dict[str, Any], goal_metrics: Any | None) -> dict[str, Any]:
+    goal_success = False if goal_metrics is None else bool(goal_metrics.goal_reached)
+    physical_pass = bool(section.get("physical_safety", {}).get("physical_safety_pass", False))
+    safety_margin_pass = bool(section.get("safety_margin", {}).get("safety_margin_pass", False))
+    run_valid = bool(section.get("run_valid", False))
+    return {
+        "run_valid": run_valid,
+        "goal_success": goal_success,
+        "physical_safety_pass": physical_pass,
+        "safety_margin_pass": safety_margin_pass,
+        "navigation_success": bool(run_valid and goal_success and physical_pass),
+    }
+
+
+def _acceptance_with_curved_lumen(
+    acceptance: dict[str, Any],
+    section: dict[str, Any],
+    goal_metrics: Any | None,
+) -> dict[str, Any]:
+    updated = dict(acceptance)
+    reasons = list(updated.get("reasons", []))
+    goal_success = False if goal_metrics is None else bool(goal_metrics.goal_reached)
+    physical_pass = bool(section.get("physical_safety", {}).get("physical_safety_pass", False))
+    safety_margin_pass = bool(section.get("safety_margin", {}).get("safety_margin_pass", False))
+    updated["goal_reached_pass"] = goal_success
+    updated["collision_free_pass"] = physical_pass
+    updated["safety_margin_pass"] = safety_margin_pass
+    if not goal_success:
+        _append_reason_once(reasons, "goal tolerance hold requirement was not met")
+    if not physical_pass:
+        _append_reason_once(reasons, "generic lumen physical safety failed or was unavailable")
+    if not safety_margin_pass:
+        _append_reason_once(reasons, "generic lumen safety margin failed or was unavailable")
+    updated["reasons"] = reasons
+    return updated
+
+
+def _append_reason_once(reasons: list[str], reason: str) -> None:
+    if reason not in reasons:
+        reasons.append(reason)
+
+
+def _finite_float_or_none(value: Any) -> float | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
+def _unique_reasons(reasons: list[str]) -> list[str]:
+    result: list[str] = []
+    for reason in reasons:
+        if reason not in result:
+            result.append(reason)
+    return result
 
 
 def write_aligned_csv(path: Path, alignment: AlignmentResult) -> None:
@@ -1166,8 +2026,44 @@ def promoted_orchestration_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "sampled_reachability_seed",
         "sampled_reachability_sample_count",
         "suggested_target",
+        "validated_target",
+        "derived_target",
+        "override_used",
+        "target_override_used",
+        "reference_mode",
+        "curved_lumen_type",
+        "scenario_id",
+        "scenario_policy_version",
+        "scenario_fingerprint",
+        "geometry_frame",
+        "geometry_fingerprint",
     )
-    return {key: metadata[key] for key in keys if key in metadata}
+    result = {key: metadata[key] for key in keys if key in metadata}
+    reference = metadata.get("reference_configuration")
+    if isinstance(reference, dict):
+        for key in ("task", "reference_mode"):
+            if key in reference and key not in result:
+                result[key] = reference[key]
+        scenario = reference.get("curved_scenario")
+        if isinstance(scenario, dict):
+            for key in (
+                "requested_target",
+                "executed_target",
+                "validated_target",
+                "derived_target",
+                "override_used",
+                "target_override_used",
+                "reference_mode",
+                "curved_lumen_type",
+                "scenario_id",
+                "scenario_policy_version",
+                "scenario_fingerprint",
+                "geometry_frame",
+                "geometry_fingerprint",
+            ):
+                if key in scenario and key not in result:
+                    result[key] = scenario[key]
+    return result
 
 
 def _baseline_rmse_improvement_pass(
