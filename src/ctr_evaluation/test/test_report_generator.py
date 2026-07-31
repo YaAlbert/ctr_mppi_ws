@@ -90,7 +90,7 @@ class ReportGeneratorTest(unittest.TestCase):
                         "real_time_pass": False,
                         "physical_validation_pass": False,
                         "hardware_validation_pass": False,
-                        "reasons": ["not real time"],
+                        "reasons": [],
                     },
                 },
                 comparison={
@@ -115,6 +115,14 @@ class ReportGeneratorTest(unittest.TestCase):
             self.assertIn("Topic Status", text)
             self.assertIn("Baseline Comparison", text)
             self.assertIn("Warnings And Limitations", text)
+            self.assertIn(
+                "Timing and solver-performance metrics are descriptive only and are not navigation acceptance criteria.",
+                text,
+            )
+            self.assertIn("| mean_solve_time | 0.3 |", text)
+            self.assertNotIn("| timing_pass |", text)
+            self.assertNotIn("| real_time_pass |", text)
+            self.assertNotIn("not real time", text.lower())
 
     def test_invalid_comparison_is_reported_without_improvement_claim(self):
         with tempfile.TemporaryDirectory() as temp_dir:

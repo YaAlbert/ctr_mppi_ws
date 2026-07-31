@@ -261,6 +261,8 @@ class EvaluationMetricsTest(unittest.TestCase):
         self.assertTrue(result.safety_margin_pass)
         self.assertTrue(result.numerical_safety_pass)
         self.assertFalse(result.real_time_pass)
+        self.assertFalse(result.timing_pass)
+        self.assertNotIn("controller timing", result.reasons)
         self.assertFalse(result.physical_validation_pass)
         self.assertFalse(result.hardware_validation_pass)
 
@@ -300,6 +302,28 @@ class EvaluationMetricsTest(unittest.TestCase):
         )
         self.assertFalse(result.compatibility_valid)
         self.assertFalse(result.metric_comparisons[0].comparison_valid)
+
+    def test_timing_measurements_do_not_change_comparison_validity(self):
+        candidate = {
+            "tracking": {"rmse": 1.0},
+            "timing": {"mean_solve_time": 0.01, "effective_solve_frequency": 100.0},
+        }
+        baseline = {
+            "tracking": {"rmse": 2.0},
+            "timing": {"mean_solve_time": 9.0, "effective_solve_frequency": 0.1},
+        }
+        config = {"trajectory_type": "circle", "frame_id": "base_link"}
+        result = compare_summaries(
+            candidate_summary=candidate,
+            baseline_summary=baseline,
+            candidate_metadata={"configuration": config},
+            baseline_metadata={"configuration": config},
+            near_zero_epsilon=1.0e-12,
+            duration_tolerance=1.0,
+            initial_state_tolerance=1.0e-6,
+        )
+        self.assertTrue(result.compatibility_valid)
+        self.assertTrue(result.metric_comparisons[0].comparison_valid)
 
     def test_actual_duration_difference_rejects_comparison(self):
         candidate = {"tracking": {"rmse": 1.0}}

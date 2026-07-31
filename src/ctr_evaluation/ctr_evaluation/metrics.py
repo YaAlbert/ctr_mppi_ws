@@ -715,8 +715,6 @@ def compute_acceptance(
 
     timing_pass = timing.deadline_overrun_percentage <= thresholds.maximum_deadline_overrun_percentage
     real_time_pass = timing_pass and timing.mean_solve_time <= thresholds.control_period
-    if not real_time_pass:
-        reasons.append("controller timing is not real-time capable under configured period")
 
     saturation_pass = control.saturation_percentage <= thresholds.maximum_saturation_percentage
     if not saturation_pass:

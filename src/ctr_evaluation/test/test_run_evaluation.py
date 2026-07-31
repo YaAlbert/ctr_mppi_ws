@@ -466,13 +466,32 @@ class RunEvaluationHelpersTest(unittest.TestCase):
 
     def test_require_improvement_returns_nonzero_for_valid_worse_performance(self):
         original = patch_fake_orchestrator(
-            {"comparison": {"compatibility_valid": True, "comparison_valid": True}, "baseline_improvement_pass": False}
+            {
+                "comparison": {"compatibility_valid": True, "comparison_valid": True},
+                "baseline_improvement_pass": False,
+                "timing_pass": False,
+                "real_time_pass": False,
+            }
         )
         try:
             code = main(["--experiment-group", "g", "--duration", "12.0", "--require-improvement"])
         finally:
             restore_orchestrator(original)
         self.assertEqual(4, code)
+
+    def test_timing_diagnostics_do_not_change_cli_acceptance(self):
+        result = {
+            "comparison": {"compatibility_valid": True, "comparison_valid": True},
+            "baseline_improvement_pass": True,
+            "timing_pass": False,
+            "real_time_pass": False,
+        }
+        original = patch_fake_orchestrator(result)
+        try:
+            self.assertEqual(0, main(["--experiment-group", "g", "--duration", "12.0"]))
+            self.assertEqual(0, main(["--experiment-group", "g", "--duration", "12.0", "--require-improvement"]))
+        finally:
+            restore_orchestrator(original)
 
     def test_invalid_comparison_returns_nonzero(self):
         original = patch_fake_orchestrator(

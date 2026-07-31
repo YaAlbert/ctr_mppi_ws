@@ -451,20 +451,11 @@ class ExperimentRecorder:
             write_aligned_csv(partial_dir / "aligned_samples.csv", alignment)
 
             comparison = None
-            if self.config.report_generation or self.config.plot_generation:
-                from ctr_evaluation.report_generator import generate_plots, generate_report
+            from ctr_evaluation.report_generator import generate_plots, generate_report
 
-                plot_paths: list[Path] = []
-                if self.config.plot_generation:
-                    plot_paths = generate_plots(partial_dir, alignment.samples, metadata=metadata)
-                if self.config.report_generation:
-                    generate_report(
-                        run_dir=partial_dir,
-                        metadata=metadata,
-                        summary=summary,
-                        comparison=None,
-                        plot_paths=plot_paths,
-                    )
+            plot_paths: list[Path] = []
+            if self.config.plot_generation:
+                plot_paths = generate_plots(partial_dir, alignment.samples, metadata=metadata)
 
             if self.config.baseline_result_dir:
                 from ctr_evaluation.compare_results import compare_result_dirs
@@ -478,16 +469,14 @@ class ExperimentRecorder:
                 )
                 summary = self._apply_baseline_acceptance(summary, comparison)
                 write_json(partial_dir / "summary.json", summary)
-                if self.config.report_generation:
-                    from ctr_evaluation.report_generator import generate_report
 
-                    generate_report(
-                        run_dir=partial_dir,
-                        metadata=metadata,
-                        summary=summary,
-                        comparison=comparison,
-                        plot_paths=[path for path in partial_dir.glob("*.png")],
-                    )
+            generate_report(
+                run_dir=partial_dir,
+                metadata=metadata,
+                summary=summary,
+                comparison=comparison,
+                plot_paths=[path for path in partial_dir.glob("*.png")],
+            )
 
             partial_dir.replace(final_dir)
             self._write_aggregate(group_dir)

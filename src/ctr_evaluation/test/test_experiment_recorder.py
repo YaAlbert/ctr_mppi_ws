@@ -26,6 +26,7 @@ from ctr_evaluation.experiment_recorder import (  # noqa: E402
     write_json,
 )
 from ctr_evaluation.compare_results import write_json as write_comparison_json  # noqa: E402
+import ctr_evaluation.report_generator as report_module  # noqa: E402
 
 
 CONFIG_FILES = [
@@ -108,6 +109,58 @@ def strict_json_load(path: Path):
 
 
 class ExperimentRecorderTest(unittest.TestCase):
+    def test_report_is_generated_when_report_generation_flag_is_disabled(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = project_config(temp_dir)
+            config["evaluation"]["plot_generation"] = False
+            config["evaluation"]["report_generation"] = False
+            recorder = ExperimentRecorder(
+                config=EvaluationRecorderConfig.from_project_config(config),
+                project_config=config,
+            )
+            recorder.start(experiment_name="automatic_report", monotonic_time=0.0)
+            add_samples(recorder)
+            result = recorder.stop(monotonic_time=1.0)
+
+            self.assertTrue((result.run_dir / "summary.json").is_file())
+            self.assertTrue((result.run_dir / "report.md").is_file())
+
+    def test_baseline_report_is_generated_once_after_comparison(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            baseline = make_recorder(temp_dir)
+            baseline.start(experiment_name="baseline", monotonic_time=0.0)
+            add_samples(baseline, tip_offset=1.0)
+            baseline_result = baseline.stop(monotonic_time=1.0)
+
+            config = project_config(temp_dir, baseline_result_dir=str(baseline_result.run_dir))
+            config["evaluation"]["plot_generation"] = False
+            config["evaluation"]["report_generation"] = False
+            candidate = ExperimentRecorder(
+                config=EvaluationRecorderConfig.from_project_config(config),
+                project_config=config,
+            )
+            calls = []
+            original_generate_report = report_module.generate_report
+
+            def spy_generate_report(**kwargs):
+                calls.append(kwargs["comparison"])
+                return original_generate_report(**kwargs)
+
+            report_module.generate_report = spy_generate_report
+            try:
+                candidate.start(experiment_name="candidate", monotonic_time=0.0)
+                add_samples(candidate, tip_offset=0.5)
+                result = candidate.stop(monotonic_time=1.0)
+            finally:
+                report_module.generate_report = original_generate_report
+
+            self.assertEqual(1, len(calls))
+            self.assertIsNotNone(calls[0])
+            self.assertTrue(calls[0]["comparison_valid"])
+            report_text = (result.run_dir / "report.md").read_text(encoding="utf-8")
+            self.assertIn("Baseline Comparison", report_text)
+            self.assertIn("| rmse | 0.5 | 1 | -0.5 | 50 | True |", report_text)
+
     def test_lifecycle_writes_raw_summary_report_and_plots(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             recorder = make_recorder(temp_dir)

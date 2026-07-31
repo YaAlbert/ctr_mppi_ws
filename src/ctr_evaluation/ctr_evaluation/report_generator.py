@@ -19,6 +19,10 @@ import numpy as np  # noqa: E402
 from ctr_evaluation.metrics import compute_control_effort_series
 from ctr_evaluation.time_alignment import AlignedSample
 
+TIMING_DESCRIPTION = (
+    "Timing and solver-performance metrics are descriptive only and are not navigation acceptance criteria."
+)
+
 
 def generate_report(
     *,
@@ -77,13 +81,13 @@ def generate_report(
     lines.extend(_metrics_table("Goal", summary.get("goal", {})))
     lines.extend(_metrics_table("Lumen Safety", summary.get("lumen_safety", {})))
     lines.extend(_metrics_table("Motion", summary.get("motion", {})))
-    lines.extend(_metrics_table("Timing", summary.get("timing", {})))
+    lines.extend(_metrics_table("Timing (Descriptive)", summary.get("timing", {}), description=TIMING_DESCRIPTION))
     lines.extend(_metrics_table("Data Quality", summary.get("data_quality", {})))
     lines.extend(_metrics_table("Numerical Safety", summary.get("numerical_safety", {})))
 
     lines.extend(["", "## Acceptance", "", "| Category | Pass |", "| --- | --- |"])
     for key, value in summary.get("acceptance", {}).items():
-        if key == "reasons":
+        if key in {"reasons", "timing_pass", "real_time_pass"}:
             continue
         lines.append(f"| {key} | {value} |")
     reasons = summary.get("acceptance", {}).get("reasons", [])
@@ -184,8 +188,10 @@ def generate_plots(run_dir: Path, samples: list[AlignedSample], metadata: dict[s
     return _maybe_add_cylinder_plots(run_dir, paths, metadata, tip=tip)
 
 
-def _metrics_table(title: str, values: dict[str, Any]) -> list[str]:
+def _metrics_table(title: str, values: dict[str, Any], description: str | None = None) -> list[str]:
     lines = ["", f"### {title}", "", "| Metric | Value |", "| --- | ---: |"]
+    if description is not None:
+        lines = ["", f"### {title}", "", description, "", "| Metric | Value |", "| --- | ---: |"]
     for key, value in sorted(values.items()):
         if isinstance(value, list):
             rendered = ", ".join(_fmt(item) for item in value)
