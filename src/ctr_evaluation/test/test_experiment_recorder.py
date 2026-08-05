@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import yaml
@@ -27,6 +28,20 @@ from ctr_evaluation.experiment_recorder import (  # noqa: E402
 )
 from ctr_evaluation.compare_results import write_json as write_comparison_json  # noqa: E402
 import ctr_evaluation.report_generator as report_module  # noqa: E402
+from ctr_evaluation.publication_model import (  # noqa: E402
+    Applicability,
+    ArtifactRepresentation,
+    ArtifactSpec,
+    LayerASnapshot,
+    PublicationStatus,
+    RecordPhase,
+)
+from ctr_evaluation.experiment_recorder import (  # noqa: E402
+    StagingSetupError,
+    ProducerRenderError,
+    ProducerStagingError,
+    prepare_prepromotion_ledger,
+)
 
 
 CONFIG_FILES = [
@@ -379,6 +394,425 @@ class ExperimentRecorderTest(unittest.TestCase):
             result = recorder.stop(monotonic_time=1.0)
             summary = strict_json_load(result.run_dir / "summary.json")
             self.assertAlmostEqual(1.0, summary["timing"]["effective_solve_frequency"])
+
+    def test_disconnected_prepromotion_pipeline_continues_and_terminalizes(
+        self,
+    ):
+        def make_layer():
+            return LayerASnapshot(
+                snapshot_id="slice2",
+                operational_reason="none",
+                workflow_classification="COMPLETED",
+                workflow_exit_code=0,
+                comparison_valid=True,
+                compatibility_valid=True,
+                cancellation_evidence=(),
+                timing_data=(),
+            )
+
+        specs = (
+            ArtifactSpec(
+                "root", "root.json", True, Applicability.APPLICABLE,
+                ArtifactRepresentation.OPAQUE, "regular_file",
+            ),
+            ArtifactSpec(
+                "sibling", "sibling.json", True, Applicability.APPLICABLE,
+                ArtifactRepresentation.OPAQUE, "regular_file",
+            ),
+            ArtifactSpec(
+                "child", "child.json", True, Applicability.APPLICABLE,
+                ArtifactRepresentation.OPAQUE, "regular_file", ("root",),
+            ),
+            ArtifactSpec(
+                "optional", "optional.json", False,
+                Applicability.NOT_APPLICABLE, ArtifactRepresentation.OPAQUE,
+                "regular_file",
+            ),
+            ArtifactSpec(
+                "optional_child", "optional_child.json", True,
+                Applicability.APPLICABLE, ArtifactRepresentation.OPAQUE,
+                "regular_file", ("optional",),
+            ),
+            ArtifactSpec(
+                "report", "report.md", True, Applicability.APPLICABLE,
+                ArtifactRepresentation.OPAQUE, "regular_file",
+                ("sibling", "child"),
+            ),
+            ArtifactSpec(
+                "orchestration", "orchestration.json", True,
+                Applicability.APPLICABLE, ArtifactRepresentation.OPAQUE,
+                "regular_file",
+            ),
+        )
+        calls = []
+
+        def fail_root(path):
+            calls.append("root")
+            raise RuntimeError("root failure")
+
+        def write(name):
+            def producer(path):
+                calls.append(name)
+                path.write_text(name, encoding="utf-8")
+            return producer
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = prepare_prepromotion_ledger(
+                layer_a=make_layer(),
+                inventory=specs,
+                staging_root=Path(temp_dir) / "run.partial",
+                applicability={},
+                producer_registry={
+                    "root": fail_root,
+                    "sibling": write("sibling"),
+                    "optional_child": write("optional_child"),
+                },
+                report_producer=write("report"),
+                orchestration_producer=write("orchestration"),
+            )
+            by_name = ledger.by_name
+            self.assertEqual(
+                PublicationStatus.RENDER_FAILED,
+                by_name["root"].publication_status,
+            )
+            self.assertEqual(
+                PublicationStatus.DEPENDENCY_FAILED,
+                by_name["child"].publication_status,
+            )
+            self.assertEqual(
+                "sibling",
+                (Path(temp_dir) / "run.partial" / "sibling.json").read_text(),
+            )
+            self.assertIsNone(by_name["optional_child"].publication_status)
+            self.assertEqual(0, calls.count("report"))
+            self.assertNotIn("child", calls)
+            self.assertTrue(all(
+                record.record_phase is RecordPhase.PRE_PROMOTION
+                or record.publication_status
+                is PublicationStatus.NOT_APPLICABLE
+                for record in ledger.records
+            ))
+            self.assertTrue(all(
+                record.visibility_status.name == "NOT_OBSERVED"
+                for record in ledger.records
+                if record.publication_status
+                is not PublicationStatus.NOT_APPLICABLE
+            ))
+            self.assertFalse((Path(temp_dir) / "run").exists())
+
+    def test_disconnected_prepromotion_orchestration_policy_and_empty_staging(
+        self,
+    ):
+        layer = LayerASnapshot(
+            "slice2", "none", "COMPLETED", 0, True,
+            compatibility_valid=True,
+        )
+        specs = (
+            ArtifactSpec(
+                "orchestration", "orchestration.json", True,
+                Applicability.APPLICABLE, ArtifactRepresentation.OPAQUE,
+                "regular_file",
+            ),
+            ArtifactSpec(
+                "optional", "optional.json", False, Applicability.APPLICABLE,
+                ArtifactRepresentation.OPAQUE, "regular_file",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = prepare_prepromotion_ledger(
+                layer_a=layer,
+                inventory=specs,
+                staging_root=Path(temp_dir) / "empty.partial",
+                applicability={"optional": Applicability.NOT_APPLICABLE},
+                producer_registry={},
+                report_producer=None,
+            )
+            self.assertEqual(
+                PublicationStatus.DEPENDENCY_FAILED,
+                ledger.by_name["orchestration"].publication_status,
+            )
+            self.assertEqual(
+                PublicationStatus.NOT_APPLICABLE,
+                ledger.by_name["optional"].publication_status,
+            )
+            self.assertFalse(any((Path(temp_dir) / "empty.partial").iterdir()))
+            with self.assertRaises(StagingSetupError):
+                prepare_prepromotion_ledger(
+                    layer_a=layer,
+                    inventory=specs,
+                    staging_root=Path(temp_dir) / "empty.partial",
+                    applicability={},
+                    producer_registry={},
+                    report_producer=None,
+                )
+
+    def test_disconnected_report_is_attempted_once_after_comparison(self):
+        layer = LayerASnapshot(
+            "slice2", "none", "COMPLETED", 0, True,
+            compatibility_valid=True,
+        )
+        specs = (
+            ArtifactSpec(
+                "metadata", "metadata.yaml", True, Applicability.APPLICABLE,
+                ArtifactRepresentation.OPAQUE, "regular_file",
+            ),
+            ArtifactSpec(
+                "comparison", "comparison.json", False,
+                Applicability.APPLICABLE, ArtifactRepresentation.OPAQUE,
+                "regular_file", ("metadata",),
+            ),
+            ArtifactSpec(
+                "report", "report.md", True, Applicability.APPLICABLE,
+                ArtifactRepresentation.OPAQUE, "regular_file", ("comparison",),
+            ),
+        )
+        order = []
+
+        def producer(name):
+            def write(path):
+                order.append(name)
+                path.write_text(name, encoding="utf-8")
+            return write
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = prepare_prepromotion_ledger(
+                layer_a=layer,
+                inventory=specs,
+                staging_root=Path(temp_dir) / "report.partial",
+                applicability={},
+                producer_registry={"metadata": producer("metadata")},
+                comparison_producer=producer("comparison"),
+                report_producer=producer("report"),
+            )
+            self.assertEqual(["metadata", "comparison", "report"], order)
+            self.assertEqual(1, order.count("report"))
+            self.assertIsNone(ledger.by_name["report"].publication_status)
+
+    def test_disconnected_multiple_failed_parents_are_deterministic(self):
+        layer = LayerASnapshot("slice2", "none", "COMPLETED", 0, True)
+        specs = (
+            ArtifactSpec(
+                "a", "a.json", True, Applicability.APPLICABLE,
+                ArtifactRepresentation.OPAQUE, "regular_file",
+            ),
+            ArtifactSpec(
+                "b", "b.json", True, Applicability.APPLICABLE,
+                ArtifactRepresentation.OPAQUE, "regular_file",
+            ),
+            ArtifactSpec(
+                "child", "child.json", True, Applicability.APPLICABLE,
+                ArtifactRepresentation.OPAQUE, "regular_file", ("b", "a"),
+            ),
+            ArtifactSpec(
+                "sibling", "sibling.json", True, Applicability.APPLICABLE,
+                ArtifactRepresentation.OPAQUE, "regular_file",
+            ),
+        )
+        calls = []
+
+        def fail(path):
+            raise ProducerRenderError("root failed")
+
+        def sibling(path):
+            calls.append("sibling")
+            path.write_text("sibling", encoding="utf-8")
+
+        def child(path):
+            calls.append("child")
+            path.write_text("child", encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = prepare_prepromotion_ledger(
+                layer_a=layer,
+                inventory=specs,
+                staging_root=Path(temp_dir) / "parents.partial",
+                applicability={},
+                producer_registry={
+                    "a": fail,
+                    "b": fail,
+                    "child": child,
+                    "sibling": sibling,
+                },
+                report_producer=None,
+            )
+            child_record = ledger.by_name["child"]
+            self.assertEqual(
+                PublicationStatus.DEPENDENCY_FAILED,
+                child_record.publication_status,
+            )
+            self.assertEqual(
+                "applicable dependency failed for child: a, b",
+                child_record.failure_reason,
+            )
+            self.assertNotIn("child", calls)
+            self.assertIn("sibling", calls)
+
+    def test_orchestration_not_applicable_preserves_requiredness(self):
+        layer = LayerASnapshot("slice2", "none", "COMPLETED", 0, True)
+        orchestration = ArtifactSpec(
+            "orchestration", "orchestration.json", True,
+            Applicability.APPLICABLE,
+            ArtifactRepresentation.OPAQUE, "regular_file",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = prepare_prepromotion_ledger(
+                layer_a=layer,
+                inventory=(orchestration,),
+                staging_root=Path(temp_dir) / "orchestration.partial",
+                applicability={"orchestration": Applicability.NOT_APPLICABLE},
+                producer_registry={},
+                report_producer=None,
+            )
+            record = ledger.by_name["orchestration"]
+            self.assertEqual(
+                PublicationStatus.NOT_APPLICABLE,
+                record.publication_status,
+            )
+            self.assertTrue(record.required)
+            self.assertIs(record.applicability, Applicability.APPLICABLE)
+
+    def test_finalization_trace_write_failure_is_artifact_local(self):
+        layer = LayerASnapshot("slice2", "none", "COMPLETED", 0, True)
+        trace = ArtifactSpec(
+            "finalization_trace", "finalization_trace.json", False,
+            Applicability.APPLICABLE, ArtifactRepresentation.OPAQUE,
+            "regular_file",
+        )
+        sibling = ArtifactSpec(
+            "sibling", "sibling.json", True, Applicability.APPLICABLE,
+            ArtifactRepresentation.OPAQUE, "regular_file",
+        )
+
+        original_write_text = Path.write_text
+
+        def write_text(path, *args, **kwargs):
+            if path.name == "finalization_trace.json":
+                raise OSError("trace write failed")
+            return original_write_text(path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(Path, "write_text", new=write_text):
+                ledger = prepare_prepromotion_ledger(
+                    layer_a=layer,
+                    inventory=(trace, sibling),
+                    staging_root=Path(temp_dir) / "trace.partial",
+                    applicability={},
+                    producer_registry={
+                        "sibling": lambda path: path.write_text("ok")
+                    },
+                    report_producer=None,
+                )
+            self.assertEqual(
+                PublicationStatus.STAGE_FAILED,
+                ledger.by_name["finalization_trace"].publication_status,
+            )
+            self.assertIsNone(ledger.by_name["sibling"].publication_status)
+
+    def test_disconnected_partial_output_render_failure_is_explicit(self):
+        layer = LayerASnapshot("slice2", "none", "COMPLETED", 0, True)
+        spec = ArtifactSpec(
+            "broken", "broken.json", True, Applicability.APPLICABLE,
+            ArtifactRepresentation.OPAQUE, "regular_file",
+        )
+
+        def broken(path):
+            path.write_text("partial", encoding="utf-8")
+            raise ProducerRenderError("render interrupted")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = prepare_prepromotion_ledger(
+                layer_a=layer,
+                inventory=(spec,),
+                staging_root=Path(temp_dir) / "broken.partial",
+                applicability={},
+                producer_registry={"broken": broken},
+                report_producer=None,
+            )
+            self.assertEqual(
+                PublicationStatus.RENDER_FAILED,
+                ledger.by_name["broken"].publication_status,
+            )
+            self.assertFalse(
+                (Path(temp_dir) / "broken.partial" / "broken.json").exists()
+            )
+
+    def test_disconnected_explicit_stage_failure_before_target_continues(self):
+        layer = LayerASnapshot("slice2", "none", "COMPLETED", 0, True)
+        specs = (
+            ArtifactSpec(
+                "broken", "broken.json", True, Applicability.APPLICABLE,
+                ArtifactRepresentation.OPAQUE, "regular_file",
+            ),
+            ArtifactSpec(
+                "sibling", "sibling.json", True, Applicability.APPLICABLE,
+                ArtifactRepresentation.OPAQUE, "regular_file",
+            ),
+        )
+        calls = []
+
+        def broken(path):
+            calls.append("broken")
+            raise ProducerStagingError("stage interrupted")
+
+        def sibling(path):
+            calls.append("sibling")
+            path.write_text("sibling", encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = prepare_prepromotion_ledger(
+                layer_a=layer,
+                inventory=specs,
+                staging_root=Path(temp_dir) / "explicit.partial",
+                applicability={},
+                producer_registry={"broken": broken, "sibling": sibling},
+                report_producer=None,
+            )
+            self.assertEqual(
+                PublicationStatus.STAGE_FAILED,
+                ledger.by_name["broken"].publication_status,
+            )
+            self.assertIsNone(ledger.by_name["sibling"].publication_status)
+            self.assertEqual(["broken", "sibling"], calls)
+
+    def test_nested_parent_failure_continues(self):
+        layer = LayerASnapshot("slice2", "none", "COMPLETED", 0, True)
+        specs = (
+            ArtifactSpec(
+                "nested", "nested/artifact.json", True,
+                Applicability.APPLICABLE,
+                ArtifactRepresentation.OPAQUE, "regular_file",
+            ),
+            ArtifactSpec(
+                "sibling", "sibling.json", True, Applicability.APPLICABLE,
+                ArtifactRepresentation.OPAQUE, "regular_file",
+            ),
+        )
+
+        def write(path):
+            path.write_text("ok", encoding="utf-8")
+
+        original_mkdir = Path.mkdir
+
+        def fail_nested(path, *args, **kwargs):
+            if path.name == "nested":
+                raise OSError("cannot create nested parent")
+            return original_mkdir(path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(Path, "mkdir", new=fail_nested):
+                ledger = prepare_prepromotion_ledger(
+                    layer_a=layer,
+                    inventory=specs,
+                    staging_root=Path(temp_dir) / "mkdir.partial",
+                    applicability={},
+                    producer_registry={"nested": write, "sibling": write},
+                    report_producer=None,
+                )
+            self.assertEqual(
+                PublicationStatus.STAGE_FAILED,
+                ledger.by_name["nested"].publication_status,
+            )
+            self.assertIsNone(ledger.by_name["sibling"].publication_status)
 
 
 if __name__ == "__main__":

@@ -140,52 +140,187 @@ def generate_report(
     return path
 
 
-def generate_plots(run_dir: Path, samples: list[AlignedSample], metadata: dict[str, Any] | None = None) -> list[Path]:
-    paths = [
-        run_dir / "tracking_error.png",
-        run_dir / "trajectory_xy.png",
-        run_dir / "trajectory_3d.png",
-        run_dir / "tip_trajectory.png",
-        run_dir / "command_history.png",
-        run_dir / "solve_time.png",
-        run_dir / "cumulative_control_effort.png",
-    ]
-    if not samples:
-        for path in paths:
-            _empty_plot(path, "No aligned samples")
-        return _maybe_add_cylinder_plots(run_dir, paths, metadata)
+_BASE_PLOT_ARTIFACTS = (
+    ("tracking_error_plot", "tracking_error.png"),
+    ("trajectory_xy_plot", "trajectory_xy.png"),
+    ("trajectory_3d_plot", "trajectory_3d.png"),
+    ("tip_trajectory_plot", "tip_trajectory.png"),
+    ("command_history_plot", "command_history.png"),
+    ("solve_time_plot", "solve_time.png"),
+    ("cumulative_control_effort_plot", "cumulative_control_effort.png"),
+)
 
+
+def plot_artifact_names(
+    run_dir: Path,
+    metadata: dict[str, Any] | None = None,
+    *,
+    include_cylinder_plots: bool | None = None,
+) -> tuple[str, ...]:
+    names = [name for name, _ in _BASE_PLOT_ARTIFACTS]
+    if include_cylinder_plots is None:
+        configuration = (
+            {} if metadata is None else metadata.get("configuration", {})
+        )
+        lumen = configuration.get("cylindrical_lumen")
+        include_cylinder_plots = (
+            isinstance(lumen, dict)
+            and (run_dir / "cylinder_navigation.csv").is_file()
+        )
+    elif type(include_cylinder_plots) is not bool:
+        raise TypeError("include_cylinder_plots must be a bool or None")
+    if include_cylinder_plots:
+        names.extend(("wall_clearance_plot", "cylinder_backbone_target_plot"))
+    return tuple(names)
+
+
+def generate_plot_artifact(
+    logical_name: str,
+    run_dir: Path,
+    samples: list[AlignedSample],
+    metadata: dict[str, Any] | None = None,
+) -> Path:
+    paths = dict((name, run_dir / path) for name, path in _BASE_PLOT_ARTIFACTS)
+    if logical_name in {
+        "wall_clearance_plot",
+        "cylinder_backbone_target_plot",
+    }:
+        configuration = (
+            {} if metadata is None else metadata.get("configuration", {})
+        )
+        lumen = configuration.get("cylindrical_lumen")
+        cylinder_csv = run_dir / "cylinder_navigation.csv"
+        if not isinstance(lumen, dict) or not cylinder_csv.is_file():
+            raise FileNotFoundError(
+                "cylinder plot prerequisites are unavailable"
+            )
+        tip = (
+            np.asarray(
+                [sample.tip_position for sample in samples], dtype=float
+            )
+            if samples
+            else None
+        )
+        if logical_name == "wall_clearance_plot":
+            path = run_dir / "wall_clearance.png"
+            _wall_clearance_plot(path, cylinder_csv)
+            return path
+        path = run_dir / "cylinder_backbone_target_3d.png"
+        _cylinder_3d_plot(
+            path,
+            run_dir,
+            lumen,
+            configuration.get("goal", {}),
+            tip=tip,
+        )
+        return path
+    if logical_name not in paths:
+        raise KeyError(f"unknown plot artifact: {logical_name}")
+    path = paths[logical_name]
+    if not samples:
+        _empty_plot(path, "No aligned samples")
+        return path
     times = np.asarray([sample.timestamp for sample in samples], dtype=float)
     times = times - times[0]
-    tip = np.asarray([sample.tip_position for sample in samples], dtype=float)
-    reference = np.asarray([sample.reference_position for sample in samples], dtype=float)
+    tip = np.asarray(
+        [sample.tip_position for sample in samples], dtype=float
+    )
+    reference = np.asarray(
+        [sample.reference_position for sample in samples], dtype=float
+    )
     commands = np.asarray([sample.command for sample in samples], dtype=float)
     errors = np.linalg.norm(tip - reference, axis=1)
     solve_times = np.asarray(
-        [math.nan if not math.isfinite(sample.solve_time) else sample.solve_time for sample in samples],
+        [
+            math.nan if not math.isfinite(sample.solve_time)
+            else sample.solve_time
+            for sample in samples
+        ],
         dtype=float,
     )
     effort = np.asarray(
-        compute_control_effort_series(times=times, commands=commands).cumulative_total_effort,
+        compute_control_effort_series(
+            times=times,
+            commands=commands,
+        ).cumulative_total_effort,
         dtype=float,
     )
+    if logical_name == "tracking_error_plot":
+        _line_plot(
+            path,
+            times,
+            [errors],
+            ["tip error"],
+            "Tracking Error",
+            "time [s]",
+            "error [m]",
+        )
+    elif logical_name == "trajectory_xy_plot":
+        _xy_plot(path, tip, reference)
+    elif logical_name in {"trajectory_3d_plot", "tip_trajectory_plot"}:
+        _trajectory_3d_plot(path, tip, reference)
+    elif logical_name == "command_history_plot":
+        _line_plot(
+            path,
+            times,
+            [commands[:, index] for index in range(commands.shape[1])],
+            [f"u{index}" for index in range(commands.shape[1])],
+            "Command History",
+            "time [s]",
+            "command [SI units/s]",
+        )
+    elif logical_name == "solve_time_plot":
+        _line_plot(
+            path,
+            times,
+            [solve_times],
+            ["solve time"],
+            "Solve Time",
+            "time [s]",
+            "solve time [s]",
+        )
+    else:
+        _line_plot(
+            path,
+            times,
+            [effort],
+            ["effort"],
+            "Cumulative Control Effort",
+            "time [s]",
+            "sum ||u||^2 dt",
+        )
+    return path
 
-    _line_plot(paths[0], times, [errors], ["tip error"], "Tracking Error", "time [s]", "error [m]")
-    _xy_plot(paths[1], tip, reference)
-    _trajectory_3d_plot(paths[2], tip, reference)
-    _trajectory_3d_plot(paths[3], tip, reference)
-    _line_plot(
-        paths[4],
-        times,
-        [commands[:, index] for index in range(commands.shape[1])],
-        [f"u{index}" for index in range(commands.shape[1])],
-        "Command History",
-        "time [s]",
-        "command [SI units/s]",
-    )
-    _line_plot(paths[5], times, [solve_times], ["solve time"], "Solve Time", "time [s]", "solve time [s]")
-    _line_plot(paths[6], times, [effort], ["effort"], "Cumulative Control Effort", "time [s]", "sum ||u||^2 dt")
-    return _maybe_add_cylinder_plots(run_dir, paths, metadata, tip=tip)
+
+def plot_producer_registry(
+    run_dir: Path,
+    samples: list[AlignedSample],
+    metadata: dict[str, Any] | None = None,
+    *,
+    include_cylinder_plots: bool | None = None,
+) -> dict[str, Any]:
+    return {
+        name: (
+            lambda output_dir, name=name: generate_plot_artifact(
+                name, output_dir, samples, metadata
+            )
+        )
+        for name in plot_artifact_names(
+            run_dir, metadata, include_cylinder_plots=include_cylinder_plots
+        )
+    }
+
+
+def generate_plots(
+    run_dir: Path,
+    samples: list[AlignedSample],
+    metadata: dict[str, Any] | None = None,
+) -> list[Path]:
+    registry = plot_producer_registry(run_dir, samples, metadata)
+    return [
+        registry[name](run_dir)
+        for name in plot_artifact_names(run_dir, metadata)
+    ]
 
 
 def _metrics_table(title: str, values: dict[str, Any], description: str | None = None) -> list[str]:

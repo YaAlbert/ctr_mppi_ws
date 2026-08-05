@@ -13,7 +13,7 @@ import socket
 import subprocess
 import tempfile
 import uuid
-from typing import Any
+from typing import Any, Callable, Mapping
 
 import numpy as np
 import yaml
@@ -72,6 +72,19 @@ from ctr_evaluation.time_alignment import (
     state_sample,
 )
 
+
+from ctr_evaluation.publication_model import (
+    Applicability,
+    ArtifactRecord,
+    ArtifactSpec,
+    LayerASnapshot,
+    PrePromotionLedger,
+    PublicationStatus,
+    prepromotion_failure_record,
+    prepromotion_not_applicable_record,
+    prepromotion_staged_record,
+    validate_artifact_specs,
+)
 
 STATE_IDLE = "IDLE"
 STATE_RECORDING = "RECORDING"
@@ -302,6 +315,290 @@ class LumenRecorderResult:
     required: bool
     section: dict[str, Any] | None = None
     csv_rows: tuple[dict[str, Any], ...] = ()
+
+
+class StagingSetupError(RuntimeError):
+    """The disconnected coordinator could not exclusively acquire staging."""
+
+
+class ProducerRenderError(RuntimeError):
+    """A producer failed while rendering its artifact content."""
+
+
+class ProducerStagingError(RuntimeError):
+    """A producer failed while writing its artifact to staging."""
+
+
+def _prepromotion_order(
+    specs: tuple[ArtifactSpec, ...],
+) -> tuple[ArtifactSpec, ...]:
+    by_name = {item.logical_name: item for item in specs}
+    indegree = {item.logical_name: 0 for item in specs}
+    children = {item.logical_name: [] for item in specs}
+    for item in specs:
+        for dependency in item.dependencies:
+            indegree[item.logical_name] += 1
+            children[dependency].append(item.logical_name)
+    ready = sorted(name for name, count in indegree.items() if count == 0)
+    ordered: list[ArtifactSpec] = []
+    while ready:
+        name = ready.pop(0)
+        ordered.append(by_name[name])
+        for child in sorted(children[name]):
+            indegree[child] -= 1
+            if indegree[child] == 0:
+                ready.append(child)
+                ready.sort()
+    if len(ordered) != len(specs):
+        raise ValueError(
+            "artifact dependency graph did not produce a complete order"
+        )
+    return tuple(ordered)
+
+
+def _dependency_failure_reason(name: str, failed: list[str]) -> str:
+    joined = ", ".join(sorted(failed))
+    return f"applicable dependency failed for {name}: {joined}"
+
+
+def prepare_prepromotion_ledger(
+    *,
+    layer_a: LayerASnapshot,
+    inventory: tuple[ArtifactSpec, ...] | list[ArtifactSpec],
+    staging_root: Path,
+    applicability: Mapping[str, Applicability | bool] | None,
+    producer_registry: Mapping[str, Callable[[Path], Any]],
+    report_producer: Callable[[Path], Any] | None,
+    orchestration_producer: Callable[[Path], Any] | None = None,
+    comparison_producer: Callable[[Path], Any] | None = None,
+) -> PrePromotionLedger:
+    """Run disconnected artifact attempts and return a pre-promotion ledger.
+
+    Producers receive their exact target path inside the caller-owned staging
+    directory and must create that regular file. No final directory is
+    inspected and this function never renames or publishes the staging root.
+    """
+    if not isinstance(layer_a, LayerASnapshot):
+        raise TypeError("layer_a must be a LayerASnapshot")
+    specs = tuple(inventory)
+    validate_artifact_specs(specs)
+    if not isinstance(staging_root, Path):
+        raise TypeError("staging_root must be a Path")
+    if (
+        staging_root.name in {"", ".", ".."}
+        or not staging_root.name.endswith(".partial")
+    ):
+        raise ValueError(
+            "staging_root must be an explicitly named .partial directory"
+        )
+    if staging_root.exists():
+        raise StagingSetupError(f"staging root already exists: {staging_root}")
+    try:
+        staging_root.mkdir(parents=True, exist_ok=False)
+    except OSError as exc:
+        raise StagingSetupError(
+            f"could not acquire staging root: {staging_root}"
+        ) from exc
+
+    applicability = dict(applicability or {})
+    unknown_applicability = {
+        name for name in applicability
+    } - {spec.logical_name for spec in specs}
+    if unknown_applicability:
+        raise ValueError(
+            "unknown applicability entries: "
+            f"{', '.join(sorted(unknown_applicability))}"
+        )
+    execution_applicability: dict[str, Applicability] = {}
+    for spec in specs:
+        selected = applicability.get(spec.logical_name, spec.applicability)
+        if isinstance(selected, bool):
+            selected = (
+                Applicability.APPLICABLE
+                if selected else Applicability.NOT_APPLICABLE
+            )
+        if not isinstance(selected, Applicability):
+            raise TypeError(
+                f"applicability for {spec.logical_name} must be "
+                "an Applicability"
+            )
+        execution_applicability[spec.logical_name] = selected
+
+    records: dict[str, ArtifactRecord] = {}
+    for spec in specs:
+        if (
+            execution_applicability[spec.logical_name]
+            is Applicability.NOT_APPLICABLE
+        ):
+            records[spec.logical_name] = prepromotion_not_applicable_record(
+                spec, layer_a
+            )
+
+    ordered = _prepromotion_order(specs)
+
+    def attempt(
+        spec: ArtifactSpec, producer: Callable[[Path], Any] | None
+    ) -> None:
+        target = staging_root / spec.relative_path
+
+        def cleanup_target() -> None:
+            if target.is_file() and not target.is_symlink():
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            records[spec.logical_name] = prepromotion_failure_record(
+                spec, layer_a, PublicationStatus.STAGE_FAILED,
+                f"{type(exc).__name__}: {exc}",
+                run_applicability=execution_applicability[spec.logical_name],
+            )
+            return
+        if producer is None and spec.logical_name != "finalization_trace":
+            records[spec.logical_name] = prepromotion_failure_record(
+                spec, layer_a, PublicationStatus.DEPENDENCY_FAILED,
+                f"external producer callback absent: {spec.logical_name}",
+                run_applicability=execution_applicability[spec.logical_name],
+            )
+            return
+        try:
+            if producer is None:
+                try:
+                    target.write_text(
+                        json.dumps(
+                            {
+                                "schema_version": "finalization_trace_v1",
+                                "events": [],
+                            }
+                        ) + "\n",
+                        encoding="utf-8",
+                    )
+                except Exception as exc:
+                    raise ProducerStagingError(str(exc)) from exc
+            else:
+                producer(target)
+        except ProducerRenderError as exc:
+            cleanup_target()
+            records[spec.logical_name] = prepromotion_failure_record(
+                spec, layer_a, PublicationStatus.RENDER_FAILED,
+                f"{type(exc).__name__}: {exc}",
+                run_applicability=execution_applicability[spec.logical_name],
+            )
+            return
+        except ProducerStagingError as exc:
+            cleanup_target()
+            records[spec.logical_name] = prepromotion_failure_record(
+                spec, layer_a, PublicationStatus.STAGE_FAILED,
+                f"{type(exc).__name__}: {exc}",
+                run_applicability=execution_applicability[spec.logical_name],
+            )
+            return
+        except Exception as exc:
+            cleanup_target()
+            # Unexpected producer errors default to render failure. Residue is
+            # never used to infer the failed protocol stage.
+            records[spec.logical_name] = prepromotion_failure_record(
+                spec, layer_a, PublicationStatus.RENDER_FAILED,
+                f"{type(exc).__name__}: {exc}",
+                run_applicability=execution_applicability[spec.logical_name],
+            )
+            return
+        try:
+            valid_target = target.is_file() and not target.is_symlink()
+        except Exception as exc:
+            cleanup_target()
+            records[spec.logical_name] = prepromotion_failure_record(
+                spec, layer_a, PublicationStatus.STAGE_FAILED,
+                f"{type(exc).__name__}: {exc}",
+                run_applicability=execution_applicability[spec.logical_name],
+            )
+            return
+        if not valid_target:
+            records[spec.logical_name] = prepromotion_failure_record(
+                spec, layer_a, PublicationStatus.STAGE_FAILED,
+                "producer did not create expected regular file: "
+                f"{spec.relative_path}",
+                run_applicability=execution_applicability[spec.logical_name],
+            )
+            return
+        records[spec.logical_name] = prepromotion_staged_record(
+            spec,
+            layer_a,
+            run_applicability=execution_applicability[spec.logical_name],
+        )
+
+    report_spec = next(
+        (spec for spec in specs if spec.logical_name == "report"), None
+    )
+    for spec in ordered:
+        if spec.logical_name == "report":
+            continue
+        if (
+            execution_applicability[spec.logical_name]
+            is Applicability.NOT_APPLICABLE
+        ):
+            continue
+        failed = [
+            dependency for dependency in spec.dependencies
+            if records.get(dependency) is not None
+            and records[dependency].publication_status not in {
+                None,
+                PublicationStatus.NOT_APPLICABLE,
+            }
+        ]
+        if failed:
+            records[spec.logical_name] = prepromotion_failure_record(
+                spec, layer_a, PublicationStatus.DEPENDENCY_FAILED,
+                _dependency_failure_reason(spec.logical_name, failed),
+                run_applicability=execution_applicability[spec.logical_name],
+            )
+            continue
+        if spec.logical_name == "orchestration":
+            attempt(spec, orchestration_producer)
+        elif (
+            spec.logical_name == "comparison"
+            and comparison_producer is not None
+        ):
+            attempt(spec, comparison_producer)
+        else:
+            attempt(spec, producer_registry.get(spec.logical_name))
+
+    if (
+        report_spec is not None
+        and execution_applicability[report_spec.logical_name]
+        is Applicability.APPLICABLE
+    ):
+        failed = [
+            dependency for dependency in report_spec.dependencies
+            if records.get(dependency) is not None
+            and records[dependency].publication_status not in {
+                None,
+                PublicationStatus.NOT_APPLICABLE,
+            }
+        ]
+        if failed:
+            records["report"] = prepromotion_failure_record(
+                report_spec, layer_a, PublicationStatus.DEPENDENCY_FAILED,
+                _dependency_failure_reason("report", failed),
+                run_applicability=execution_applicability[
+                    report_spec.logical_name
+                ],
+            )
+        else:
+            attempt(report_spec, report_producer)
+
+    for spec in specs:
+        if spec.logical_name not in records:
+            records[spec.logical_name] = prepromotion_failure_record(
+                spec, layer_a, PublicationStatus.DEPENDENCY_FAILED,
+                f"producer execution did not terminalize: {spec.logical_name}",
+                run_applicability=execution_applicability[spec.logical_name],
+            )
+    ordered_records = tuple(records[spec.logical_name] for spec in specs)
+    return PrePromotionLedger(ordered_records, specs, staging_root)
 
 
 class ExperimentRecorder:

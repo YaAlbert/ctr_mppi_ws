@@ -11,7 +11,13 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PACKAGE_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "src" / "ctr_mppi_controller"))
 
-from ctr_evaluation.report_generator import generate_plots, generate_report  # noqa: E402
+from ctr_evaluation.report_generator import (  # noqa: E402
+    generate_plot_artifact,
+    generate_plots,
+    plot_artifact_names,
+    plot_producer_registry,
+    generate_report,
+)
 from ctr_evaluation.time_alignment import AlignedSample  # noqa: E402
 
 
@@ -52,6 +58,43 @@ class ReportGeneratorTest(unittest.TestCase):
             self.assertEqual(7, len(paths))
             self.assertIn("tip_trajectory.png", [path.name for path in paths])
             self.assertTrue(all(path.is_file() for path in paths))
+
+    def test_plot_dispatch_is_deterministic_and_single_artifact(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            names = plot_artifact_names(run_dir)
+            self.assertEqual(7, len(names))
+            self.assertEqual(names, plot_artifact_names(run_dir))
+            registry = plot_producer_registry(
+                run_dir, [sample(0.0), sample(1.0)]
+            )
+            self.assertEqual(names, tuple(registry))
+            path = registry["tracking_error_plot"](run_dir)
+            self.assertEqual("tracking_error.png", path.name)
+            self.assertTrue(path.is_file())
+            self.assertFalse((run_dir / "trajectory_xy.png").exists())
+
+    def test_cylinder_registry_uses_explicit_applicability(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            metadata = {
+                "configuration": {"cylindrical_lumen": {"enabled": True}}
+            }
+            names = plot_artifact_names(
+                run_dir, metadata, include_cylinder_plots=True
+            )
+            registry = plot_producer_registry(
+                run_dir, [sample(0.0)], metadata, include_cylinder_plots=True
+            )
+            self.assertIn("wall_clearance_plot", names)
+            self.assertIn("cylinder_backbone_target_plot", names)
+            self.assertEqual(names, tuple(registry))
+            self.assertFalse((run_dir / "cylinder_navigation.csv").exists())
+
+    def test_plot_dispatch_unknown_name_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaises(KeyError):
+                generate_plot_artifact("missing_plot", Path(temp_dir), [])
 
     def test_markdown_report_contains_required_sections(self):
         with tempfile.TemporaryDirectory() as temp_dir:
