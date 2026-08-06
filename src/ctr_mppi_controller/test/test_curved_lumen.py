@@ -2,6 +2,7 @@ import math
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -16,6 +17,9 @@ from ctr_mppi_controller.curved_lumen import (  # noqa: E402
 )
 from ctr_mppi_controller.cylindrical_lumen import CylindricalLumen  # noqa: E402
 from ctr_mppi_controller.lumen_geometry import LumenGeometry  # noqa: E402
+from ctr_mppi_controller.lumen_geometry import (  # noqa: E402
+    PROJECTION_TIE_TOLERANCE,
+)
 
 
 def straight_curved_lumen(**overrides):
@@ -117,6 +121,79 @@ class CurvedLumenInterfaceAndValidationTest(unittest.TestCase):
 
 
 class CurvedLumenProjectionTest(unittest.TestCase):
+    def test_vectorized_projection_uses_bounded_array_clip_calls(self):
+        lumen = kinked_lumen()
+        with patch(
+            "ctr_mppi_controller.curved_lumen.np.clip", wraps=np.clip
+        ) as clip:
+            lumen.project_point([0.020, 0.0, 0.060])
+        self.assertEqual(1, clip.call_count)
+
+    def test_nontransitive_tie_preserves_sequential_selection(self):
+        centerline = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [-1.71856464e-6, 9.03459556e-7, -1.33887194e-8],
+                [-1.90786742e-7, 7.74289252e-7, -1.42368087e-8],
+                [9.48807876e-7, 2.01177740e-7, -7.18050201e-7],
+                [1.51859567e-6, 2.05447009e-8, -8.56721815e-7],
+            ],
+            dtype=float,
+        )
+        lumen = straight_curved_lumen(
+            centerline_points=centerline,
+            lumen_radius=0.05,
+            ctr_outer_radius=0.005,
+            safety_margin=0.001,
+        )
+        point = np.array([7.13700016e-7, 1.09911115e-6, -3.94643358e-8])
+
+        # Pairwise ties are non-transitive; the sequential rule
+        # reaches segment 2.
+        projection = lumen.project_point(point)
+        clearance = lumen.point_clearance(point)
+
+        self.assertEqual(2, projection.segment_index)
+        self.assertAlmostEqual(
+            0.4062898638534053, projection.segment_parameter, places=14
+        )
+        np.testing.assert_allclose(
+            [
+                2.722190001952934e-7,
+                5.414398538167008e-7,
+                -3.001890560357703e-7,
+            ],
+            projection.closest_point,
+            rtol=1e-12,
+            atol=1e-18,
+        )
+        self.assertAlmostEqual(
+            4.066761275045901e-6, projection.progress, places=17
+        )
+        self.assertAlmostEqual(
+            7.575487717927721e-7, projection.radial_distance, places=17
+        )
+        self.assertAlmostEqual(0.05, projection.local_radius, places=14)
+        self.assertAlmostEqual(
+            0.04499924245122821, clearance.physical_clearance, places=17
+        )
+
+    def test_two_segment_tie_keeps_first_segment(self):
+        lumen = CurvedLumen(
+            frame_id="base_link",
+            centerline_points=[
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+            ],
+            lumen_radius=1.0,
+            ctr_outer_radius=0.0,
+            safety_margin=0.0,
+        )
+        point = [1.0, math.sqrt(1.0 + 0.5 * PROJECTION_TIE_TOLERANCE), 0.0]
+        actual = lumen.project_point(point)
+        self.assertEqual(0, actual.segment_index)
+
     def test_point_exactly_on_segment(self):
         projection = straight_curved_lumen().project_point([0.0, 0.0, 0.060])
         self.assertEqual(0, projection.segment_index)

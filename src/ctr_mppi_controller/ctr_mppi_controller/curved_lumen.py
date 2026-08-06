@@ -86,31 +86,42 @@ class CurvedLumen:
 
     def project_point(self, point: Any) -> CenterlineProjection:
         point_array = vector3(point, "point")
+        starts = self.centerline_points[:-1]
+        vectors = self.segment_vectors
+        squared_lengths = self.segment_lengths * self.segment_lengths
+        offsets = point_array - starts
+        raw_parameters = np.einsum(
+            "ij,ij->i", offsets, vectors
+        ) / squared_lengths
+        parameters = np.clip(raw_parameters, 0.0, 1.0)
+        closest_points = starts + parameters[:, None] * vectors
+        deltas = point_array - closest_points
+        distance_squared = np.einsum("ij,ij->i", deltas, deltas)
+
         best_distance_squared = float("inf")
         best_index = 0
         best_parameter = 0.0
-        best_closest = self.centerline_points[0]
-        for index, (start, vector, length) in enumerate(
-            zip(self.centerline_points[:-1], self.segment_vectors, self.segment_lengths)
+        for index, (distance, parameter) in enumerate(
+            zip(distance_squared, parameters)
         ):
-            raw_parameter = float(np.dot(point_array - start, vector) / (length * length))
-            parameter = float(np.clip(raw_parameter, 0.0, 1.0))
-            closest = start + parameter * vector
-            delta = point_array - closest
-            distance_squared = float(np.dot(delta, delta))
+            distance = float(distance)
+            parameter = float(parameter)
             if _is_better_projection(
-                distance_squared,
+                distance,
                 index,
                 parameter,
                 best_distance_squared,
                 best_index,
                 best_parameter,
             ):
-                best_distance_squared = distance_squared
+                best_distance_squared = distance
                 best_index = index
                 best_parameter = parameter
-                best_closest = closest
-        progress = float(self.cumulative_arc_lengths[best_index] + best_parameter * self.segment_lengths[best_index])
+        best_closest = closest_points[best_index]
+        progress = float(
+            self.cumulative_arc_lengths[best_index]
+            + best_parameter * self.segment_lengths[best_index]
+        )
         radius = float(
             (1.0 - best_parameter) * self.radius_profile[best_index]
             + best_parameter * self.radius_profile[best_index + 1]
