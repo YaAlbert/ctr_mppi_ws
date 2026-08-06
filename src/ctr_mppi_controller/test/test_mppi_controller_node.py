@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+from builtin_interfaces.msg import Time
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -96,10 +97,13 @@ class FakeLogger:
 
 class FakeTime:
     def __init__(self, seconds=10.0):
-        self.nanoseconds = int(seconds * 1.0e9)
+        self.nanoseconds = int(round(seconds * 1.0e9))
 
     def to_msg(self):
-        return SimpleNamespace(sec=int(self.nanoseconds // 1_000_000_000), nanosec=int(self.nanoseconds % 1_000_000_000))
+        message = Time()
+        message.sec = int(self.nanoseconds // 1_000_000_000)
+        message.nanosec = int(self.nanoseconds % 1_000_000_000)
+        return message
 
 
 class FakeClock:
@@ -649,6 +653,10 @@ class MPPIControllerNodeHelpersTest(unittest.TestCase):
         node._on_timer()
         self.assertEqual(1, node.core.solve_calls)
         self.assertTrue(np.array_equal(previous_points, node.core.solve_kwargs[0]["target_tip_sequence"]))
+        stamp = node.command_pub.messages[0].header.stamp
+        self.assertIsInstance(stamp, Time)
+        self.assertEqual(10, stamp.sec)
+        self.assertEqual(110000000, stamp.nanosec)
 
     def test_trajectory_valid_replacement_duplicate_and_timestamp_policy(self):
         node = controller_shell(mode=TRAJECTORY)
