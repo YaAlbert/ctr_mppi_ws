@@ -122,6 +122,31 @@ class PublicationModelTest(unittest.TestCase):
         self.assertNotIn("aggregate_summary", by_name)
         self.assertNotIn("aggregate_report", by_name)
 
+    def test_cylinder_applicability_is_independent_of_lumen_evaluation(self):
+        specs = build_artifact_inventory(
+            include_lumen=False,
+            include_cylinder=True,
+            include_plots=True,
+            include_comparison=False,
+        )
+        by_name = {item.logical_name: item for item in specs}
+        self.assertIs(
+            Applicability.NOT_APPLICABLE,
+            by_name["lumen_evaluation"].applicability,
+        )
+        self.assertIs(
+            Applicability.APPLICABLE,
+            by_name["cylinder_navigation"].applicability,
+        )
+        self.assertIs(
+            Applicability.APPLICABLE,
+            by_name["wall_clearance_plot"].applicability,
+        )
+        self.assertNotIn(
+            "lumen_evaluation",
+            by_name["wall_clearance_plot"].dependencies,
+        )
+
     def test_inventory_dependencies_are_real_payload_edges(self):
         by_name = {item.logical_name: item for item in build_artifact_inventory(include_lumen=True, include_plots=True, include_comparison=True)}
         self.assertEqual(("aligned_samples",), by_name["lumen_evaluation"].dependencies)
