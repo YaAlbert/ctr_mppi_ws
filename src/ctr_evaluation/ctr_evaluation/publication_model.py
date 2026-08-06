@@ -413,13 +413,15 @@ class ArtifactRecord:
         return ArtifactRecord(self._spec, self._layer_a, **values, run_applicability=self.run_applicability)
 
 
-def build_artifact_inventory(*, include_lumen: bool, include_plots: bool, include_comparison: bool, include_finalization_error: bool = False) -> tuple[ArtifactSpec, ...]:
+def build_artifact_inventory(*, include_lumen: bool, include_plots: bool, include_comparison: bool, include_finalization_error: bool = False, include_cylinder: bool | None = None) -> tuple[ArtifactSpec, ...]:
     """Return current producer-backed payloads; late sidecar is deferred.
 
     Optional dependencies are satisfied by a NOT_APPLICABLE dependency when
     the corresponding producer is disabled. A failed applicable dependency
     remains a dependency failure for later publication orchestration.
     """
+    if include_cylinder is None:
+        include_cylinder = include_lumen
     plots = (("tracking_error_plot", "tracking_error.png"), ("trajectory_xy_plot", "trajectory_xy.png"), ("trajectory_3d_plot", "trajectory_3d.png"), ("tip_trajectory_plot", "tip_trajectory.png"), ("command_history_plot", "command_history.png"), ("solve_time_plot", "solve_time.png"), ("cumulative_control_effort_plot", "cumulative_control_effort.png"))
     plot_names = tuple(name for name, _ in plots)
     specs = [
@@ -435,10 +437,10 @@ def build_artifact_inventory(*, include_lumen: bool, include_plots: bool, includ
         ArtifactSpec("summary", "summary.json", True, Applicability.APPLICABLE, ArtifactRepresentation.OPAQUE, "regular_file"),
         ArtifactSpec("aligned_samples", "aligned_samples.csv", True, Applicability.APPLICABLE, ArtifactRepresentation.OPAQUE, "regular_file"),
         ArtifactSpec("lumen_evaluation", "lumen_evaluation.csv", False, _app(include_lumen), ArtifactRepresentation.OPAQUE, "regular_file", ("aligned_samples",)),
-        ArtifactSpec("cylinder_navigation", "cylinder_navigation.csv", False, _app(include_lumen), ArtifactRepresentation.OPAQUE, "regular_file"),
+        ArtifactSpec("cylinder_navigation", "cylinder_navigation.csv", False, _app(include_cylinder), ArtifactRepresentation.OPAQUE, "regular_file"),
         *[ArtifactSpec(name, path, False, _app(include_plots), ArtifactRepresentation.OPAQUE, "regular_file", ("aligned_samples",)) for name, path in plots],
-        ArtifactSpec("wall_clearance_plot", "wall_clearance.png", False, _app(include_lumen and include_plots), ArtifactRepresentation.OPAQUE, "regular_file", ("cylinder_navigation",)),
-        ArtifactSpec("cylinder_backbone_target_plot", "cylinder_backbone_target_3d.png", False, _app(include_lumen and include_plots), ArtifactRepresentation.OPAQUE, "regular_file", ("cylinder_navigation", "metadata", "backbone")),
+        ArtifactSpec("wall_clearance_plot", "wall_clearance.png", False, _app(include_cylinder and include_plots), ArtifactRepresentation.OPAQUE, "regular_file", ("cylinder_navigation",)),
+        ArtifactSpec("cylinder_backbone_target_plot", "cylinder_backbone_target_3d.png", False, _app(include_cylinder and include_plots), ArtifactRepresentation.OPAQUE, "regular_file", ("cylinder_navigation", "metadata", "backbone")),
         ArtifactSpec("comparison", "comparison.json", False, _app(include_comparison), ArtifactRepresentation.OPAQUE, "regular_file", ("metadata", "summary")),
         ArtifactSpec("comparison_report", "comparison.md", False, _app(include_comparison), ArtifactRepresentation.OPAQUE, "regular_file", ("comparison",)),
         ArtifactSpec("report", "report.md", True, Applicability.APPLICABLE, ArtifactRepresentation.OPAQUE, "regular_file", ("metadata", "summary", "aligned_samples", "comparison", "comparison_report", *plot_names, "wall_clearance_plot", "cylinder_backbone_target_plot")),

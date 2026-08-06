@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import csv
+import cProfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 import json
 import math
 import os
@@ -12,6 +14,7 @@ from pathlib import Path
 import socket
 import subprocess
 import tempfile
+import time
 import uuid
 from typing import Any, Callable, Mapping
 
@@ -75,6 +78,7 @@ from ctr_evaluation.time_alignment import (
 
 from ctr_evaluation.publication_model import (
     Applicability,
+    build_artifact_inventory,
     ArtifactRecord,
     ArtifactSpec,
     LayerASnapshot,
@@ -300,6 +304,7 @@ class FinalizationResult:
     metadata: dict[str, Any]
     comparison: dict[str, Any] | None
     output_files: list[Path]
+    promotion: PromotionResult | None = None
 
 
 @dataclass(frozen=True)
@@ -371,6 +376,7 @@ def prepare_prepromotion_ledger(
     report_producer: Callable[[Path], Any] | None,
     orchestration_producer: Callable[[Path], Any] | None = None,
     comparison_producer: Callable[[Path], Any] | None = None,
+    acquire_staging: bool = True,
 ) -> PrePromotionLedger:
     """Run disconnected artifact attempts and return a pre-promotion ledger.
 
@@ -391,14 +397,21 @@ def prepare_prepromotion_ledger(
         raise ValueError(
             "staging_root must be an explicitly named .partial directory"
         )
-    if staging_root.exists():
-        raise StagingSetupError(f"staging root already exists: {staging_root}")
-    try:
-        staging_root.mkdir(parents=True, exist_ok=False)
-    except OSError as exc:
+    if acquire_staging:
+        if staging_root.exists():
+            raise StagingSetupError(
+                f"staging root already exists: {staging_root}"
+            )
+        try:
+            staging_root.mkdir(parents=True, exist_ok=False)
+        except OSError as exc:
+            raise StagingSetupError(
+                f"could not acquire staging root: {staging_root}"
+            ) from exc
+    elif staging_root.is_symlink() or not staging_root.is_dir():
         raise StagingSetupError(
-            f"could not acquire staging root: {staging_root}"
-        ) from exc
+            f"pre-acquired staging root is not a directory: {staging_root}"
+        )
 
     applicability = dict(applicability or {})
     unknown_applicability = {
@@ -601,6 +614,165 @@ def prepare_prepromotion_ledger(
     return PrePromotionLedger(ordered_records, specs, staging_root)
 
 
+class PromotionStatus(str, Enum):
+    """Filesystem-only outcome of the Slice 3 promotion boundary."""
+
+    PRE_PROMOTION_FAILED = "PRE_PROMOTION_FAILED"
+    PROMOTION_REFUSED = "PROMOTION_REFUSED"
+    PROMOTION_FAILED = "PROMOTION_FAILED"
+    PROMOTED_AND_OBSERVED = "PROMOTED_AND_OBSERVED"
+    PROMOTED_OBSERVATION_FAILED = "PROMOTED_OBSERVATION_FAILED"
+
+
+@dataclass(frozen=True)
+class PromotionResult:
+    """Non-authoritative evidence about staging and final-path observation."""
+
+    status: PromotionStatus
+    staging_dir: Path
+    final_dir: Path
+    reason: str | None = None
+    observed_paths: tuple[Path, ...] = ()
+    failure_evidence_dir: Path | None = None
+
+
+def _owned_path(root: Path, relative_path: str) -> Path:
+    root_resolved = root.resolve()
+    candidate = root / relative_path
+    candidate_resolved = candidate.resolve(strict=False)
+    if root_resolved not in candidate_resolved.parents:
+        raise ValueError(
+            f"artifact path escapes staging root: {relative_path}"
+        )
+    return candidate
+
+
+def _promotion_eligibility(ledger: PrePromotionLedger) -> tuple[str, ...]:
+    if not isinstance(ledger, PrePromotionLedger):
+        return ("promotion requires a PrePromotionLedger",)
+    root = ledger.staging_root
+    if root.is_symlink() or not root.is_dir():
+        return (f"staging directory is absent: {root}",)
+    reasons: list[str] = []
+    for record in ledger.records:
+        if record.run_applicability is Applicability.NOT_APPLICABLE:
+            continue
+        try:
+            target = _owned_path(root, record.relative_path)
+        except ValueError as exc:
+            reasons.append(str(exc))
+            continue
+        if record.publication_status is None:
+            if target.is_symlink() or not target.is_file():
+                reasons.append(
+                    f"staged artifact is missing or not a regular file: "
+                    f"{record.logical_name}"
+                )
+        elif record.required:
+            reasons.append(
+                f"required applicable artifact failed: {record.logical_name}"
+            )
+    return tuple(reasons)
+
+
+def promote_prepromotion_ledger(
+    ledger: PrePromotionLedger,
+    final_dir: Path,
+) -> PromotionResult:
+    """Promote staging and observe paths without publication authority."""
+    if not isinstance(final_dir, Path):
+        raise TypeError("final_dir must be a Path")
+    if not isinstance(ledger, PrePromotionLedger):
+        return PromotionResult(
+            PromotionStatus.PRE_PROMOTION_FAILED,
+            Path("."),
+            final_dir,
+            "promotion requires a PrePromotionLedger",
+        )
+    staging_dir = ledger.staging_root
+    try:
+        reasons = list(_promotion_eligibility(ledger))
+        if staging_dir.name != f"{final_dir.name}.partial":
+            reasons.append("staging and final paths are not the same run")
+        if staging_dir.parent != final_dir.parent:
+            reasons.append("staging and final paths do not share a parent")
+        if final_dir.exists():
+            reasons.append(f"final directory already exists: {final_dir}")
+        if reasons:
+            return PromotionResult(
+                PromotionStatus.PROMOTION_REFUSED,
+                staging_dir,
+                final_dir,
+                "; ".join(reasons),
+                failure_evidence_dir=staging_dir,
+            )
+        try:
+            staging_dir.replace(final_dir)
+        except OSError as exc:
+            return PromotionResult(
+                PromotionStatus.PROMOTION_FAILED,
+                staging_dir,
+                final_dir,
+                f"atomic promotion failed: {exc}",
+                failure_evidence_dir=staging_dir,
+            )
+        expected: set[Path] = set()
+        missing: list[str] = []
+        for record in ledger.records:
+            if (
+                record.run_applicability is Applicability.APPLICABLE
+                and record.publication_status is None
+            ):
+                try:
+                    path = _owned_path(final_dir, record.relative_path)
+                except ValueError as exc:
+                    missing.append(str(exc))
+                    continue
+                expected.add(path.relative_to(final_dir.resolve()))
+                if path.is_symlink() or not path.is_file():
+                    missing.append(record.logical_name)
+        observed_entries = {
+            path.relative_to(final_dir.resolve())
+            for path in final_dir.rglob("*")
+        }
+        unexpected = sorted(observed_entries - expected, key=str)
+        if missing or unexpected:
+            reason_parts = []
+            if missing:
+                reason_parts.append(
+                    "missing final artifacts: " + ", ".join(sorted(missing))
+                )
+            if unexpected:
+                reason_parts.append(
+                    "unexpected final files: "
+                    + ", ".join(map(str, unexpected))
+                )
+            return PromotionResult(
+                PromotionStatus.PROMOTED_OBSERVATION_FAILED,
+                staging_dir,
+                final_dir,
+                "; ".join(reason_parts),
+                failure_evidence_dir=final_dir,
+            )
+        observed = tuple(
+            sorted((final_dir / path for path in expected), key=str)
+        )
+        return PromotionResult(
+            PromotionStatus.PROMOTED_AND_OBSERVED,
+            staging_dir,
+            final_dir,
+            observed_paths=observed,
+        )
+    except (OSError, ValueError) as exc:
+        return PromotionResult(
+            PromotionStatus.PROMOTION_REFUSED,
+            staging_dir,
+            final_dir,
+            str(exc),
+            failure_evidence_dir=staging_dir,
+        )
+
+
 class ExperimentRecorder:
     """Record experiment samples and finalize them into an evaluation run."""
 
@@ -648,7 +820,9 @@ class ExperimentRecorder:
         if partial_dir.exists():
             raise FileExistsError(f"partial result directory already exists: {partial_dir}")
         if final_dir.exists():
-            raise FileExistsError(f"final result directory already exists: {final_dir}")
+            raise FileExistsError(
+                f"final result directory already exists: {final_dir}"
+            )
 
     def start(
         self,
@@ -693,6 +867,9 @@ class ExperimentRecorder:
             raise RuntimeError("no experiment is recording")
         self.stop_monotonic_time = float(monotonic_time)
         self.stop_wall_time = datetime.now(timezone.utc)
+        self._record_optional_diagnostic(
+            "data_collection_disabled", phase="end", status="ok"
+        )
         return self.finalize(interrupted=interrupted)
 
     def finalize(self, *, interrupted: bool = False) -> FinalizationResult:
@@ -713,9 +890,18 @@ class ExperimentRecorder:
         if partial_dir.exists():
             raise FileExistsError(f"partial result directory already exists: {partial_dir}")
         if final_dir.exists():
-            raise FileExistsError(f"final result directory already exists: {final_dir}")
+            raise FileExistsError(
+                f"final result directory already exists: {final_dir}"
+            )
         partial_dir.mkdir(parents=True)
+        self._set_optional_trace_path(partial_dir / "finalization_trace.json")
+        self._record_optional_diagnostic(
+            "finalization", phase="start", status="started"
+        )
         try:
+            self._record_optional_diagnostic(
+                "data_snapshot", phase="start", status="started"
+            )
             metadata = self._metadata(interrupted=interrupted)
             metadata["initial_state_q"] = self.initial_state_q
             metadata["initial_tip_position"] = self.initial_tip_position
@@ -728,6 +914,9 @@ class ExperimentRecorder:
                 solves=self.solves,
                 config=self.config.alignment,
             )
+            self._record_optional_diagnostic(
+                "data_snapshot", phase="end", status="ok"
+            )
             metadata["alignment_window"] = {
                 "state_samples_recorded": len(self.states),
                 "state_samples_evaluated": len(alignment_states),
@@ -739,44 +928,255 @@ class ExperimentRecorder:
                 if alignment.samples
                 else 0.0
             )
-            self._write_raw_files(partial_dir)
-            lumen_result = self._lumen_evaluation_result(alignment=alignment, metadata=metadata)
-            lumen_result = self._write_lumen_evaluation_csv_if_available(partial_dir, lumen_result)
-            summary = self._summary(alignment=alignment, metadata=metadata, lumen_result=lumen_result)
-            write_yaml(partial_dir / "metadata.yaml", metadata)
-            write_json(partial_dir / "summary.json", summary)
-            write_aligned_csv(partial_dir / "aligned_samples.csv", alignment)
+            alignment_start_ns = time.monotonic_ns()
+            self._record_optional_metric_stage_end(
+                "alignment",
+                alignment_start_ns,
+                status="ok",
+                details={"aligned_count": len(alignment.samples)},
+            )
+            preparation_failures: dict[str, str] = {}
+            raw_artifacts = (
+                "raw_state",
+                "raw_tip",
+                "raw_reference",
+                "raw_command",
+                "solve_timing",
+                "horizon",
+                "reference_path",
+                "backbone",
+                "cylinder_navigation",
+            )
+            raw_start_ns = time.monotonic_ns()
+            self._record_optional_diagnostic(
+                "metric_calculation.raw_data_write",
+                phase="start",
+                status="started",
+            )
+            try:
+                self._write_raw_files(partial_dir)
+            except Exception as exc:
+                reason = (
+                    f"raw artifact write failed: {type(exc).__name__}: {exc}"
+                )
+                for logical_name in raw_artifacts:
+                    preparation_failures[logical_name] = reason
+            self._record_optional_metric_stage_end(
+                "raw_data_write",
+                raw_start_ns,
+                status="ok",
+                details={"state_count": len(self.states)},
+            )
+            lumen_profile = self._start_optional_profile()
+            lumen_start_ns = time.monotonic_ns()
+            self._record_optional_diagnostic(
+                "metric_calculation.lumen_evaluation",
+                phase="start",
+                status="started",
+            )
+            lumen_result = None
+            lumen_status = "ok"
+            try:
+                lumen_result = self._lumen_evaluation_result(
+                    alignment=alignment, metadata=metadata
+                )
+            except BaseException as exc:
+                lumen_status = "error"
+                preparation_failures["lumen_evaluation"] = (
+                    f"lumen evaluation failed: {type(exc).__name__}: {exc}"
+                )
+                lumen_result = LumenRecorderResult(required=True)
+            finally:
+                self._record_optional_metric_stage_end(
+                    "lumen_evaluation",
+                    lumen_start_ns,
+                    status=lumen_status,
+                    details={"aligned_count": len(alignment.samples)},
+                )
+                self._finish_optional_profile(lumen_profile)
+            lumen_result = self._write_lumen_evaluation_csv_if_available(
+                partial_dir, lumen_result
+            )
+            if (
+                lumen_result.required
+                and not (partial_dir / "lumen_evaluation.csv").is_file()
+            ):
+                preparation_failures.setdefault(
+                    "lumen_evaluation",
+                    "lumen evaluation did not produce lumen_evaluation.csv",
+                )
+            try:
+                summary = self._summary(
+                    alignment=alignment,
+                    metadata=metadata,
+                    lumen_result=lumen_result,
+                )
+            except Exception as exc:
+                summary = {}
+                preparation_failures["summary"] = (
+                    f"summary write failed: {type(exc).__name__}: {exc}"
+                )
+            summary_start_ns = time.monotonic_ns()
+            self._record_optional_metric_stage_end(
+                "summary",
+                summary_start_ns,
+                status="ok",
+                details={"summary_keys": len(summary)},
+            )
+            try:
+                write_yaml(partial_dir / "metadata.yaml", metadata)
+            except Exception as exc:
+                preparation_failures["metadata"] = (
+                    f"metadata write failed: {type(exc).__name__}: {exc}"
+                )
+            try:
+                write_json(partial_dir / "summary.json", summary)
+            except Exception as exc:
+                preparation_failures["summary"] = (
+                    f"summary write failed: {type(exc).__name__}: {exc}"
+                )
+            try:
+                write_aligned_csv(
+                    partial_dir / "aligned_samples.csv", alignment
+                )
+            except Exception as exc:
+                preparation_failures["aligned_samples"] = (
+                    f"aligned sample write failed: {type(exc).__name__}: {exc}"
+                )
 
             comparison = None
-            from ctr_evaluation.report_generator import generate_plots, generate_report
 
-            plot_paths: list[Path] = []
-            if self.config.plot_generation:
-                plot_paths = generate_plots(partial_dir, alignment.samples, metadata=metadata)
-
-            if self.config.baseline_result_dir:
+            comparison_applicable = bool(self.config.baseline_result_dir)
+            if comparison_applicable:
+                self._record_optional_diagnostic(
+                    "comparison_metadata_update",
+                    phase="start",
+                    status="started",
+                )
                 from ctr_evaluation.compare_results import compare_result_dirs
 
-                comparison = compare_result_dirs(
-                    candidate_dir=partial_dir,
-                    baseline_dir=Path(self.config.baseline_result_dir),
-                    duration_tolerance=self.config.duration_compatibility_tolerance,
-                    initial_state_tolerance=self.config.initial_state_compatibility_tolerance,
-                    near_zero_epsilon=self.config.thresholds.near_zero_baseline_epsilon,
+                try:
+                    comparison = compare_result_dirs(
+                        candidate_dir=partial_dir,
+                        baseline_dir=Path(self.config.baseline_result_dir),
+                        duration_tolerance=(
+                            self.config.duration_compatibility_tolerance
+                        ),
+                        initial_state_tolerance=(
+                            self.config.initial_state_compatibility_tolerance
+                        ),
+                        near_zero_epsilon=(
+                            self.config.thresholds.near_zero_baseline_epsilon
+                        ),
+                    )
+                    summary = self._apply_baseline_acceptance(
+                        summary, comparison
+                    )
+                    write_json(partial_dir / "summary.json", summary)
+                except Exception as exc:
+                    comparison = None
+                    preparation_failures["comparison"] = (
+                        f"comparison failed: {type(exc).__name__}: {exc}"
+                    )
+                    preparation_failures["comparison_report"] = (
+                        f"comparison failed: {type(exc).__name__}: {exc}"
+                    )
+                self._record_optional_diagnostic(
+                    "comparison_metadata_update",
+                    phase="end",
+                    status="ok",
                 )
-                summary = self._apply_baseline_acceptance(summary, comparison)
-                write_json(partial_dir / "summary.json", summary)
 
-            generate_report(
-                run_dir=partial_dir,
-                metadata=metadata,
-                summary=summary,
-                comparison=comparison,
-                plot_paths=[path for path in partial_dir.glob("*.png")],
+            try:
+                ledger = self._prepare_finalization_ledger(
+                    partial_dir=partial_dir,
+                    metadata=metadata,
+                    summary=summary,
+                    comparison=comparison,
+                    alignment=alignment,
+                    interrupted=interrupted,
+                    preparation_failures=preparation_failures,
+                    comparison_applicable=comparison_applicable,
+                )
+            except (StagingSetupError, TypeError, ValueError) as exc:
+                promotion = PromotionResult(
+                    PromotionStatus.PRE_PROMOTION_FAILED,
+                    partial_dir,
+                    final_dir,
+                    str(exc),
+                    failure_evidence_dir=partial_dir,
+                )
+                try:
+                    self._write_finalization_error(partial_dir, exc)
+                except Exception:
+                    pass
+                self.lifecycle_state = STATE_COMPLETED
+                self.finalization_result = FinalizationResult(
+                    run_id=self.run_id,
+                    run_dir=partial_dir,
+                    summary=summary,
+                    metadata=metadata,
+                    comparison=comparison,
+                    output_files=sorted(
+                        path
+                        for path in partial_dir.iterdir()
+                        if path.is_file()
+                    ),
+                    promotion=promotion,
+                )
+                return self.finalization_result
+            promotion = promote_prepromotion_ledger(ledger, final_dir)
+            if promotion.status is not PromotionStatus.PROMOTED_AND_OBSERVED:
+                evidence_dir = promotion.failure_evidence_dir or partial_dir
+                try:
+                    self._write_finalization_error(
+                        evidence_dir,
+                        RuntimeError(
+                            promotion.reason or promotion.status.value
+                        ),
+                    )
+                except Exception:
+                    pass
+                if promotion.final_dir.is_dir():
+                    self._record_optional_diagnostic(
+                        "final_path_observation",
+                        phase="error",
+                        status=promotion.status.value,
+                        error_message=promotion.reason,
+                    )
+                self.lifecycle_state = STATE_COMPLETED
+                self.finalization_result = FinalizationResult(
+                    run_id=self.run_id,
+                    run_dir=(
+                        promotion.final_dir
+                        if promotion.final_dir.is_dir()
+                        else partial_dir
+                    ),
+                    summary=summary,
+                    metadata=metadata,
+                    comparison=comparison,
+                    output_files=sorted(
+                        path
+                        for path in (
+                            promotion.final_dir
+                            if promotion.final_dir.is_dir()
+                            else partial_dir
+                        ).iterdir()
+                        if path.is_file()
+                    ),
+                    promotion=promotion,
+                )
+                return self.finalization_result
+            self._set_optional_trace_path(
+                final_dir / "finalization_trace.json"
             )
-
-            partial_dir.replace(final_dir)
+            self._record_optional_diagnostic(
+                "final_artifact_rename", phase="end", status="ok"
+            )
             self._write_aggregate(group_dir)
+            self._record_optional_diagnostic(
+                "aggregate_write", phase="end", status="ok"
+            )
             self.lifecycle_state = STATE_COMPLETED
             self.finalization_result = FinalizationResult(
                 run_id=self.run_id,
@@ -784,12 +1184,240 @@ class ExperimentRecorder:
                 summary=summary,
                 metadata=metadata,
                 comparison=comparison,
-                output_files=sorted(path for path in final_dir.iterdir() if path.is_file()),
+                output_files=sorted(
+                    path for path in final_dir.iterdir() if path.is_file()
+                ),
+                promotion=promotion,
+            )
+            self._record_optional_diagnostic(
+                "finalization", phase="end", status="ok"
             )
             return self.finalization_result
         except Exception as exc:
+            self._record_optional_diagnostic(
+                "finalization",
+                phase="error",
+                status="error",
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
             self._write_finalization_error(partial_dir, exc)
             raise
+
+    @staticmethod
+    def _existing_artifact_producer(path: Path) -> None:
+        if path.is_symlink() or not path.is_file():
+            raise ProducerStagingError(
+                f"expected rendered artifact is unavailable: {path.name}"
+            )
+
+    def _record_optional_diagnostic(
+        self,
+        stage: str,
+        *,
+        phase: str,
+        status: str,
+        **details: Any,
+    ) -> None:
+        try:
+            callback = getattr(self, "record_diagnostic_event", None)
+            if callable(callback):
+                callback(stage, phase=phase, status=status, **details)
+        except Exception:
+            pass
+
+    def _record_optional_metric_stage_end(
+        self,
+        stage: str,
+        start_ns: int,
+        *,
+        status: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        try:
+            callback = getattr(self, "_record_metric_stage_end", None)
+            if callable(callback):
+                callback(stage, start_ns, status=status, details=details)
+        except Exception:
+            pass
+
+    def _start_optional_profile(self) -> Any | None:
+        try:
+            enabled = bool(
+                getattr(self.config, "enable_finalization_profiling", False)
+            )
+            profile_factory = getattr(cProfile, "Profile", None)
+            if not enabled or not callable(profile_factory):
+                return None
+            profile = profile_factory()
+            profile.enable()
+            return profile
+        except Exception:
+            return None
+
+    def _finish_optional_profile(self, profile: Any | None) -> None:
+        try:
+            if profile is not None:
+                profile.disable()
+            callback = getattr(self, "_record_metric_profile", None)
+            if callable(callback):
+                callback(profile)
+        except Exception:
+            pass
+
+    def _set_optional_trace_path(self, path: Path) -> None:
+        try:
+            state = object.__getattribute__(self, "__dict__")
+            if "_finalization_trace_path" not in state:
+                return
+            object.__setattr__(self, "_finalization_trace_path", path)
+        except Exception:
+            pass
+
+    def _orchestration_artifact_producer(
+        self,
+        path: Path,
+        metadata: dict[str, Any],
+    ) -> None:
+        orchestration = metadata.get("orchestration_runtime")
+        if not isinstance(orchestration, dict):
+            orchestration = {
+                "schema_version": "orchestration_v1",
+                "run_id": self.run_id,
+                "source": "experiment_recorder",
+            }
+        write_json(path, orchestration)
+
+    def _finalization_layer_a(
+        self,
+        metadata: dict[str, Any],
+        comparison: dict[str, Any] | None,
+        interrupted: bool,
+    ) -> LayerASnapshot:
+        return LayerASnapshot(
+            snapshot_id=stable_hash(
+                {"run_id": self.run_id, "metadata": metadata}
+            ),
+            operational_reason=metadata.get("operational_reason"),
+            workflow_classification=(
+                "INTERRUPTED" if interrupted else "COMPLETED"
+            ),
+            workflow_exit_code=0,
+            comparison_valid=(
+                None
+                if comparison is None
+                else bool(comparison.get("comparison_valid", False))
+            ),
+            timeout_status="DESCRIPTIVE_ONLY",
+            cancellation_evidence=metadata.get("cancellation_evidence", ()),
+            delivery_classification="RECORDER_FINALIZATION",
+            compatibility_valid=(
+                None
+                if comparison is None
+                else bool(comparison.get("compatibility_valid", False))
+            ),
+            timing_data=metadata.get("timing", {}),
+        )
+
+    def _prepare_finalization_ledger(
+        self,
+        *,
+        partial_dir: Path,
+        metadata: dict[str, Any],
+        summary: dict[str, Any],
+        comparison: dict[str, Any] | None,
+        alignment: AlignmentResult,
+        interrupted: bool,
+        preparation_failures: dict[str, str] | None = None,
+        comparison_applicable: bool | None = None,
+    ) -> PrePromotionLedger:
+        include_lumen = _has_curved_lumen_metadata(metadata)
+        include_cylinder = (
+            self.config.cylindrical_lumen is not None
+            and self.config.goal_position is not None
+        )
+        inventory = build_artifact_inventory(
+            include_lumen=include_lumen,
+            include_cylinder=include_cylinder,
+            include_plots=self.config.plot_generation,
+            include_comparison=(
+                comparison is not None
+                if comparison_applicable is None
+                else comparison_applicable
+            ),
+        )
+        existing = self._existing_artifact_producer
+        producers: dict[str, Callable[[Path], Any]] = {
+            spec.logical_name: existing for spec in inventory
+        }
+        for name, reason in (preparation_failures or {}).items():
+            def failed_producer(
+                _target: Path,
+                reason: str = reason,
+            ) -> None:
+                raise ProducerStagingError(reason)
+
+            producers[name] = failed_producer
+        from ctr_evaluation.report_generator import (
+            generate_report,
+            plot_producer_registry,
+        )
+
+        plot_producers = plot_producer_registry(
+            partial_dir,
+            alignment.samples,
+            metadata,
+            include_cylinder_plots=include_cylinder,
+        )
+        for name, producer in plot_producers.items():
+            producers[name] = lambda _target, producer=producer: producer(
+                partial_dir
+            )
+
+        def report(path: Path) -> None:
+            self._record_optional_diagnostic(
+                "report_generation", phase="start", status="started"
+            )
+            try:
+                generate_report(
+                    run_dir=partial_dir,
+                    metadata=metadata,
+                    summary=summary,
+                    comparison=comparison,
+                    plot_paths=[path for path in partial_dir.glob("*.png")],
+                )
+                if not path.is_file():
+                    raise ProducerStagingError(
+                        f"report producer did not create {path.name}"
+                    )
+            except Exception as exc:
+                self._record_optional_diagnostic(
+                    "report_generation",
+                    phase="end",
+                    status="error",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+                raise
+            self._record_optional_diagnostic(
+                "report_generation", phase="end", status="ok"
+            )
+
+        def orchestration(path: Path) -> None:
+            self._orchestration_artifact_producer(path, metadata)
+
+        layer_a = self._finalization_layer_a(metadata, comparison, interrupted)
+        return prepare_prepromotion_ledger(
+            layer_a=layer_a,
+            inventory=inventory,
+            staging_root=partial_dir,
+            applicability=None,
+            producer_registry=producers,
+            report_producer=report,
+            orchestration_producer=orchestration,
+            comparison_producer=existing,
+            acquire_staging=False,
+        )
 
     def record_state(self, *, timestamp: float, q: Any, q_dot: Any, tip_position: Any, backbone_points: Any | None = None) -> None:
         if not self._accept_sample("/ctr/state"):

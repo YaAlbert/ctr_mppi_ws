@@ -24,10 +24,12 @@ from ctr_evaluation.experiment_recorder import (  # noqa: E402
     STATE_COMPLETED,
     STATE_FINALIZING,
     STATE_RECORDING,
+    PromotionStatus,
     write_json,
 )
 from ctr_evaluation.compare_results import write_json as write_comparison_json  # noqa: E402
 import ctr_evaluation.report_generator as report_module  # noqa: E402
+import ctr_evaluation.experiment_recorder as recorder_module  # noqa: E402
 from ctr_evaluation.publication_model import (  # noqa: E402
     Applicability,
     ArtifactRepresentation,
@@ -41,6 +43,7 @@ from ctr_evaluation.experiment_recorder import (  # noqa: E402
     ProducerRenderError,
     ProducerStagingError,
     prepare_prepromotion_ledger,
+    promote_prepromotion_ledger,
 )
 
 
@@ -121,6 +124,55 @@ def strict_json_load(path: Path):
         raise AssertionError(f"non-strict JSON constant {value} found in {path}")
 
     return json.loads(text, parse_constant=reject_constant)
+
+
+def make_uninstrumented_recorder(temp_dir):
+    config = project_config(temp_dir)
+
+    class NoProfilingConfig:
+        def __init__(self, delegate):
+            self._delegate = delegate
+
+        def __getattribute__(self, name):
+            if name == "enable_finalization_profiling":
+                raise AssertionError(
+                    "profiling configuration must not be required"
+                )
+            if name == "_delegate":
+                return object.__getattribute__(self, name)
+            return getattr(object.__getattribute__(self, "_delegate"), name)
+
+    class NoInstrumentationRecorder(ExperimentRecorder):
+        def __getattribute__(self, name):
+            if name in {
+                "record_diagnostic_event",
+                "_record_metric_stage_end",
+                "_finalization_trace_path",
+            }:
+                raise AssertionError(
+                    "forbidden instrumentation lookup: " f"{name}"
+                )
+            return super().__getattribute__(name)
+
+        def __setattr__(self, name, value):
+            if (
+                name == "_finalization_trace_path"
+                and object.__getattribute__(self, "__dict__").get(
+                    "_isolation_active", False
+                )
+            ):
+                raise AssertionError(
+                    "forbidden instrumentation write: "
+                    "_finalization_trace_path"
+                )
+            object.__setattr__(self, name, value)
+
+    recorder = NoInstrumentationRecorder(
+        config=EvaluationRecorderConfig.from_project_config(config),
+        project_config=config,
+    )
+    recorder.config = NoProfilingConfig(recorder.config)
+    return recorder
 
 
 class ExperimentRecorderTest(unittest.TestCase):
@@ -312,18 +364,20 @@ class ExperimentRecorderTest(unittest.TestCase):
             run_id = recorder.start(experiment_name="failure", monotonic_time=0.0)
             add_samples(recorder)
 
-            with self.assertRaises(FileNotFoundError):
-                recorder.stop(monotonic_time=1.0)
+            result = recorder.stop(monotonic_time=1.0)
 
             partial_dir = recorder.config.output_root / recorder.config.experiment_group / f"{run_id}.partial"
             final_dir = recorder.config.output_root / recorder.config.experiment_group / run_id
-            self.assertEqual(STATE_FINALIZING, recorder.lifecycle_state)
+            self.assertEqual(STATE_COMPLETED, recorder.lifecycle_state)
             self.assertTrue(partial_dir.is_dir())
             self.assertFalse(final_dir.exists())
             self.assertTrue((partial_dir / "state.csv").is_file())
             error = strict_json_load(partial_dir / "finalization_error.json")
             self.assertEqual(run_id, error["run_id"])
             self.assertEqual(STATE_FINALIZING, error["state"])
+            self.assertIs(
+                PromotionStatus.PROMOTION_REFUSED, result.promotion.status
+            )
 
     def test_baseline_comparison_is_written_for_compatible_runs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -814,6 +868,538 @@ class ExperimentRecorderTest(unittest.TestCase):
             )
             self.assertIsNone(ledger.by_name["sibling"].publication_status)
 
+    def test_finalize_succeeds_without_profiling_or_diagnostic_symbols(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = make_uninstrumented_recorder(temp_dir)
+            recorder.start(
+                experiment_name="uninstrumented", monotonic_time=0.0
+            )
+            add_samples(recorder)
+            if "_finalization_trace_path" in recorder.__dict__:
+                delattr(recorder, "_finalization_trace_path")
+            object.__setattr__(recorder, "_isolation_active", True)
+            with mock.patch.object(
+                recorder_module.cProfile,
+                "Profile",
+                side_effect=AssertionError(
+                    "profiling must not be instantiated"
+                ),
+            ):
+                result = recorder.finalize()
+            self.assertIs(
+                PromotionStatus.PROMOTED_AND_OBSERVED,
+                result.promotion.status,
+            )
+            self.assertEqual(STATE_COMPLETED, recorder.lifecycle_state)
+            self.assertNotIn("_finalization_trace_path", recorder.__dict__)
+
+    def test_required_failure_returns_evidence_without_profiling_symbols(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = make_uninstrumented_recorder(temp_dir)
+            recorder.start(
+                experiment_name="uninstrumented_failure",
+                monotonic_time=0.0,
+            )
+            add_samples(recorder)
+            if "_finalization_trace_path" in recorder.__dict__:
+                delattr(recorder, "_finalization_trace_path")
+            object.__setattr__(recorder, "_isolation_active", True)
+            captured = {}
+            original_promote = recorder_module.promote_prepromotion_ledger
+
+            def capture(ledger, final_dir):
+                captured["ledger"] = ledger
+                return original_promote(ledger, final_dir)
+
+            with mock.patch.object(
+                recorder,
+                "_write_raw_files",
+                side_effect=RuntimeError("raw failure"),
+            ), mock.patch.object(
+                recorder_module,
+                "promote_prepromotion_ledger",
+                side_effect=capture,
+            ), mock.patch.object(
+                recorder_module.cProfile,
+                "Profile",
+                side_effect=AssertionError(
+                    "profiling must not be instantiated"
+                ),
+            ):
+                result = recorder.finalize()
+            self.assertIs(
+                PromotionStatus.PROMOTION_REFUSED,
+                result.promotion.status,
+            )
+            self.assertIs(
+                PublicationStatus.STAGE_FAILED,
+                captured["ledger"].by_name["raw_state"].publication_status,
+            )
+            self.assertTrue(result.run_dir.name.endswith(".partial"))
+            self.assertTrue(result.run_dir.is_dir())
+            self.assertNotIn("_finalization_trace_path", recorder.__dict__)
+
+    def test_applicable_cylinder_failure_is_not_reclassified_as_inapplicable(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = project_config(temp_dir)
+            config["cylindrical_lumen"]["enabled"] = True
+            recorder = ExperimentRecorder(
+                config=EvaluationRecorderConfig.from_project_config(config),
+                project_config=config,
+            )
+            captured = {}
+            original_promote = recorder_module.promote_prepromotion_ledger
+
+            def capture(ledger, final_dir):
+                captured["ledger"] = ledger
+                return original_promote(ledger, final_dir)
+
+            recorder.start(
+                experiment_name="cylinder_failure", monotonic_time=0.0
+            )
+            add_cylinder_samples(recorder)
+            with mock.patch.object(
+                recorder,
+                "_write_raw_files",
+                side_effect=RuntimeError("raw failure"),
+            ), mock.patch.object(
+                recorder_module,
+                "promote_prepromotion_ledger",
+                side_effect=capture,
+            ):
+                result = recorder.stop(monotonic_time=1.0)
+            record = captured["ledger"].by_name["cylinder_navigation"]
+            self.assertIs(
+                Applicability.APPLICABLE, record.execution_applicability
+            )
+            self.assertIs(
+                PublicationStatus.STAGE_FAILED, record.publication_status
+            )
+            self.assertIs(
+                PromotionStatus.PROMOTION_REFUSED, result.promotion.status
+            )
+
+    def test_applicable_lumen_failure_is_not_reclassified_as_inapplicable(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = make_recorder(temp_dir)
+            captured = {}
+            original_promote = recorder_module.promote_prepromotion_ledger
+
+            def capture(ledger, final_dir):
+                captured["ledger"] = ledger
+                return original_promote(ledger, final_dir)
+
+            recorder.start(
+                experiment_name="lumen_failure",
+                metadata={"curved_lumen_type": "circular_arc"},
+                monotonic_time=0.0,
+            )
+            add_samples(recorder)
+            with mock.patch.object(
+                recorder_module,
+                "_has_curved_lumen_metadata",
+                return_value=True,
+            ), mock.patch.object(
+                recorder,
+                "_lumen_evaluation_result",
+                side_effect=RuntimeError("lumen failure"),
+            ), mock.patch.object(
+                recorder_module,
+                "promote_prepromotion_ledger",
+                side_effect=capture,
+            ):
+                result = recorder.stop(monotonic_time=1.0)
+            record = captured["ledger"].by_name["lumen_evaluation"]
+            self.assertIs(
+                Applicability.APPLICABLE,
+                record.execution_applicability,
+            )
+            self.assertIs(
+                PublicationStatus.STAGE_FAILED,
+                record.publication_status,
+            )
+            self.assertIs(
+                PromotionStatus.PROMOTED_AND_OBSERVED,
+                result.promotion.status,
+            )
+
+    def test_non_applicable_lumen_and_cylinder_remain_not_applicable(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = make_recorder(temp_dir)
+            captured = {}
+            original_promote = recorder_module.promote_prepromotion_ledger
+
+            def capture(ledger, final_dir):
+                captured["ledger"] = ledger
+                return original_promote(ledger, final_dir)
+
+            recorder.start(experiment_name="no_lumen", monotonic_time=0.0)
+            add_samples(recorder)
+            with mock.patch.object(
+                recorder_module,
+                "promote_prepromotion_ledger",
+                side_effect=capture,
+            ):
+                recorder.stop(monotonic_time=1.0)
+            ledger = captured["ledger"]
+            self.assertIs(
+                Applicability.NOT_APPLICABLE,
+                ledger.by_name["lumen_evaluation"].execution_applicability,
+            )
+            self.assertIs(
+                Applicability.NOT_APPLICABLE,
+                ledger.by_name["cylinder_navigation"].execution_applicability,
+            )
+
+    def test_slice3_valid_ledger_promotes_and_observes_final_paths(self):
+        layer = LayerASnapshot("slice3", "none", "COMPLETED", 0, True)
+        spec = ArtifactSpec(
+            "payload", "payload.json", True, Applicability.APPLICABLE,
+            ArtifactRepresentation.OPAQUE, "regular_file",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ledger = prepare_prepromotion_ledger(
+                layer_a=layer,
+                inventory=(spec,),
+                staging_root=root / "run.partial",
+                applicability=None,
+                producer_registry={
+                    "payload": lambda path: path.write_text(
+                        "ok", encoding="utf-8"
+                    )
+                },
+                report_producer=None,
+            )
+            result = promote_prepromotion_ledger(ledger, root / "run")
+            self.assertIs(
+                PromotionStatus.PROMOTED_AND_OBSERVED,
+                result.status,
+            )
+            self.assertTrue((root / "run" / "payload.json").is_file())
+            self.assertFalse((root / "run.partial").exists())
+
+    def test_slice3_required_failure_refuses_and_preserves_staging(self):
+        layer = LayerASnapshot("slice3", "none", "COMPLETED", 0, True)
+        spec = ArtifactSpec(
+            "payload", "payload.json", True, Applicability.APPLICABLE,
+            ArtifactRepresentation.OPAQUE, "regular_file",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ledger = prepare_prepromotion_ledger(
+                layer_a=layer,
+                inventory=(spec,),
+                staging_root=root / "run.partial",
+                applicability=None,
+                producer_registry={
+                    "payload": lambda path: (_ for _ in ()).throw(
+                        ProducerRenderError("render failed")
+                    )
+                },
+                report_producer=None,
+            )
+            result = promote_prepromotion_ledger(ledger, root / "run")
+            self.assertIs(PromotionStatus.PROMOTION_REFUSED, result.status)
+            self.assertTrue((root / "run.partial").is_dir())
+            self.assertFalse((root / "run").exists())
+
+    def test_slice3_optional_failure_does_not_block_required_promotion(self):
+        layer = LayerASnapshot("slice3", "none", "COMPLETED", 0, True)
+        required = ArtifactSpec(
+            "required", "required.json", True, Applicability.APPLICABLE,
+            ArtifactRepresentation.OPAQUE, "regular_file",
+        )
+        optional = ArtifactSpec(
+            "optional", "optional.json", False, Applicability.APPLICABLE,
+            ArtifactRepresentation.OPAQUE, "regular_file",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ledger = prepare_prepromotion_ledger(
+                layer_a=layer,
+                inventory=(required, optional),
+                staging_root=root / "run.partial",
+                applicability=None,
+                producer_registry={
+                    "required": lambda path: path.write_text(
+                        "ok", encoding="utf-8"
+                    ),
+                    "optional": lambda path: (_ for _ in ()).throw(
+                        ProducerRenderError("optional failed")
+                    ),
+                },
+                report_producer=None,
+            )
+            result = promote_prepromotion_ledger(ledger, root / "run")
+            self.assertIs(
+                PromotionStatus.PROMOTED_AND_OBSERVED,
+                result.status,
+            )
+            self.assertTrue((root / "run" / "required.json").is_file())
+
+    def test_slice3_missing_final_path_is_observation_failure(self):
+        layer = LayerASnapshot("slice3", "none", "COMPLETED", 0, True)
+        spec = ArtifactSpec(
+            "payload", "payload.json", True, Applicability.APPLICABLE,
+            ArtifactRepresentation.OPAQUE, "regular_file",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ledger = prepare_prepromotion_ledger(
+                layer_a=layer,
+                inventory=(spec,),
+                staging_root=root / "run.partial",
+                applicability=None,
+                producer_registry={
+                    "payload": lambda path: path.write_text(
+                        "ok", encoding="utf-8"
+                    )
+                },
+                report_producer=None,
+            )
+            original_replace = Path.replace
+
+            def replace_then_remove(path, target):
+                result = original_replace(path, target)
+                (target / "payload.json").unlink()
+                return result
+
+            with mock.patch.object(
+                Path, "replace", new=replace_then_remove
+            ):
+                result = promote_prepromotion_ledger(ledger, root / "run")
+            self.assertIs(
+                PromotionStatus.PROMOTED_OBSERVATION_FAILED,
+                result.status,
+            )
+            self.assertTrue((root / "run").is_dir())
+
+    def test_slice3_promotion_failure_is_distinct_from_refusal(self):
+        layer = LayerASnapshot("slice3", "none", "COMPLETED", 0, True)
+        spec = ArtifactSpec(
+            "payload", "payload.json", True, Applicability.APPLICABLE,
+            ArtifactRepresentation.OPAQUE, "regular_file",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ledger = prepare_prepromotion_ledger(
+                layer_a=layer,
+                inventory=(spec,),
+                staging_root=root / "run.partial",
+                applicability=None,
+                producer_registry={
+                    "payload": lambda path: path.write_text(
+                        "ok", encoding="utf-8"
+                    )
+                },
+                report_producer=None,
+            )
+            with mock.patch.object(
+                Path, "replace", side_effect=OSError("rename failed")
+            ):
+                result = promote_prepromotion_ledger(ledger, root / "run")
+            self.assertIs(PromotionStatus.PROMOTION_FAILED, result.status)
+            self.assertTrue((root / "run.partial").is_dir())
+
+    def test_slice3_existing_final_directory_refuses_overwrite(self):
+        layer = LayerASnapshot("slice3", "none", "COMPLETED", 0, True)
+        spec = ArtifactSpec(
+            "payload", "payload.json", True, Applicability.APPLICABLE,
+            ArtifactRepresentation.OPAQUE, "regular_file",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "run").mkdir()
+            ledger = prepare_prepromotion_ledger(
+                layer_a=layer,
+                inventory=(spec,),
+                staging_root=root / "run.partial",
+                applicability=None,
+                producer_registry={
+                    "payload": lambda path: path.write_text(
+                        "ok", encoding="utf-8"
+                    )
+                },
+                report_producer=None,
+            )
+            result = promote_prepromotion_ledger(ledger, root / "run")
+            self.assertIs(PromotionStatus.PROMOTION_REFUSED, result.status)
+            self.assertTrue((root / "run" / "payload.json").exists() is False)
+
+    def test_slice3_empty_staging_is_eligible(self):
+        layer = LayerASnapshot("slice3", "none", "COMPLETED", 0, True)
+        spec = ArtifactSpec(
+            "optional", "optional.json", False,
+            Applicability.NOT_APPLICABLE, ArtifactRepresentation.OPAQUE,
+            "regular_file",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ledger = prepare_prepromotion_ledger(
+                layer_a=layer,
+                inventory=(spec,),
+                staging_root=root / "empty.partial",
+                applicability=None,
+                producer_registry={},
+                report_producer=None,
+            )
+            result = promote_prepromotion_ledger(ledger, root / "empty")
+            self.assertIs(
+                PromotionStatus.PROMOTED_AND_OBSERVED,
+                result.status,
+            )
+            self.assertTrue((root / "empty").is_dir())
+
+    def test_slice3_nonregular_and_symlink_outputs_do_not_promote(self):
+        layer = LayerASnapshot("slice3", "none", "COMPLETED", 0, True)
+        spec = ArtifactSpec(
+            "payload", "payload.json", True, Applicability.APPLICABLE,
+            ArtifactRepresentation.OPAQUE, "regular_file",
+        )
+        for mode in ("directory", "symlink"):
+            with self.subTest(mode=mode):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    outside = root / "outside.txt"
+                    outside.write_text("outside", encoding="utf-8")
+
+                    def producer(path, mode=mode):
+                        if mode == "directory":
+                            path.mkdir()
+                        else:
+                            path.symlink_to(outside)
+
+                    ledger = prepare_prepromotion_ledger(
+                        layer_a=layer,
+                        inventory=(spec,),
+                        staging_root=root / "run.partial",
+                        applicability=None,
+                        producer_registry={"payload": producer},
+                        report_producer=None,
+                    )
+                    result = promote_prepromotion_ledger(ledger, root / "run")
+                    self.assertIs(
+                        PromotionStatus.PROMOTION_REFUSED,
+                        result.status,
+                    )
+                    self.assertTrue((root / "run.partial").is_dir())
+
+    def test_slice3_repeated_promotion_is_refused(self):
+        layer = LayerASnapshot("slice3", "none", "COMPLETED", 0, True)
+        spec = ArtifactSpec(
+            "payload", "payload.json", True, Applicability.APPLICABLE,
+            ArtifactRepresentation.OPAQUE, "regular_file",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ledger = prepare_prepromotion_ledger(
+                layer_a=layer,
+                inventory=(spec,),
+                staging_root=root / "run.partial",
+                applicability=None,
+                producer_registry={
+                    "payload": lambda path: path.write_text(
+                        "ok", encoding="utf-8"
+                    )
+                },
+                report_producer=None,
+            )
+            first = promote_prepromotion_ledger(ledger, root / "run")
+            second = promote_prepromotion_ledger(ledger, root / "run")
+            self.assertIs(PromotionStatus.PROMOTED_AND_OBSERVED, first.status)
+            self.assertIs(PromotionStatus.PROMOTION_REFUSED, second.status)
+
+    def test_slice3_unexpected_directory_fails_observation(self):
+        layer = LayerASnapshot("slice3", "none", "COMPLETED", 0, True)
+        spec = ArtifactSpec(
+            "payload", "payload.json", True, Applicability.APPLICABLE,
+            ArtifactRepresentation.OPAQUE, "regular_file",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+
+            def producer(path):
+                path.write_text("ok", encoding="utf-8")
+                path.parent.joinpath("unexpected").mkdir()
+
+            ledger = prepare_prepromotion_ledger(
+                layer_a=layer,
+                inventory=(spec,),
+                staging_root=root / "run.partial",
+                applicability=None,
+                producer_registry={"payload": producer},
+                report_producer=None,
+            )
+            result = promote_prepromotion_ledger(ledger, root / "run")
+            self.assertIs(
+                PromotionStatus.PROMOTED_OBSERVATION_FAILED,
+                result.status,
+            )
+
+    def test_slice3_observation_error_write_failure_preserves_status(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = make_recorder(temp_dir)
+            recorder.start(
+                experiment_name="observation_error",
+                monotonic_time=0.0,
+            )
+            add_samples(recorder)
+            original_replace = Path.replace
+
+            def replace_then_remove(path, target):
+                result = original_replace(path, target)
+                (target / "state.csv").unlink()
+                return result
+
+            with mock.patch.object(
+                Path, "replace", new=replace_then_remove
+            ), mock.patch.object(
+                recorder,
+                "_write_finalization_error",
+                side_effect=OSError("cannot write evidence"),
+            ):
+                result = recorder.stop(monotonic_time=1.0)
+            self.assertIs(
+                PromotionStatus.PROMOTED_OBSERVATION_FAILED,
+                result.promotion.status,
+            )
+            self.assertTrue(result.run_dir.is_dir())
+
+    def test_slice3_final_directory_race_reports_promotion_failure(self):
+        layer = LayerASnapshot("slice3", "none", "COMPLETED", 0, True)
+        spec = ArtifactSpec(
+            "payload", "payload.json", True, Applicability.APPLICABLE,
+            ArtifactRepresentation.OPAQUE, "regular_file",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ledger = prepare_prepromotion_ledger(
+                layer_a=layer,
+                inventory=(spec,),
+                staging_root=root / "run.partial",
+                applicability=None,
+                producer_registry={
+                    "payload": lambda path: path.write_text(
+                        "ok", encoding="utf-8"
+                    )
+                },
+                report_producer=None,
+            )
+
+            def race(path, target):
+                target.mkdir()
+                raise OSError("final path appeared")
+
+            with mock.patch.object(Path, "replace", new=race):
+                result = promote_prepromotion_ledger(ledger, root / "run")
+            self.assertIs(PromotionStatus.PROMOTION_FAILED, result.status)
+            self.assertTrue((root / "run.partial").is_dir())
+            self.assertTrue((root / "run").is_dir())
 
 if __name__ == "__main__":
     unittest.main()
