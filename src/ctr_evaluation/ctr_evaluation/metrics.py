@@ -109,6 +109,7 @@ CURVED_BOOLEAN_COMPARISON_FIELDS = (
 CURVED_IDENTITY_FIELDS = (
     "task",
     "reference_mode",
+    "target_mode",
     "curved_lumen_type",
     "scenario_id",
     "scenario_policy_version",
@@ -122,6 +123,9 @@ CURVED_IDENTITY_FIELDS = (
     "derived_target",
     "requested_target",
     "executed_target",
+    "centerline_fraction",
+    "centerline_arc_length",
+    "radial_offset",
     "override_used",
 )
 
@@ -867,7 +871,9 @@ def _curved_run_validity(summary: dict[str, Any], metadata: dict[str, Any], role
         identity = {}
     for field_name in CURVED_IDENTITY_FIELDS:
         kind = "bool" if field_name in {"geometry_fingerprint_match", "override_used"} else (
-            "vector" if field_name in {"derived_target", "requested_target", "executed_target"} else "string"
+            "vector" if field_name in {"derived_target", "requested_target", "executed_target"} else (
+                "number" if field_name in {"centerline_fraction", "centerline_arc_length", "radial_offset"} else "string"
+            )
         )
         _validate_required_curved_field(
             field_name,
@@ -931,6 +937,14 @@ def _curved_run_validity(summary: dict[str, Any], metadata: dict[str, Any], role
     _validate_required_curved_field(
         "target_tolerance",
         goal_configuration.get("tolerance"),
+        kind="number",
+        reasons=reasons,
+        values=values,
+        details=details,
+    )
+    _validate_required_curved_field(
+        "required_hold_duration",
+        goal_configuration.get("required_hold_duration"),
         kind="number",
         reasons=reasons,
         values=values,
@@ -1073,6 +1087,7 @@ def _curved_compatibility_report(
     required_fields = (
         "geometry.fingerprint",
         "target_tolerance",
+        "required_hold_duration",
         "evaluation_window_duration_s",
         "configuration.model_configuration_hash",
         "configuration.frame_id",
@@ -1108,6 +1123,7 @@ def _curved_compatibility_report(
             else TARGET_IDENTITY_ATOL
             if field_name in {
                 "target_tolerance",
+                "required_hold_duration",
                 "configuration.configured_control_period",
                 "configuration.reference_sample_period",
                 "geometry.ctr_outer_radius_m",
@@ -1133,7 +1149,10 @@ def _curved_compatibility_report(
     for field_name in CURVED_IDENTITY_FIELDS:
         candidate_value = _curved_identity_value(field_name, candidate_identity, candidate_metadata)
         baseline_value = _curved_identity_value(field_name, baseline_identity, baseline_metadata)
-        tolerance = TARGET_IDENTITY_ATOL if field_name in {"derived_target", "requested_target", "executed_target"} else None
+        tolerance = TARGET_IDENTITY_ATOL if field_name in {
+            "derived_target", "requested_target", "executed_target",
+            "centerline_fraction", "centerline_arc_length", "radial_offset",
+        } else None
         if not _values_match(candidate_value, baseline_value, tolerance=tolerance):
             code = _curved_mismatch_code(field_name)
             reasons.append(code)
@@ -1239,6 +1258,7 @@ def _curved_mismatch_code(field_name: str) -> str:
     return {
         "task": "task_mismatch",
         "reference_mode": "reference_mode_mismatch",
+        "target_mode": "target_mode_mismatch",
         "curved_lumen_type": "curved_lumen_type_mismatch",
         "scenario_id": "scenario_id_mismatch",
         "scenario_policy_version": "scenario_policy_version_mismatch",
@@ -1252,6 +1272,9 @@ def _curved_mismatch_code(field_name: str) -> str:
         "derived_target": "derived_target_mismatch",
         "requested_target": "requested_target_mismatch",
         "executed_target": "executed_target_mismatch",
+        "centerline_fraction": "centerline_fraction_mismatch",
+        "centerline_arc_length": "centerline_arc_length_mismatch",
+        "radial_offset": "radial_offset_mismatch",
         "override_used": "override_state_mismatch",
     }[field_name]
 

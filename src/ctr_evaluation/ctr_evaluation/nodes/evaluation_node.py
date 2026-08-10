@@ -17,7 +17,7 @@ from ctr_bringup.parameter_validation import load_parameter_files, validate_conf
 from ctr_evaluation.experiment_recorder import EvaluationRecorderConfig, ExperimentRecorder, STATE_RECORDING
 from ctr_interfaces.msg import CtrControllerMetrics, CtrJointCommand, CtrState
 from ctr_interfaces.srv import StartExperiment, StopExperiment
-from ctr_mppi_controller.cylindrical_lumen import config_with_cylinder_overrides
+from ctr_mppi_controller.lumen_factory import config_with_lumen_overrides
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 
@@ -38,6 +38,8 @@ class EvaluationNode(Node):
         self.declare_parameter("baseline_result_dir", "")
         self.declare_parameter("output_root", "")
         self.declare_parameter("enable_cylindrical_lumen", False)
+        self.declare_parameter("enable_curved_lumen", False)
+        self.declare_parameter("curved_lumen_type", "")
         self.declare_parameter("cylinder_profile", "")
         self.declare_parameter("cylinder_target_position", Parameter.Type.DOUBLE_ARRAY)
         self.declare_parameter("mppi_random_seed", -1)
@@ -45,11 +47,13 @@ class EvaluationNode(Node):
 
         config_paths = validate_config_paths(self.get_parameter("config_paths").value)
         raw_config = load_parameter_files(config_paths)
-        self.project_config = config_with_cylinder_overrides(
+        self.project_config = config_with_lumen_overrides(
             raw_config,
-            enabled=_bool_value(self.get_parameter("enable_cylindrical_lumen").value),
-            target_position=_optional_vector3_parameter(self.get_parameter("cylinder_target_position").value),
-            mppi_profile=str(self.get_parameter("cylinder_profile").value or ""),
+            enable_cylindrical_lumen=_bool_value(self.get_parameter("enable_cylindrical_lumen").value),
+            enable_curved_lumen=_bool_value(self.get_parameter("enable_curved_lumen").value),
+            curved_lumen_type=str(self.get_parameter("curved_lumen_type").value or ""),
+            target=_optional_vector3_parameter(self.get_parameter("cylinder_target_position").value),
+            cylinder_profile=str(self.get_parameter("cylinder_profile").value or ""),
             random_seed=_optional_seed(self.get_parameter("mppi_random_seed").value),
         )
         runtime_mode = str(self.get_parameter("runtime_mode").value)
@@ -135,20 +139,34 @@ class EvaluationNode(Node):
         return response
 
     def _stop_experiment(self, request, response):
+        self.recorder.record_diagnostic_event("stop_service_callback", phase="start", status="entered")
         if self.recorder.lifecycle_state != STATE_RECORDING:
             response.accepted = False
             response.message = "no experiment is recording"
+            self.recorder.record_diagnostic_event("stop_service_callback", phase="end", status="rejected")
             return response
         try:
+            self.recorder.record_diagnostic_event("recorder_finalization", phase="start", status="started")
             result = self.recorder.stop(monotonic_time=self._now_seconds(), interrupted=False)
+            self.recorder.record_diagnostic_event("recorder_finalization", phase="end", status="ok")
         except Exception as exc:
+            self.recorder.record_diagnostic_event(
+                "stop_service_callback",
+                phase="error",
+                status="error",
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
             response.accepted = False
             response.message = f"failed to finalize experiment: {exc}"
             self.get_logger().error(response.message)
             return response
+        self.recorder.record_diagnostic_event("stop_response_construction", phase="start", status="started")
         response.accepted = True
         response.message = f"completed evaluation run {result.run_id}: {result.run_dir}"
+        self.recorder.record_diagnostic_event("stop_response_construction", phase="end", status="ok")
         self.get_logger().info(response.message)
+        self.recorder.record_diagnostic_event("stop_service_callback", phase="end", status="ok")
         return response
 
     def _on_state(self, msg: CtrState) -> None:

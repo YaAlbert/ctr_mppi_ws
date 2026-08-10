@@ -1,5 +1,6 @@
 import copy
 import dataclasses
+import json
 import math
 import sys
 import unittest
@@ -23,6 +24,9 @@ from ctr_evaluation.curved_lumen_scenarios import (  # noqa: E402
     CURVED_SCENARIO_POLICY_VERSION,
     LATERAL_OFFSET_TARGET,
     NEAR_SAFETY_BOUNDARY_TARGET,
+    S_CURVE_MIDDLE_TARGET,
+    S_CURVE_NEAR_OUTLET_TARGET,
+    S_CURVE_SCENARIO_IDS,
     SCENARIO_CENTERLINE_FRACTIONS,
     CurvedLumenScenario,
     _centerline_data,
@@ -105,7 +109,10 @@ class CurvedLumenScenarioResolutionTest(unittest.TestCase):
     def test_default_scenarios_are_geometry_relative_and_safety_valid(self):
         for lumen_type in ("circular_arc", "s_curve"):
             geometry = curved_geometry(lumen_type)
-            for scenario_id in CURVED_LUMEN_SCENARIO_IDS:
+            scenario_ids = (CENTERLINE_TARGET, LATERAL_OFFSET_TARGET, NEAR_SAFETY_BOUNDARY_TARGET)
+            if lumen_type == "s_curve":
+                scenario_ids += S_CURVE_SCENARIO_IDS
+            for scenario_id in scenario_ids:
                 with self.subTest(lumen_type=lumen_type, scenario_id=scenario_id):
                     scenario = resolve_curved_lumen_scenario(curved_config(lumen_type), scenario_id)
                     validation = geometry.validate_target(
@@ -115,6 +122,7 @@ class CurvedLumenScenarioResolutionTest(unittest.TestCase):
                     )
                     self.assertTrue(validation.valid, validation.reasons)
                     self.assertEqual(CURVED_SCENARIO_POLICY_VERSION, scenario.policy_version)
+                    self.assertEqual("fixed_target", scenario.target_mode)
                     self.assertEqual("curved", scenario.geometry_mode)
                     self.assertEqual("base_link", scenario.geometry_frame)
                     self.assertEqual(lumen_geometry_fingerprint(geometry), scenario.geometry_fingerprint)
@@ -139,7 +147,7 @@ class CurvedLumenScenarioResolutionTest(unittest.TestCase):
                         self.assertTrue(np.allclose(scenario.centerline_point, scenario.derived_target))
                     elif scenario_id == LATERAL_OFFSET_TARGET:
                         self.assertAlmostEqual(0.5 * scenario.preferred_radius, scenario.radial_offset, places=15)
-                    else:
+                    elif scenario_id == NEAR_SAFETY_BOUNDARY_TARGET:
                         self.assertAlmostEqual(
                             min(0.001, 0.10 * scenario.preferred_radius),
                             scenario.boundary_guard,
@@ -151,16 +159,78 @@ class CurvedLumenScenarioResolutionTest(unittest.TestCase):
                             places=15,
                         )
                         self.assertGreaterEqual(validation.clearance.safety_margin_clearance, 0.0)
+                    else:
+                        self.assertEqual(0.0, scenario.radial_offset)
+                        self.assertEqual(0.0, scenario.boundary_guard)
                     self.assertFalse(validation.clearance.inlet_violation)
                     self.assertFalse(validation.clearance.outlet_violation)
                     assert_no_nonfinite(self, scenario)
 
     def test_circular_arc_and_s_curve_scenarios_preserve_policy_fractions(self):
         for lumen_type in ("circular_arc", "s_curve"):
-            for scenario_id, expected_fraction in SCENARIO_CENTERLINE_FRACTIONS.items():
+            scenario_ids = (CENTERLINE_TARGET, LATERAL_OFFSET_TARGET, NEAR_SAFETY_BOUNDARY_TARGET)
+            if lumen_type == "s_curve":
+                scenario_ids += S_CURVE_SCENARIO_IDS
+            for scenario_id in scenario_ids:
                 with self.subTest(lumen_type=lumen_type, scenario_id=scenario_id):
                     scenario = resolve_curved_lumen_scenario(curved_config(lumen_type), scenario_id)
-                    self.assertEqual(expected_fraction, scenario.centerline_fraction)
+                    self.assertEqual(SCENARIO_CENTERLINE_FRACTIONS[scenario_id], scenario.centerline_fraction)
+
+    def test_s_curve_named_targets_use_polyline_arc_length_and_zero_offset(self):
+        config = curved_config("s_curve")
+        geometry = curved_geometry("s_curve")
+        centerline = _centerline_data(geometry)
+        for scenario_id, fraction in (
+            (S_CURVE_MIDDLE_TARGET, 0.50),
+            (S_CURVE_NEAR_OUTLET_TARGET, 0.90),
+        ):
+            with self.subTest(scenario_id=scenario_id):
+                scenario = resolve_curved_lumen_scenario(config, scenario_id)
+                expected = _sample_centerline(centerline, fraction)
+                validation = geometry.validate_target(
+                    scenario.validated_target,
+                    frame_id="base_link",
+                    require_safety_margin=True,
+                )
+                self.assertTrue(validation.valid, validation.reasons)
+                self.assertEqual("fixed_target", scenario.target_mode)
+                self.assertEqual(fraction, scenario.normalized_centerline_fraction)
+                self.assertAlmostEqual(fraction * geometry.length, scenario.centerline_arc_length, places=12)
+                self.assertEqual(expected.segment_index, scenario.centerline_segment_index)
+                self.assertEqual(expected.segment_parameter, scenario.centerline_segment_parameter)
+                np.testing.assert_allclose(scenario.validated_target, expected.point, rtol=0.0, atol=1.0e-12)
+                np.testing.assert_allclose(scenario.validated_target, scenario.centerline_point, rtol=0.0, atol=0.0)
+                self.assertEqual(0.0, scenario.radial_offset)
+                self.assertEqual("base_link", scenario.geometry_frame)
+                self.assertTrue(np.all(np.isfinite(scenario.validated_target)))
+                json.dumps(scenario.scenario_identity_payload, allow_nan=False)
+
+    def test_s_curve_named_targets_are_seed_independent_and_type_restricted(self):
+        identities = []
+        for scenario_id in S_CURVE_SCENARIO_IDS:
+            seeded = []
+            for seed in (11, 22, 33):
+                config = curved_config("s_curve")
+                config["mppi"]["random_seed"] = seed
+                scenario = resolve_curved_lumen_scenario(config, scenario_id)
+                seeded.append((scenario.scenario_fingerprint, scenario.validated_target.copy()))
+            self.assertEqual(seeded[0][0], seeded[1][0])
+            self.assertEqual(seeded[0][0], seeded[2][0])
+            np.testing.assert_array_equal(seeded[0][1], seeded[1][1])
+            np.testing.assert_array_equal(seeded[0][1], seeded[2][1])
+            identities.append(seeded[0][0])
+            with self.assertRaisesRegex(ValueError, "requires curved_lumen.type=s_curve"):
+                resolve_curved_lumen_scenario(curved_config("circular_arc"), scenario_id)
+        self.assertNotEqual(identities[0], identities[1])
+
+    def test_s_curve_geometry_change_changes_target_and_fingerprint(self):
+        original = resolve_curved_lumen_scenario(curved_config("s_curve"), S_CURVE_NEAR_OUTLET_TARGET)
+        changed = curved_config("s_curve")
+        changed["curved_lumen"]["s_curve"]["lateral_amplitude"] = 0.010
+        updated = resolve_curved_lumen_scenario(changed, S_CURVE_NEAR_OUTLET_TARGET)
+        self.assertNotEqual(original.geometry_fingerprint, updated.geometry_fingerprint)
+        self.assertNotEqual(original.scenario_fingerprint, updated.scenario_fingerprint)
+        self.assertFalse(np.array_equal(original.validated_target, updated.validated_target))
 
     def test_arc_length_sampling_is_not_raw_index_sampling(self):
         geometry = CurvedLumen(
@@ -309,10 +379,13 @@ class CurvedLumenScenarioResolutionTest(unittest.TestCase):
     def test_geometry_types_and_scenario_ids_produce_distinct_identities(self):
         identities = set()
         for lumen_type in ("circular_arc", "s_curve"):
-            for scenario_id in CURVED_LUMEN_SCENARIO_IDS:
+            scenario_ids = (CENTERLINE_TARGET, LATERAL_OFFSET_TARGET, NEAR_SAFETY_BOUNDARY_TARGET)
+            if lumen_type == "s_curve":
+                scenario_ids += S_CURVE_SCENARIO_IDS
+            for scenario_id in scenario_ids:
                 scenario = resolve_curved_lumen_scenario(curved_config(lumen_type), scenario_id)
                 identities.add(scenario.scenario_fingerprint)
-        self.assertEqual(6, len(identities))
+        self.assertEqual(8, len(identities))
         arc = resolve_curved_lumen_scenario(curved_config("circular_arc"), CENTERLINE_TARGET)
         s_curve = resolve_curved_lumen_scenario(curved_config("s_curve"), CENTERLINE_TARGET)
         self.assertNotEqual(arc.geometry_fingerprint, s_curve.geometry_fingerprint)

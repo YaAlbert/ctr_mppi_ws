@@ -86,12 +86,16 @@ def scenario_and_metadata(config, *, curved_type="circular_arc", scenario_id=CEN
         "override_used": bool(scenario.override_used),
         "target_override_used": bool(scenario.override_used),
         "reference_mode": "fixed_target",
+        "target_mode": scenario.target_mode,
         "curved_lumen_type": scenario.curved_lumen_type,
         "scenario_id": scenario.scenario_id,
         "scenario_policy_version": scenario.policy_version,
         "scenario_fingerprint": scenario.scenario_fingerprint,
         "geometry_frame": scenario.geometry_frame,
         "geometry_fingerprint": scenario.geometry_fingerprint,
+        "centerline_fraction": float(scenario.centerline_fraction),
+        "centerline_arc_length": float(scenario.centerline_arc_length),
+        "radial_offset": float(scenario.radial_offset),
     }
     metadata = {
         "requested_run_id": run_id,
@@ -812,6 +816,12 @@ class LumenRecorderIntegrationTest(unittest.TestCase):
                 metrics = captured[0]
                 summary = strict_json_load(result.run_dir / "summary.json")
                 lumen = summary["lumen_evaluation"]
+                identity = lumen["identity"]
+                self.assertEqual(scenario.target_mode, identity["target_mode"])
+                self.assertEqual(scenario.scenario_id, identity["scenario_id"])
+                self.assertEqual(scenario.centerline_fraction, identity["centerline_fraction"])
+                self.assertEqual(scenario.centerline_arc_length, identity["centerline_arc_length"])
+                self.assertEqual(scenario.radial_offset, identity["radial_offset"])
                 safety = metrics.safety
                 self.assertEqual(safety.physical_safety_pass, lumen["physical_safety"]["physical_safety_pass"])
                 self.assertEqual(safety.physical_collision_detected, lumen["physical_safety"]["collision_detected"])

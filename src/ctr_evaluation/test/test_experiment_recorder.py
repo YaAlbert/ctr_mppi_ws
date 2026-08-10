@@ -1,4 +1,5 @@
 import copy
+import cProfile
 import json
 import math
 import sys
@@ -24,12 +25,15 @@ from ctr_evaluation.experiment_recorder import (  # noqa: E402
     STATE_COMPLETED,
     STATE_FINALIZING,
     STATE_RECORDING,
-    PromotionStatus,
+    promoted_orchestration_metadata,
     write_json,
+    StagingSetupError,
+    ProducerRenderError,
+    ProducerStagingError,
+    PromotionStatus,
+    prepare_prepromotion_ledger,
+    promote_prepromotion_ledger,
 )
-from ctr_evaluation.compare_results import write_json as write_comparison_json  # noqa: E402
-import ctr_evaluation.report_generator as report_module  # noqa: E402
-import ctr_evaluation.experiment_recorder as recorder_module  # noqa: E402
 from ctr_evaluation.publication_model import (  # noqa: E402
     Applicability,
     ArtifactRepresentation,
@@ -37,14 +41,11 @@ from ctr_evaluation.publication_model import (  # noqa: E402
     LayerASnapshot,
     PublicationStatus,
     RecordPhase,
+    StagingStatus,
 )
-from ctr_evaluation.experiment_recorder import (  # noqa: E402
-    StagingSetupError,
-    ProducerRenderError,
-    ProducerStagingError,
-    prepare_prepromotion_ledger,
-    promote_prepromotion_ledger,
-)
+from ctr_evaluation.compare_results import write_json as write_comparison_json  # noqa: E402
+import ctr_evaluation.report_generator as report_module  # noqa: E402
+import ctr_evaluation.experiment_recorder as recorder_module  # noqa: E402
 
 
 CONFIG_FILES = [
@@ -114,18 +115,6 @@ def add_cylinder_samples(recorder):
         recorder.record_solve_timing(timestamp=timestamp, solve_time=0.01, saturated=False)
 
 
-def strict_json_load(path: Path):
-    text = path.read_text(encoding="utf-8")
-    for token in ("NaN", "Infinity", "-Infinity"):
-        if token in text:
-            raise AssertionError(f"non-strict JSON token {token} found in {path}")
-
-    def reject_constant(value):
-        raise AssertionError(f"non-strict JSON constant {value} found in {path}")
-
-    return json.loads(text, parse_constant=reject_constant)
-
-
 def make_uninstrumented_recorder(temp_dir):
     config = project_config(temp_dir)
 
@@ -149,9 +138,7 @@ def make_uninstrumented_recorder(temp_dir):
                 "_record_metric_stage_end",
                 "_finalization_trace_path",
             }:
-                raise AssertionError(
-                    "forbidden instrumentation lookup: " f"{name}"
-                )
+                raise AssertionError(f"forbidden instrumentation lookup: {name}")
             return super().__getattribute__(name)
 
         def __setattr__(self, name, value):
@@ -175,7 +162,50 @@ def make_uninstrumented_recorder(temp_dir):
     return recorder
 
 
+def strict_json_load(path: Path):
+    text = path.read_text(encoding="utf-8")
+    for token in ("NaN", "Infinity", "-Infinity"):
+        if token in text:
+            raise AssertionError(f"non-strict JSON token {token} found in {path}")
+
+    def reject_constant(value):
+        raise AssertionError(f"non-strict JSON constant {value} found in {path}")
+
+    return json.loads(text, parse_constant=reject_constant)
+
+
 class ExperimentRecorderTest(unittest.TestCase):
+    def test_recorder_promotes_authoritative_curved_identity(self):
+        scenario = {
+            "target_mode": "fixed_target",
+            "curved_lumen_type": "s_curve",
+            "scenario_id": "s_curve_near_outlet_target",
+            "centerline_fraction": 0.9,
+            "centerline_arc_length": 0.12308993589263667,
+            "radial_offset": 0.0,
+            "geometry_fingerprint": "geometry-fingerprint",
+            "target_tolerance": 0.003,
+            "required_hold_duration": 0.5,
+        }
+        metadata = promoted_orchestration_metadata({"reference_configuration": {"curved_scenario": scenario}})
+        self.assertEqual(scenario, metadata)
+
+    def test_curved_configuration_records_authoritative_goal_tolerance(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = project_config(temp_dir)
+            config["cylindrical_lumen"]["enabled"] = False
+            config["curved_lumen"]["enabled"] = True
+            config["curved_lumen"]["type"] = "circular_arc"
+            recorder = ExperimentRecorder(
+                config=EvaluationRecorderConfig.from_project_config(config),
+                project_config=config,
+            )
+            recorder.start(experiment_name="curved_tolerance", monotonic_time=0.0)
+            metadata = recorder._metadata(interrupted=False)
+
+            self.assertEqual(0.003, recorder.config.goal_tolerance)
+            self.assertEqual(0.003, metadata["configuration"]["goal"]["tolerance"])
+
     def test_report_is_generated_when_report_generation_flag_is_disabled(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config = project_config(temp_dir)
@@ -191,6 +221,141 @@ class ExperimentRecorderTest(unittest.TestCase):
 
             self.assertTrue((result.run_dir / "summary.json").is_file())
             self.assertTrue((result.run_dir / "report.md").is_file())
+
+    def test_finalization_trace_records_ordered_stages_and_strict_json(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = make_recorder(temp_dir)
+            recorder.start(experiment_name="trace", monotonic_time=0.0)
+            add_samples(recorder)
+            result = recorder.stop(monotonic_time=1.0)
+            trace = strict_json_load(result.run_dir / "finalization_trace.json")
+            events = trace["events"]
+            stages = [(event["stage"], event["phase"]) for event in events]
+            self.assertEqual("data_collection_disabled", stages[0][0])
+            self.assertLess(stages.index(("data_collection_disabled", "end")), stages.index(("finalization", "start")))
+            self.assertLess(stages.index(("data_snapshot", "end")), stages.index(("report_generation", "start")))
+            self.assertLess(stages.index(("report_generation", "end")), stages.index(("finalization", "end")))
+            nested = {
+                event["stage"]: event
+                for event in events
+                if event["phase"] == "end" and event["stage"].startswith("metric_calculation.")
+            }
+            self.assertIn("metric_calculation.alignment", nested)
+            self.assertIn("metric_calculation.summary", nested)
+            lumen = nested["metric_calculation.lumen_evaluation"]
+            self.assertEqual(lumen["details"]["call_count"], 1)
+            self.assertEqual(lumen["details"]["aligned_count"], 2)
+            self.assertGreaterEqual(lumen["details"]["elapsed_s"], 0.0)
+            profile = nested["metric_calculation.profile"]
+            self.assertFalse(profile["details"]["enabled"])
+            self.assertEqual(0, profile["details"]["function_count"])
+            self.assertEqual([], profile["details"]["top_functions"])
+            self.assertTrue(all(event["monotonic_ns"] > 0 for event in events))
+            self.assertTrue((result.run_dir / "summary.json").is_file())
+            self.assertTrue((result.run_dir / "report.md").is_file())
+
+    def test_finalization_profiling_is_opt_in_and_runs_once_when_enabled(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = project_config(temp_dir)
+            config["evaluation"]["enable_finalization_profiling"] = True
+            recorder = ExperimentRecorder(
+                config=EvaluationRecorderConfig.from_project_config(config),
+                project_config=config,
+            )
+            profile_instances = []
+            original_profile = cProfile.Profile
+
+            class CountingProfile(original_profile):
+                def __init__(self, *args, **kwargs):
+                    profile_instances.append(self)
+                    super().__init__(*args, **kwargs)
+
+            cProfile.Profile = CountingProfile
+            try:
+                recorder.start(experiment_name="profiled", monotonic_time=0.0)
+                add_samples(recorder)
+                result = recorder.stop(monotonic_time=1.0)
+            finally:
+                cProfile.Profile = original_profile
+
+            trace = strict_json_load(result.run_dir / "finalization_trace.json")
+            profile_events = [
+                event for event in trace["events"]
+                if event["stage"] == "metric_calculation.profile" and event["phase"] == "end"
+            ]
+            lumen_events = [
+                event for event in trace["events"]
+                if event["stage"] == "metric_calculation.lumen_evaluation" and event["phase"] == "end"
+            ]
+            self.assertEqual(1, len(profile_instances))
+            self.assertEqual(1, len(profile_events))
+            self.assertTrue(profile_events[0]["details"]["enabled"])
+            self.assertGreater(profile_events[0]["details"]["function_count"], 0)
+            self.assertEqual(1, lumen_events[0]["details"]["call_count"])
+
+    def test_finalization_profiling_disabled_does_not_instantiate_profile(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = make_recorder(temp_dir)
+            recorder.project_config["evaluation"].pop("enable_finalization_profiling", None)
+            original_profile = cProfile.Profile
+
+            def fail_profile(*_args, **_kwargs):
+                raise AssertionError("cProfile must remain disabled by default")
+
+            cProfile.Profile = fail_profile
+            try:
+                recorder.start(experiment_name="unprofiled", monotonic_time=0.0)
+                add_samples(recorder)
+                result = recorder.stop(monotonic_time=1.0)
+            finally:
+                cProfile.Profile = original_profile
+
+            trace = strict_json_load(result.run_dir / "finalization_trace.json")
+            profile = next(
+                event for event in trace["events"]
+                if event["stage"] == "metric_calculation.profile" and event["phase"] == "end"
+            )
+            self.assertEqual("disabled", profile["status"])
+            self.assertFalse(profile["details"]["enabled"])
+
+    def test_profile_mode_preserves_summary_report_and_plot_outputs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            unprofiled_config = project_config(Path(temp_dir) / "unprofiled")
+            profiled_config = project_config(Path(temp_dir) / "profiled")
+            profiled_config["evaluation"]["enable_finalization_profiling"] = True
+            unprofiled = ExperimentRecorder(
+                config=EvaluationRecorderConfig.from_project_config(unprofiled_config),
+                project_config=unprofiled_config,
+            )
+            profiled = ExperimentRecorder(
+                config=EvaluationRecorderConfig.from_project_config(profiled_config),
+                project_config=profiled_config,
+            )
+            unprofiled.start(experiment_name="unprofiled", monotonic_time=0.0)
+            add_samples(unprofiled)
+            unprofiled_result = unprofiled.stop(monotonic_time=1.0)
+            profiled.start(experiment_name="profiled", monotonic_time=0.0)
+            add_samples(profiled)
+            profiled_result = profiled.stop(monotonic_time=1.0)
+
+            unprofiled_summary = strict_json_load(unprofiled_result.run_dir / "summary.json")
+            profiled_summary = strict_json_load(profiled_result.run_dir / "summary.json")
+            self.assertEqual(unprofiled_summary, profiled_summary)
+            unprofiled_report = (unprofiled_result.run_dir / "report.md").read_text(encoding="utf-8")
+            profiled_report = (profiled_result.run_dir / "report.md").read_text(encoding="utf-8")
+            unprofiled_report = unprofiled_report.replace(unprofiled_result.run_id, "RUN_ID").replace(
+                "unprofiled", "ROLE"
+            )
+            profiled_report = profiled_report.replace(profiled_result.run_id, "RUN_ID").replace(
+                "profiled", "ROLE"
+            )
+            self.assertEqual(
+                unprofiled_report,
+                profiled_report,
+            )
+            for filename in ("tracking_error.png", "tip_trajectory.png", "trajectory_3d.png"):
+                self.assertTrue((unprofiled_result.run_dir / filename).is_file())
+                self.assertTrue((profiled_result.run_dir / filename).is_file())
 
     def test_baseline_report_is_generated_once_after_comparison(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -237,6 +402,11 @@ class ExperimentRecorderTest(unittest.TestCase):
             result = recorder.stop(monotonic_time=1.0)
             self.assertEqual(run_id, result.run_id)
             self.assertEqual(STATE_COMPLETED, recorder.lifecycle_state)
+            self.assertIsNotNone(result.promotion)
+            self.assertIs(
+                PromotionStatus.PROMOTED_AND_OBSERVED,
+                result.promotion.status,
+            )
             self.assertTrue((result.run_dir / "metadata.yaml").is_file())
             self.assertTrue((result.run_dir / "summary.json").is_file())
             self.assertTrue((result.run_dir / "state.csv").is_file())
@@ -245,7 +415,73 @@ class ExperimentRecorderTest(unittest.TestCase):
             self.assertTrue((result.run_dir / "backbone.csv").is_file())
             self.assertTrue((result.run_dir / "report.md").is_file())
             self.assertTrue((result.run_dir / "tracking_error.png").is_file())
+            self.assertTrue((result.run_dir / "orchestration.json").is_file())
             self.assertFalse((result.run_dir.parent / f"{run_id}.partial").exists())
+
+    def test_finalize_succeeds_without_profiling_or_diagnostic_symbols(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = make_uninstrumented_recorder(temp_dir)
+            recorder.start(experiment_name="uninstrumented", monotonic_time=0.0)
+            add_samples(recorder)
+            delattr(recorder, "_finalization_trace_path")
+            object.__setattr__(recorder, "_isolation_active", True)
+            with mock.patch.object(
+                recorder_module.cProfile,
+                "Profile",
+                side_effect=AssertionError("profiling must not be instantiated"),
+            ):
+                result = recorder.finalize()
+            self.assertIs(
+                PromotionStatus.PROMOTED_AND_OBSERVED,
+                result.promotion.status,
+            )
+            self.assertEqual(STATE_COMPLETED, recorder.lifecycle_state)
+            self.assertNotIn("_finalization_trace_path", recorder.__dict__)
+
+    def test_required_failure_returns_evidence_without_profiling_symbols(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = make_uninstrumented_recorder(temp_dir)
+            recorder.start(
+                experiment_name="uninstrumented_failure",
+                monotonic_time=0.0,
+            )
+            add_samples(recorder)
+            delattr(recorder, "_finalization_trace_path")
+            object.__setattr__(recorder, "_isolation_active", True)
+            captured = {}
+            original_promote = recorder_module.promote_prepromotion_ledger
+
+            def capture(ledger, final_dir):
+                captured["ledger"] = ledger
+                return original_promote(ledger, final_dir)
+
+            with mock.patch.object(
+                recorder,
+                "_write_raw_files",
+                side_effect=RuntimeError("raw failure"),
+            ), mock.patch.object(
+                recorder_module,
+                "promote_prepromotion_ledger",
+                side_effect=capture,
+            ), mock.patch.object(
+                recorder_module.cProfile,
+                "Profile",
+                side_effect=AssertionError(
+                    "profiling must not be instantiated"
+                ),
+            ):
+                result = recorder.finalize()
+            self.assertIs(
+                PromotionStatus.PROMOTION_REFUSED,
+                result.promotion.status,
+            )
+            self.assertIs(
+                PublicationStatus.STAGE_FAILED,
+                captured["ledger"].by_name["raw_state"].publication_status,
+            )
+            self.assertTrue(result.run_dir.name.endswith(".partial"))
+            self.assertTrue(result.run_dir.is_dir())
+            self.assertNotIn("_finalization_trace_path", recorder.__dict__)
 
     def test_cylinder_navigation_outputs_are_written_when_enabled(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -266,6 +502,104 @@ class ExperimentRecorderTest(unittest.TestCase):
             self.assertTrue((result.run_dir / "wall_clearance.png").is_file())
             self.assertTrue((result.run_dir / "cylinder_backbone_target_3d.png").is_file())
             self.assertTrue(summary["lumen_safety"]["collision_free_pass"])
+
+    def test_applicable_cylinder_failure_is_not_reclassified_as_inapplicable(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = project_config(temp_dir)
+            config["cylindrical_lumen"]["enabled"] = True
+            recorder = ExperimentRecorder(
+                config=EvaluationRecorderConfig.from_project_config(config),
+                project_config=config,
+            )
+            captured = {}
+            original_promote = recorder_module.promote_prepromotion_ledger
+
+            def capture(ledger, final_dir):
+                captured["ledger"] = ledger
+                return original_promote(ledger, final_dir)
+
+            recorder.start(experiment_name="cylinder_failure", monotonic_time=0.0)
+            add_cylinder_samples(recorder)
+            with mock.patch.object(recorder, "_write_raw_files", side_effect=RuntimeError("raw failure")), mock.patch.object(
+                recorder_module, "promote_prepromotion_ledger", side_effect=capture
+            ):
+                result = recorder.stop(monotonic_time=1.0)
+            record = captured["ledger"].by_name["cylinder_navigation"]
+            self.assertIs(Applicability.APPLICABLE, record.execution_applicability)
+            self.assertIs(PublicationStatus.STAGE_FAILED, record.publication_status)
+            self.assertIs(PromotionStatus.PROMOTION_REFUSED, result.promotion.status)
+
+    def test_applicable_lumen_failure_is_not_reclassified_as_inapplicable(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = make_recorder(temp_dir)
+            captured = {}
+            original_promote = recorder_module.promote_prepromotion_ledger
+
+            def capture(ledger, final_dir):
+                captured["ledger"] = ledger
+                return original_promote(ledger, final_dir)
+
+            recorder.start(
+                experiment_name="lumen_failure",
+                metadata={"curved_lumen_type": "circular_arc"},
+                monotonic_time=0.0,
+            )
+            add_samples(recorder)
+            with mock.patch.object(
+                recorder_module,
+                "_has_curved_lumen_metadata",
+                return_value=True,
+            ), mock.patch.object(
+                recorder,
+                "_lumen_evaluation_result",
+                side_effect=RuntimeError("lumen failure"),
+            ), mock.patch.object(
+                recorder_module,
+                "promote_prepromotion_ledger",
+                side_effect=capture,
+            ):
+                result = recorder.stop(monotonic_time=1.0)
+            record = captured["ledger"].by_name["lumen_evaluation"]
+            self.assertIs(
+                Applicability.APPLICABLE,
+                record.execution_applicability,
+            )
+            self.assertIs(
+                PublicationStatus.STAGE_FAILED,
+                record.publication_status,
+            )
+            self.assertIs(
+                PromotionStatus.PROMOTED_AND_OBSERVED,
+                result.promotion.status,
+            )
+
+    def test_non_applicable_lumen_and_cylinder_remain_not_applicable(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = make_recorder(temp_dir)
+            captured = {}
+            original_promote = recorder_module.promote_prepromotion_ledger
+
+            def capture(ledger, final_dir):
+                captured["ledger"] = ledger
+                return original_promote(ledger, final_dir)
+
+            recorder.start(experiment_name="no_lumen", monotonic_time=0.0)
+            add_samples(recorder)
+            with mock.patch.object(
+                recorder_module,
+                "promote_prepromotion_ledger",
+                side_effect=capture,
+            ):
+                recorder.stop(monotonic_time=1.0)
+            ledger = captured["ledger"]
+            self.assertIs(
+                Applicability.NOT_APPLICABLE,
+                ledger.by_name["lumen_evaluation"].execution_applicability,
+            )
+            self.assertIs(
+                Applicability.NOT_APPLICABLE,
+                ledger.by_name["cylinder_navigation"].execution_applicability,
+            )
 
     def test_metadata_and_summary_are_machine_readable(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -375,9 +709,33 @@ class ExperimentRecorderTest(unittest.TestCase):
             error = strict_json_load(partial_dir / "finalization_error.json")
             self.assertEqual(run_id, error["run_id"])
             self.assertEqual(STATE_FINALIZING, error["state"])
+            self.assertIs(PromotionStatus.PROMOTION_REFUSED, result.promotion.status)
+
+    def test_finalization_trace_records_exception_after_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = make_recorder(temp_dir)
+            recorder.start(experiment_name="trace_failure", monotonic_time=0.0)
+            add_samples(recorder)
+            original_generate_report = report_module.generate_report
+
+            def fail_report(**_kwargs):
+                raise RuntimeError("diagnostic report failure")
+
+            report_module.generate_report = fail_report
+            try:
+                result = recorder.stop(monotonic_time=1.0)
+            finally:
+                report_module.generate_report = original_generate_report
+            self.assertIsNotNone(result.promotion)
             self.assertIs(
-                PromotionStatus.PROMOTION_REFUSED, result.promotion.status
+                PromotionStatus.PROMOTION_REFUSED,
+                result.promotion.status,
             )
+            partial_dir = recorder.config.output_root / recorder.config.experiment_group / f"{recorder.run_id}.partial"
+            trace = strict_json_load(partial_dir / "finalization_trace.json")
+            self.assertTrue((partial_dir / "summary.json").is_file())
+            self.assertEqual("error", trace["events"][-1]["status"])
+            self.assertEqual("RuntimeError", trace["events"][-1]["error_type"])
 
     def test_baseline_comparison_is_written_for_compatible_runs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -868,193 +1226,6 @@ class ExperimentRecorderTest(unittest.TestCase):
             )
             self.assertIsNone(ledger.by_name["sibling"].publication_status)
 
-    def test_finalize_succeeds_without_profiling_or_diagnostic_symbols(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            recorder = make_uninstrumented_recorder(temp_dir)
-            recorder.start(
-                experiment_name="uninstrumented", monotonic_time=0.0
-            )
-            add_samples(recorder)
-            if "_finalization_trace_path" in recorder.__dict__:
-                delattr(recorder, "_finalization_trace_path")
-            object.__setattr__(recorder, "_isolation_active", True)
-            with mock.patch.object(
-                recorder_module.cProfile,
-                "Profile",
-                side_effect=AssertionError(
-                    "profiling must not be instantiated"
-                ),
-            ):
-                result = recorder.finalize()
-            self.assertIs(
-                PromotionStatus.PROMOTED_AND_OBSERVED,
-                result.promotion.status,
-            )
-            self.assertEqual(STATE_COMPLETED, recorder.lifecycle_state)
-            self.assertNotIn("_finalization_trace_path", recorder.__dict__)
-
-    def test_required_failure_returns_evidence_without_profiling_symbols(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            recorder = make_uninstrumented_recorder(temp_dir)
-            recorder.start(
-                experiment_name="uninstrumented_failure",
-                monotonic_time=0.0,
-            )
-            add_samples(recorder)
-            if "_finalization_trace_path" in recorder.__dict__:
-                delattr(recorder, "_finalization_trace_path")
-            object.__setattr__(recorder, "_isolation_active", True)
-            captured = {}
-            original_promote = recorder_module.promote_prepromotion_ledger
-
-            def capture(ledger, final_dir):
-                captured["ledger"] = ledger
-                return original_promote(ledger, final_dir)
-
-            with mock.patch.object(
-                recorder,
-                "_write_raw_files",
-                side_effect=RuntimeError("raw failure"),
-            ), mock.patch.object(
-                recorder_module,
-                "promote_prepromotion_ledger",
-                side_effect=capture,
-            ), mock.patch.object(
-                recorder_module.cProfile,
-                "Profile",
-                side_effect=AssertionError(
-                    "profiling must not be instantiated"
-                ),
-            ):
-                result = recorder.finalize()
-            self.assertIs(
-                PromotionStatus.PROMOTION_REFUSED,
-                result.promotion.status,
-            )
-            self.assertIs(
-                PublicationStatus.STAGE_FAILED,
-                captured["ledger"].by_name["raw_state"].publication_status,
-            )
-            self.assertTrue(result.run_dir.name.endswith(".partial"))
-            self.assertTrue(result.run_dir.is_dir())
-            self.assertNotIn("_finalization_trace_path", recorder.__dict__)
-
-    def test_applicable_cylinder_failure_is_not_reclassified_as_inapplicable(
-        self,
-    ):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config = project_config(temp_dir)
-            config["cylindrical_lumen"]["enabled"] = True
-            recorder = ExperimentRecorder(
-                config=EvaluationRecorderConfig.from_project_config(config),
-                project_config=config,
-            )
-            captured = {}
-            original_promote = recorder_module.promote_prepromotion_ledger
-
-            def capture(ledger, final_dir):
-                captured["ledger"] = ledger
-                return original_promote(ledger, final_dir)
-
-            recorder.start(
-                experiment_name="cylinder_failure", monotonic_time=0.0
-            )
-            add_cylinder_samples(recorder)
-            with mock.patch.object(
-                recorder,
-                "_write_raw_files",
-                side_effect=RuntimeError("raw failure"),
-            ), mock.patch.object(
-                recorder_module,
-                "promote_prepromotion_ledger",
-                side_effect=capture,
-            ):
-                result = recorder.stop(monotonic_time=1.0)
-            record = captured["ledger"].by_name["cylinder_navigation"]
-            self.assertIs(
-                Applicability.APPLICABLE, record.execution_applicability
-            )
-            self.assertIs(
-                PublicationStatus.STAGE_FAILED, record.publication_status
-            )
-            self.assertIs(
-                PromotionStatus.PROMOTION_REFUSED, result.promotion.status
-            )
-
-    def test_applicable_lumen_failure_is_not_reclassified_as_inapplicable(
-        self,
-    ):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            recorder = make_recorder(temp_dir)
-            captured = {}
-            original_promote = recorder_module.promote_prepromotion_ledger
-
-            def capture(ledger, final_dir):
-                captured["ledger"] = ledger
-                return original_promote(ledger, final_dir)
-
-            recorder.start(
-                experiment_name="lumen_failure",
-                metadata={"curved_lumen_type": "circular_arc"},
-                monotonic_time=0.0,
-            )
-            add_samples(recorder)
-            with mock.patch.object(
-                recorder_module,
-                "_has_curved_lumen_metadata",
-                return_value=True,
-            ), mock.patch.object(
-                recorder,
-                "_lumen_evaluation_result",
-                side_effect=RuntimeError("lumen failure"),
-            ), mock.patch.object(
-                recorder_module,
-                "promote_prepromotion_ledger",
-                side_effect=capture,
-            ):
-                result = recorder.stop(monotonic_time=1.0)
-            record = captured["ledger"].by_name["lumen_evaluation"]
-            self.assertIs(
-                Applicability.APPLICABLE,
-                record.execution_applicability,
-            )
-            self.assertIs(
-                PublicationStatus.STAGE_FAILED,
-                record.publication_status,
-            )
-            self.assertIs(
-                PromotionStatus.PROMOTED_AND_OBSERVED,
-                result.promotion.status,
-            )
-
-    def test_non_applicable_lumen_and_cylinder_remain_not_applicable(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            recorder = make_recorder(temp_dir)
-            captured = {}
-            original_promote = recorder_module.promote_prepromotion_ledger
-
-            def capture(ledger, final_dir):
-                captured["ledger"] = ledger
-                return original_promote(ledger, final_dir)
-
-            recorder.start(experiment_name="no_lumen", monotonic_time=0.0)
-            add_samples(recorder)
-            with mock.patch.object(
-                recorder_module,
-                "promote_prepromotion_ledger",
-                side_effect=capture,
-            ):
-                recorder.stop(monotonic_time=1.0)
-            ledger = captured["ledger"]
-            self.assertIs(
-                Applicability.NOT_APPLICABLE,
-                ledger.by_name["lumen_evaluation"].execution_applicability,
-            )
-            self.assertIs(
-                Applicability.NOT_APPLICABLE,
-                ledger.by_name["cylinder_navigation"].execution_applicability,
-            )
-
     def test_slice3_valid_ledger_promotes_and_observes_final_paths(self):
         layer = LayerASnapshot("slice3", "none", "COMPLETED", 0, True)
         spec = ArtifactSpec(
@@ -1400,6 +1571,7 @@ class ExperimentRecorderTest(unittest.TestCase):
             self.assertIs(PromotionStatus.PROMOTION_FAILED, result.status)
             self.assertTrue((root / "run.partial").is_dir())
             self.assertTrue((root / "run").is_dir())
+
 
 if __name__ == "__main__":
     unittest.main()

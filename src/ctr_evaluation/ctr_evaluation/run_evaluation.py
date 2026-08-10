@@ -13,6 +13,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from typing import Any, Callable
@@ -35,6 +36,7 @@ from ctr_mppi_controller.cylindrical_lumen import (
     CylindricalLumen,
     config_with_cylinder_overrides,
     goal_position_from_config,
+    goal_hold_duration_from_config,
     goal_tolerance_from_config,
 )
 from ctr_mppi_controller.lumen_factory import CURVED_LUMEN_TYPES, config_with_lumen_overrides
@@ -376,6 +378,9 @@ class EvaluationOrchestrator:
         records: list[ProcessRecord] = []
         monitor: RosRunMonitor | None = None
         recording_active = False
+        stability: StabilityStats | None = None
+        cleanup_state: dict[str, Any] = {"attempted": False, "audit": None}
+        stop_attempted = False
         try:
             env = run_environment(domain_id)
             base_command = build_base_simulation_command(
@@ -392,6 +397,14 @@ class EvaluationOrchestrator:
             )
             records.append(self.process_manager.start(role=f"{role}_base", command=base_command, env=env))
             monitor = RosRunMonitor(domain_id=domain_id)
+            monitor.record_runner_event("runner_start", orchestration_id=self.orchestration_id, run_role=role)
+            monitor.record_runner_event(
+                "launch_process_created",
+                role=records[-1].role,
+                pid=records[-1].identity.pid,
+                domain_id=domain_id,
+            )
+            monitor.set_diagnostic_settings(self.settings)
             monitor.wait_for_services(self.settings.service_timeout)
             monitor.wait_for_state_tip(self.settings.topic_ready_timeout)
             if role == "baseline" and process_name_running("mppi_controller_node"):
@@ -405,15 +418,25 @@ class EvaluationOrchestrator:
             samples = monitor.collect_stability_samples(
                 duration_s=self.settings.initial_stability_duration,
                 timeout_s=self.settings.topic_ready_timeout,
+                minimum_samples=self.settings.initial_stability_samples,
             )
+            stability_entry_time = time.monotonic()
             stability = compute_initial_stability(samples, self.settings)
+            monitor.record_stability_result(samples, stability, stability_entry_time)
             audit.events.extend(monitor.command_events_since(audit_start_receive_time(audit)))
             if not stability.stable:
+                print(
+                    "readiness_diagnostics "
+                    + json.dumps(monitor.readiness_diagnostics(), allow_nan=False, separators=(",", ":")),
+                    file=sys.stderr,
+                )
                 raise OrchestrationError(f"initial state is not stable: {stability.reason}")
+            monitor.record_runner_event("readiness_completed", evaluated_sample_count=len(samples))
             if audit.nonzero_count(self.settings.command_zero_tolerance) > 0:
                 raise OrchestrationError("nonzero command received before recording")
 
             recording_start_time = monitor.now()
+            monitor.record_runner_event("recording_start", recording_start_time=recording_start_time)
             reference_epoch = recording_start_time + self.settings.reference_lead_time
             evaluation_window_end = reference_epoch + self.args.duration
             metadata = self._start_metadata(
@@ -459,63 +482,214 @@ class EvaluationOrchestrator:
                     raise OrchestrationError("candidate command timestamp is before recording start")
 
             monitor.spin_until_time(evaluation_window_end)
-            stop_response = monitor.stop_experiment(timeout_s=self.settings.finalization_timeout)
-            recording_active = False
-            run_dir = resolve_result_dir(
-                response_message=stop_response,
-                output_root=self.output_root,
-                experiment_group=self.experiment_group,
-                run_id=run_id,
-                orchestration_id=self.orchestration_id,
-                run_role=role,
+            monitor.record_runner_event(
+                "recording_duration_complete",
+                scheduled_end=evaluation_window_end,
+                actual_end=monitor.now(),
             )
-            summary = strict_json_file(run_dir / "summary.json")
-            if not (run_dir / "report.md").is_file():
-                raise OrchestrationError(f"missing report.md in {run_dir}")
-            orchestration = self._runtime_metadata(
+            stop_attempted = True
+            stop_response, stop_recovered, stop_recovery_error = self._stop_experiment_with_recovery(monitor)
+            monitor.record_runner_event(
+                "stop_response_received",
+                status="recovered" if stop_recovered else "ok",
+            )
+            recording_active = False
+            return self._finalize_run(
                 role=role,
                 run_id=run_id,
                 domain_id=domain_id,
                 monitor=monitor,
                 records=records,
                 stability=stability,
-                run_dir=run_dir,
-            )
-            write_json(run_dir / "orchestration.json", orchestration)
-            self.process_manager.shutdown_all(records, self.settings)
-            cleanup = self.process_manager.audit_cleanup(records)
-            orchestration["cleanup_audit"] = cleanup
-            write_json(run_dir / "orchestration.json", orchestration)
-            if not cleanup["clean"]:
-                raise OrchestrationError(f"process cleanup audit failed for {role}: {cleanup}")
-            return RunResult(
-                role=role,
-                run_id=run_id,
-                run_dir=run_dir,
-                metadata=read_yaml(run_dir / "metadata.yaml"),
-                summary=summary,
-                orchestration=orchestration,
+                stop_response=stop_response,
+                cleanup_state=cleanup_state,
+                stop_recovered=stop_recovered,
+                recovery_error=stop_recovery_error,
             )
         except Exception as exc:
-            if monitor is not None and recording_active:
-                try:
-                    monitor.stop_experiment(timeout_s=self.settings.finalization_timeout)
-                except Exception:
-                    pass
+            recovery_error = None
+            if monitor is not None and recording_active and not stop_attempted:
+                recovered_result, recovery_error, recovery_stage = self._recover_stop_and_finalize(
+                    role=role,
+                    run_id=run_id,
+                    domain_id=domain_id,
+                    monitor=monitor,
+                    records=records,
+                    stability=stability,
+                    cleanup_state=cleanup_state,
+                    initial_error=exc,
+                )
+                if recovered_result is not None:
+                    recording_active = False
+                    return recovered_result
+            else:
+                recovery_stage = None
             failure = {
                 "orchestration_success": False,
+                "terminal_status": "failed",
                 "orchestration_id": self.orchestration_id,
                 "run_role": role,
                 "run_id": run_id,
                 "error": str(exc),
+                "error_type": type(exc).__name__,
                 "processes": [record.to_dict() for record in records],
             }
-            write_orchestration_failure(self.output_root, self.experiment_group, self.orchestration_id, failure)
-            self.process_manager.shutdown_all(records, self.settings)
+            if recovery_error is not None:
+                failure["recovery_error"] = str(recovery_error)
+                failure["recovery_stage"] = recovery_stage
+            cleanup_was_attempted = cleanup_state["attempted"]
+            if monitor is not None and not cleanup_was_attempted:
+                failure["readiness_diagnostics"] = monitor.readiness_diagnostics()
+                monitor.record_runner_event("cleanup_start", status="started")
+            if not cleanup_state["attempted"]:
+                cleanup_state["attempted"] = True
+                self.process_manager.shutdown_all(records, self.settings)
+                cleanup_state["audit"] = self.process_manager.audit_cleanup(records)
+            cleanup = cleanup_state["audit"] or {"clean": False, "reason": "cleanup audit unavailable"}
+            failure["cleanup_audit"] = cleanup
+            if monitor is not None and not cleanup_was_attempted:
+                monitor.record_runner_event("cleanup_end", status="ok" if cleanup["clean"] else "failed", cleanup=cleanup)
+                monitor.record_runner_event("runner_exit", status="failed")
+                failure["readiness_diagnostics"] = monitor.readiness_diagnostics()
+            try:
+                write_orchestration_failure(self.output_root, self.experiment_group, self.orchestration_id, failure)
+            except Exception as failure_write_error:
+                raise exc from failure_write_error
             raise
         finally:
             if monitor is not None:
                 monitor.close()
+
+    def _finalize_run(
+        self,
+        *,
+        role: str,
+        run_id: str,
+        domain_id: int,
+        monitor: "RosRunMonitor",
+        records: list[ProcessRecord],
+        stability: StabilityStats,
+        stop_response: str,
+        cleanup_state: dict[str, Any],
+        stop_recovered: bool = False,
+        recovery_error: Exception | None = None,
+        run_error: Exception | None = None,
+    ) -> RunResult:
+        run_dir = resolve_result_dir(
+            response_message=stop_response,
+            output_root=self.output_root,
+            experiment_group=self.experiment_group,
+            run_id=run_id,
+            orchestration_id=self.orchestration_id,
+            run_role=role,
+        )
+        summary = strict_json_file(run_dir / "summary.json")
+        if not (run_dir / "report.md").is_file():
+            raise OrchestrationError(f"missing report.md in {run_dir}")
+        orchestration = self._runtime_metadata(
+            role=role,
+            run_id=run_id,
+            domain_id=domain_id,
+            monitor=monitor,
+            records=records,
+            stability=stability,
+            run_dir=run_dir,
+        )
+        orchestration["orchestration_success"] = run_error is None
+        orchestration["terminal_status"] = "completed" if run_error is None else "failed"
+        if run_error is not None:
+            orchestration["error"] = str(run_error)
+            orchestration["error_type"] = type(run_error).__name__
+        orchestration["stop_recovered"] = stop_recovered
+        orchestration["stop_recovery_error"] = None if recovery_error is None else str(recovery_error)
+        orchestration["readiness_diagnostics"] = monitor.readiness_diagnostics()
+        monitor.record_runner_event("cleanup_start", status="started")
+        cleanup_state["attempted"] = True
+        self.process_manager.shutdown_all(records, self.settings)
+        cleanup = self.process_manager.audit_cleanup(records)
+        cleanup_state["audit"] = cleanup
+        monitor.record_runner_event("cleanup_end", status="ok" if cleanup["clean"] else "failed", cleanup=cleanup)
+        orchestration["cleanup_audit"] = cleanup
+        cleanup_failed = not cleanup["clean"]
+        if cleanup_failed:
+            orchestration["orchestration_success"] = False
+            orchestration["terminal_status"] = "failed"
+            orchestration.setdefault("error", f"process cleanup audit failed for {role}: {cleanup}")
+            orchestration.setdefault("error_type", "OrchestrationError")
+        monitor.record_runner_event("runner_exit", status="completed" if not cleanup_failed and run_error is None else "failed")
+        orchestration["readiness_diagnostics"] = monitor.readiness_diagnostics()
+        write_json(run_dir / "orchestration.json", orchestration)
+        if run_error is not None:
+            if cleanup_failed:
+                raise run_error from OrchestrationError(f"process cleanup audit failed for {role}: {cleanup}")
+            raise run_error
+        if cleanup_failed:
+            raise OrchestrationError(f"process cleanup audit failed for {role}: {cleanup}")
+        return RunResult(
+            role=role,
+            run_id=run_id,
+            run_dir=run_dir,
+            metadata=read_yaml(run_dir / "metadata.yaml"),
+            summary=summary,
+            orchestration=orchestration,
+        )
+
+    def _stop_experiment_with_recovery(
+        self,
+        monitor: "RosRunMonitor",
+    ) -> tuple[str, bool, Exception | None]:
+        try:
+            return monitor.stop_experiment(timeout_s=self.settings.finalization_timeout), False, None
+        except Exception as first_error:
+            try:
+                stop_response = monitor.stop_experiment(timeout_s=self.settings.finalization_timeout)
+            except Exception as retry_error:
+                raise first_error from retry_error
+            monitor.record_runner_event(
+                "stop_recovery",
+                status="ok",
+                initial_error=str(first_error),
+            )
+            return stop_response, True, first_error
+
+    def _recover_stop_and_finalize(
+        self,
+        *,
+        role: str,
+        run_id: str,
+        domain_id: int,
+        monitor: "RosRunMonitor",
+        records: list[ProcessRecord],
+        stability: StabilityStats,
+        cleanup_state: dict[str, Any],
+        initial_error: Exception,
+    ) -> tuple[RunResult | None, Exception | None, str | None]:
+        try:
+            stop_response = monitor.stop_experiment(timeout_s=self.settings.finalization_timeout)
+        except Exception as recovery_error:
+            return None, recovery_error, "stop_retry"
+        monitor.record_runner_event(
+            "stop_recovery",
+            status="ok",
+            initial_error=str(initial_error),
+        )
+        try:
+            result = self._finalize_run(
+                role=role,
+                run_id=run_id,
+                domain_id=domain_id,
+                monitor=monitor,
+                records=records,
+                stability=stability,
+                stop_response=stop_response,
+                cleanup_state=cleanup_state,
+                stop_recovered=True,
+                recovery_error=initial_error,
+                run_error=initial_error,
+            )
+        except Exception as finalization_error:
+            return None, finalization_error, "finalization"
+        return result, None, None
 
     def _fresh_domain_id(self) -> int:
         for _ in range(1000):
@@ -669,6 +843,9 @@ class EvaluationOrchestrator:
             "override_used": bool(scenario.override_used),
             "target_override_used": bool(scenario.override_used),
             "reference_mode": "fixed_target",
+            "target_mode": scenario.target_mode,
+            "target_tolerance": goal_tolerance_from_config(self.project_config),
+            "required_hold_duration": goal_hold_duration_from_config(self.project_config),
             "curved_lumen_type": scenario.curved_lumen_type,
             "scenario_id": scenario.scenario_id,
             "scenario_policy_version": scenario.policy_version,
@@ -708,9 +885,9 @@ class EvaluationOrchestrator:
             "enable_cylindrical_lumen:=false",
             "enable_curved_lumen:=true",
             f"curved_lumen_type:={self.curved_lumen_type}",
-            f"cylinder_target_x:={target[0]:.9f}",
-            f"cylinder_target_y:={target[1]:.9f}",
-            f"cylinder_target_z:={target[2]:.9f}",
+            f"cylinder_target_x:={target[0]:.17g}",
+            f"cylinder_target_y:={target[1]:.17g}",
+            f"cylinder_target_z:={target[2]:.17g}",
         ]
         if self.args.mppi_profile:
             args.append(f"cylinder_profile:={self.args.mppi_profile}")
@@ -869,6 +1046,7 @@ class RosRunMonitor:
         from nav_msgs.msg import Path as NavPath
 
         self.rclpy = rclpy
+        monitor_created = time.monotonic()
         self.context = Context()
         try:
             rclpy.init(args=None, context=self.context, domain_id=domain_id)
@@ -878,6 +1056,41 @@ class RosRunMonitor:
         self.node = rclpy.create_node("ctr_run_evaluation_monitor", context=self.context)
         self.executor = SingleThreadedExecutor(context=self.context)
         self.executor.add_node(self.node)
+        self._diagnostics: dict[str, Any] = {
+            "monitor_created_monotonic": monitor_created,
+            "node_created_monotonic": time.monotonic(),
+            "subscription_created_monotonic": None,
+            "executor_spin_start_monotonic": None,
+            "first_state_callback_monotonic": None,
+            "last_state_callback_monotonic": None,
+            "first_tip_callback_monotonic": None,
+            "last_tip_callback_monotonic": None,
+            "state_callback_count": 0,
+            "tip_callback_count": 0,
+            "state_callback_count_before_collection": None,
+            "tip_callback_count_before_collection": None,
+            "state_callback_count_during_collection": None,
+            "tip_callback_count_during_collection": None,
+            "readiness_function_entry_monotonic": None,
+            "stability_collection_start_monotonic": None,
+            "stability_deadline_monotonic": None,
+            "stability_collection_end_monotonic": None,
+            "evaluated_samples": [],
+            "evaluated_sample_count": 0,
+            "first_evaluated_sample_receive_monotonic": None,
+            "last_evaluated_sample_receive_monotonic": None,
+            "evaluated_receive_time_span_s": None,
+            "criteria": None,
+            "readiness_result": None,
+            "readiness_failure_reason": None,
+            "runner_events": [],
+        }
+        self._readiness_collection_active = False
+        self._state_callbacks_during_collection = 0
+        self._tip_callbacks_during_collection = 0
+        self._state_callback_sequence = 0
+        self._readiness_state_queue: list[tuple[int, StateTipSample]] = []
+        self._diagnostic_settings: OrchestrationSettings | None = None
         self.StartExperiment = StartExperiment
         self.StopExperiment = StopExperiment
         self.latest_state: StateTipSample | None = None
@@ -902,6 +1115,7 @@ class RosRunMonitor:
         ]
         self.start_client = self.node.create_client(StartExperiment, "/ctr/start_experiment")
         self.stop_client = self.node.create_client(StopExperiment, "/ctr/stop_experiment")
+        self._diagnostics["subscription_created_monotonic"] = time.monotonic()
 
     def close(self) -> None:
         try:
@@ -967,17 +1181,107 @@ class RosRunMonitor:
                 f"{identity}"
             )
 
-    def collect_stability_samples(self, *, duration_s: float, timeout_s: float) -> list[StateTipSample]:
+    def collect_stability_samples(
+        self, *, duration_s: float, timeout_s: float, minimum_samples: int
+    ) -> list[StateTipSample]:
         samples: list[StateTipSample] = []
         start = time.monotonic()
         deadline = start + timeout_s
-        while time.monotonic() < deadline:
-            self.spin_once(0.02)
-            if self.latest_state is not None and (not samples or samples[-1].receive_time != self.latest_state.receive_time):
-                samples.append(self.latest_state)
-                if samples[-1].receive_time - samples[0].receive_time >= duration_s:
-                    return samples
+        collection_state_sequence = self._state_callback_sequence
+        self._diagnostics["stability_collection_start_monotonic"] = start
+        self._diagnostics["stability_deadline_monotonic"] = deadline
+        self._diagnostics["stability_collection_state_sequence"] = collection_state_sequence
+        self._diagnostics["state_callback_count_before_collection"] = self._diagnostics["state_callback_count"]
+        self._diagnostics["tip_callback_count_before_collection"] = self._diagnostics["tip_callback_count"]
+        self._state_callbacks_during_collection = 0
+        self._tip_callbacks_during_collection = 0
+        self._readiness_state_queue.clear()
+        self._readiness_collection_active = True
+        try:
+            while time.monotonic() < deadline:
+                self.spin_once(0.02)
+                pending = self._readiness_state_queue
+                self._readiness_state_queue = []
+                for sequence, sample in pending:
+                    if sequence <= collection_state_sequence:
+                        continue
+                    samples.append(sample)
+                if (
+                    len(samples) >= minimum_samples
+                    and samples[-1].receive_time - samples[0].receive_time >= duration_s
+                ):
+                    break
+        finally:
+            self._readiness_collection_active = False
+            self._diagnostics["stability_collection_end_monotonic"] = time.monotonic()
+            self._diagnostics["state_callback_count_during_collection"] = self._state_callbacks_during_collection
+            self._diagnostics["tip_callback_count_during_collection"] = self._tip_callbacks_during_collection
+            self._diagnostics["evaluated_samples"] = [
+                {
+                    "timestamp": sample.timestamp,
+                    "receive_monotonic": sample.receive_time,
+                    "q": list(sample.q),
+                    "tip": list(sample.tip),
+                }
+                for sample in samples
+            ]
+            self._diagnostics["evaluated_sample_count"] = len(samples)
+            if samples:
+                self._diagnostics["first_evaluated_sample_receive_monotonic"] = samples[0].receive_time
+                self._diagnostics["last_evaluated_sample_receive_monotonic"] = samples[-1].receive_time
+                self._diagnostics["evaluated_receive_time_span_s"] = samples[-1].receive_time - samples[0].receive_time
         return samples
+
+    def record_stability_result(self, samples: list[StateTipSample], stability: StabilityStats, entry_time: float) -> None:
+        if self._diagnostic_settings is None:
+            raise RuntimeError("diagnostic settings were not configured")
+        self._diagnostics["readiness_function_entry_monotonic"] = entry_time
+        self._diagnostics["evaluated_samples"] = [
+            {
+                "timestamp": sample.timestamp,
+                "receive_monotonic": sample.receive_time,
+                "q": list(sample.q),
+                "tip": list(sample.tip),
+            }
+            for sample in samples
+        ]
+        self._diagnostics["evaluated_sample_count"] = len(samples)
+        if samples:
+            self._diagnostics["first_evaluated_sample_receive_monotonic"] = samples[0].receive_time
+            self._diagnostics["last_evaluated_sample_receive_monotonic"] = samples[-1].receive_time
+            self._diagnostics["evaluated_receive_time_span_s"] = samples[-1].receive_time - samples[0].receive_time
+        finite_values = bool(samples)
+        if samples:
+            q = np.asarray([sample.q for sample in samples], dtype=float)
+            tip = np.asarray([sample.tip for sample in samples], dtype=float)
+            finite_values = q.shape[1:] == (6,) and tip.shape[1:] == (3,) and bool(np.all(np.isfinite(q))) and bool(np.all(np.isfinite(tip)))
+        self._diagnostics["criteria"] = {
+            "finite_values": finite_values,
+            "sample_count": len(samples) >= self._diagnostic_settings.initial_stability_samples,
+            "duration": bool(samples and samples[-1].receive_time - samples[0].receive_time >= self._diagnostic_settings.initial_stability_duration),
+            "q_variation": bool(finite_values and stability.max_q_variation <= self._diagnostic_settings.initial_q_stability_tolerance),
+            "tip_variation": bool(finite_values and stability.max_tip_variation <= self._diagnostic_settings.initial_tip_stability_tolerance),
+        }
+        self._diagnostics["readiness_result"] = bool(stability.stable)
+        self._diagnostics["readiness_failure_reason"] = None if stability.stable else stability.reason
+
+    def set_diagnostic_settings(self, settings: OrchestrationSettings) -> None:
+        self._diagnostic_settings = settings
+
+    def readiness_diagnostics(self) -> dict[str, Any]:
+        return sanitize_for_json(self._diagnostics)
+
+    def record_runner_event(self, event: str, *, status: str = "ok", **details: Any) -> None:
+        record = {
+            "monotonic_ns": time.monotonic_ns(),
+            "utc": datetime.now(timezone.utc).isoformat(),
+            "pid": os.getpid(),
+            "thread_id": threading.get_ident(),
+            "event": event,
+            "status": status,
+            **details,
+        }
+        self._diagnostics.setdefault("runner_events", []).append(record)
 
     def command_publisher_counts(self) -> dict[str, int]:
         return {topic: len(self.node.get_publishers_info_by_topic(topic)) for topic in COMMAND_TOPICS}
@@ -1027,6 +1331,8 @@ class RosRunMonitor:
             self.spin_once(0.05)
 
     def spin_once(self, timeout_s: float) -> None:
+        if self._diagnostics["executor_spin_start_monotonic"] is None:
+            self._diagnostics["executor_spin_start_monotonic"] = time.monotonic()
         self.executor.spin_once(timeout_sec=timeout_s)
 
     def _spin_until(self, predicate: Callable[[], bool], timeout_s: float, label: str) -> None:
@@ -1038,15 +1344,62 @@ class RosRunMonitor:
         raise OrchestrationError(f"timed out waiting for {label}")
 
     def _call_service(self, client, request, timeout_s: float, label: str):
+        wait_start = time.monotonic()
+        deadline = wait_start + timeout_s
+        self.record_runner_event(
+            f"{label}_wait_start",
+            timeout_s=timeout_s,
+            wait_start_monotonic=wait_start,
+            deadline_monotonic=deadline,
+        )
         future = client.call_async(request)
-        deadline = time.monotonic() + timeout_s
+        dispatch_time = time.monotonic()
+        self.record_runner_event(
+            f"{label}_request_dispatched",
+            dispatch_monotonic=dispatch_time,
+            future_done_at_entry=bool(future.done()),
+        )
         while time.monotonic() < deadline:
             self.spin_once(0.05)
             if future.done():
+                completion_time = time.monotonic()
+                future_exception = None
+                try:
+                    future_exception = future.exception()
+                except Exception as exc:
+                    future_exception = exc
+                self.record_runner_event(
+                    f"{label}_future_completed",
+                    completion_monotonic=completion_time,
+                    elapsed_s=completion_time - dispatch_time,
+                    future_cancelled=bool(future.cancelled()),
+                    future_exception=None if future_exception is None else type(future_exception).__name__,
+                )
                 return future.result()
+        timeout_time = time.monotonic()
+        future_exception = None
+        try:
+            future_exception = future.exception() if future.done() else None
+        except Exception as exc:
+            future_exception = exc
+        self.record_runner_event(
+            f"{label}_timeout",
+            status="timeout",
+            timeout_monotonic=timeout_time,
+            elapsed_s=timeout_time - dispatch_time,
+            future_done=bool(future.done()),
+            future_cancelled=bool(future.cancelled()),
+            future_exception=None if future_exception is None else type(future_exception).__name__,
+        )
         raise OrchestrationError(f"{label} timed out")
 
     def _on_state(self, msg) -> None:
+        receive_time = time.monotonic()
+        self._diagnostics["state_callback_count"] += 1
+        self._diagnostics["first_state_callback_monotonic"] = self._diagnostics["first_state_callback_monotonic"] or receive_time
+        self._diagnostics["last_state_callback_monotonic"] = receive_time
+        if self._readiness_collection_active:
+            self._state_callbacks_during_collection += 1
         try:
             q = [float(value) for value in msg.q]
             tip = [
@@ -1055,18 +1408,26 @@ class RosRunMonitor:
                 float(msg.tip_pose.position.z),
             ]
             timestamp = stamp_seconds(msg.header.stamp)
-            sample = StateTipSample(timestamp=timestamp, q=q, tip=tip, receive_time=time.monotonic())
+            sample = StateTipSample(timestamp=timestamp, q=q, tip=tip, receive_time=receive_time)
             if len(q) == 6:
                 self.latest_state = sample
+                self._state_callback_sequence += 1
+                self._readiness_state_queue.append((self._state_callback_sequence, sample))
         except (TypeError, ValueError):
             return
 
     def _on_tip(self, msg) -> None:
+        receive_time = time.monotonic()
+        self._diagnostics["tip_callback_count"] += 1
+        self._diagnostics["first_tip_callback_monotonic"] = self._diagnostics["first_tip_callback_monotonic"] or receive_time
+        self._diagnostics["last_tip_callback_monotonic"] = receive_time
+        if self._readiness_collection_active:
+            self._tip_callbacks_during_collection += 1
         try:
             self.latest_tip = (
                 stamp_seconds(msg.header.stamp),
                 [float(msg.pose.position.x), float(msg.pose.position.y), float(msg.pose.position.z)],
-                time.monotonic(),
+                receive_time,
             )
         except (TypeError, ValueError):
             return
@@ -1532,11 +1893,14 @@ def curved_scenario_hash_payload(scenario: CurvedLumenScenario) -> dict[str, Any
     return {
         "policy_version": scenario.policy_version,
         "scenario_id": scenario.scenario_id,
+        "target_mode": scenario.target_mode,
         "curved_lumen_type": scenario.curved_lumen_type,
         "geometry_frame": scenario.geometry_frame,
         "geometry_fingerprint": scenario.geometry_fingerprint,
         "scenario_fingerprint": scenario.scenario_fingerprint,
         "centerline_fraction": float(scenario.centerline_fraction),
+        "centerline_arc_length": float(scenario.centerline_arc_length),
+        "radial_offset": float(scenario.radial_offset),
         "derived_target": [float(value) for value in scenario.derived_target],
         "requested_target": [float(value) for value in scenario.requested_target],
         "validated_target": [float(value) for value in scenario.validated_target],
@@ -1619,9 +1983,9 @@ def build_base_simulation_command(
                 "enable_curved_lumen:=true",
                 f"curved_lumen_type:={lumen_type}",
                 "reference_mode:=fixed_target",
-                f"cylinder_target_x:={float(target[0]):.9f}",
-                f"cylinder_target_y:={float(target[1]):.9f}",
-                f"cylinder_target_z:={float(target[2]):.9f}",
+                f"cylinder_target_x:={float(target[0]):.17g}",
+                f"cylinder_target_y:={float(target[1]):.17g}",
+                f"cylinder_target_z:={float(target[2]):.17g}",
             ]
         )
         if mppi_profile:

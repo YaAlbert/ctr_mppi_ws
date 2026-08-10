@@ -1,5 +1,6 @@
 import importlib.util
 import copy
+import math
 import os
 import sys
 import tempfile
@@ -379,6 +380,72 @@ class ParameterValidationTest(unittest.TestCase):
                 source = path.read_text(encoding="utf-8")
                 self.assertIn("ParameterValue", source)
                 self.assertIn("value_type=list[float]", source)
+
+    def test_cylinder_target_launch_values_are_finite_float_arrays(self):
+        from launch import LaunchContext
+        from launch_ros.actions import Node
+        from launch_ros.parameter_descriptions import ParameterValue
+
+        launch_files = (
+            "simulation.launch.py",
+            "evaluation_reference.launch.py",
+            "evaluation_mppi_controller.launch.py",
+        )
+        cases = (
+            (
+                "s_curve_near_outlet_target",
+                ["-0.008145713438018419", "0", "0.10901925297449416"],
+                [-0.008145713438018419, 0.0, 0.10901925297449416],
+            ),
+            (
+                "s_curve_middle_target",
+                ["0.00000000000000002233456475320139", "0.0", "0.05999999999999997"],
+                [2.233456475320139e-17, 0.0, 0.05999999999999997],
+            ),
+            ("circular_arc", ["0.015", "0.005", "0.100"], [0.015, 0.005, 0.1]),
+            ("default", ["0.015", "0.005", "0.100"], [0.015, 0.005, 0.1]),
+            ("integer-looking", ["1", "0", "2"], [1.0, 0.0, 2.0]),
+            ("negative-zero", ["-1.0", "-0.0", "2.0"], [-1.0, -0.0, 2.0]),
+            (
+                "scientific",
+                ["-8.145713438018419e-3", "0.0", "1.0901925297449416e-1"],
+                [-0.008145713438018419, 0.0, 0.10901925297449416],
+            ),
+            ("nonnumeric", ["not-a-number", "0", "1"], None),
+        )
+
+        for launch_file in launch_files:
+            module = load_launch_module(launch_file, f"{launch_file.replace('.', '_')}_target_array_under_test")
+            for case_name, launch_values, expected in cases:
+                with self.subTest(launch_file=launch_file, case=case_name):
+                    launch_description = launch_description_with_temp_share(module)
+                    target_values = []
+                    for entity in launch_description.entities:
+                        if not isinstance(entity, Node):
+                            continue
+                        for parameter_dict in getattr(entity, "_Node__parameters", ()):
+                            for value in parameter_dict.values():
+                                if isinstance(value, ParameterValue) and value.value_type == list[float]:
+                                    target_values.append(value)
+                    self.assertTrue(target_values, launch_file)
+                    context = LaunchContext()
+                    context.launch_configurations.update(
+                        {
+                            "cylinder_target_x": launch_values[0],
+                            "cylinder_target_y": launch_values[1],
+                            "cylinder_target_z": launch_values[2],
+                        }
+                    )
+                    for parameter_value in target_values:
+                        if expected is None:
+                            with self.assertRaises(ValueError):
+                                parameter_value.evaluate(context)
+                            continue
+                        result = parameter_value.evaluate(context)
+                        self.assertEqual(3, len(result))
+                        self.assertTrue(all(isinstance(item, float) for item in result))
+                        self.assertTrue(all(math.isfinite(item) for item in result))
+                        self.assertEqual(expected, result)
 
     def test_curved_launch_arguments_are_forwarded_without_scalar_overrides(self):
         launch_files = (

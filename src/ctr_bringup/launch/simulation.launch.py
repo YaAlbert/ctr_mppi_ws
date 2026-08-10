@@ -65,7 +65,11 @@ def generate_launch_description():
     mppi_random_seed = LaunchConfiguration("mppi_random_seed")
     run_role = LaunchConfiguration("run_role")
     cylinder_target_position = ParameterValue(
-        PythonExpression(["[", cylinder_target_x, ", ", cylinder_target_y, ", ", cylinder_target_z, "]"]),
+        [
+            [cylinder_target_x],
+            [cylinder_target_y],
+            [cylinder_target_z],
+        ],
         value_type=list[float],
     )
     reference_manager_condition = IfCondition(
@@ -310,6 +314,8 @@ def generate_launch_description():
                         "baseline_result_dir": evaluation_baseline_result_dir,
                         "output_root": evaluation_output_root,
                         "enable_cylindrical_lumen": enable_cylindrical_lumen,
+                        "enable_curved_lumen": enable_curved_lumen,
+                        "curved_lumen_type": curved_lumen_type,
                         "cylinder_profile": cylinder_profile,
                         "cylinder_target_position": cylinder_target_position,
                         "mppi_random_seed": mppi_random_seed,

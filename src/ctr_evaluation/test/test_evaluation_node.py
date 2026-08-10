@@ -51,6 +51,13 @@ class EvaluationNodeStaticTest(unittest.TestCase):
         self.assertIn('declare_parameter("output_root"', source)
         self.assertIn('["output_root"]', source)
 
+    def test_curved_configuration_parameters_are_forwarded_to_validation(self):
+        source = inspect.getsource(evaluation_node.EvaluationNode.__init__)
+        self.assertIn('declare_parameter("enable_curved_lumen"', source)
+        self.assertIn('declare_parameter("curved_lumen_type"', source)
+        self.assertIn("enable_curved_lumen=_bool_value", source)
+        self.assertIn("curved_lumen_type=str", source)
+
     def test_parse_metadata_json(self):
         self.assertEqual({"case": "circle"}, evaluation_node.parse_metadata('{"case": "circle"}'))
 
@@ -85,6 +92,41 @@ class EvaluationNodeStaticTest(unittest.TestCase):
         source = inspect.getsource(evaluation_node.EvaluationNode.destroy_node)
         self.assertIn("self.recorder.lifecycle_state == STATE_RECORDING", source)
         self.assertIn("auto_finalize_on_shutdown", source)
+
+    def test_stop_service_records_callback_and_finalization_events_on_exception(self):
+        class Recorder:
+            lifecycle_state = evaluation_node.STATE_RECORDING
+
+            def __init__(self):
+                self.events = []
+
+            def record_diagnostic_event(self, stage, **kwargs):
+                self.events.append((stage, kwargs))
+
+            def stop(self, **_kwargs):
+                raise RuntimeError("finalization failed")
+
+        class Logger:
+            def error(self, _message):
+                pass
+
+        class Node:
+            def __init__(self):
+                self.recorder = Recorder()
+
+            def _now_seconds(self):
+                return 1.0
+
+            def get_logger(self):
+                return Logger()
+
+        response = types.SimpleNamespace(accepted=None, message="")
+        node = Node()
+        evaluation_node.EvaluationNode._stop_experiment(node, None, response)
+        self.assertFalse(response.accepted)
+        self.assertEqual("stop_service_callback", node.recorder.events[0][0])
+        self.assertEqual("recorder_finalization", node.recorder.events[1][0])
+        self.assertEqual("stop_service_callback", node.recorder.events[-1][0])
 
 
 class FakeNode:

@@ -10,10 +10,13 @@ from enum import Enum
 import json
 import math
 import os
+import pstats
+import io
 from pathlib import Path
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from typing import Any, Callable, Mapping
@@ -74,21 +77,20 @@ from ctr_evaluation.time_alignment import (
     solve_sample,
     state_sample,
 )
-
-
 from ctr_evaluation.publication_model import (
     Applicability,
-    build_artifact_inventory,
     ArtifactRecord,
     ArtifactSpec,
     LayerASnapshot,
     PrePromotionLedger,
     PublicationStatus,
+    build_artifact_inventory,
     prepromotion_failure_record,
     prepromotion_not_applicable_record,
     prepromotion_staged_record,
     validate_artifact_specs,
 )
+
 
 STATE_IDLE = "IDLE"
 STATE_RECORDING = "RECORDING"
@@ -140,6 +142,7 @@ class EvaluationRecorderConfig:
     initial_state_compatibility_tolerance: float
     plot_generation: bool
     report_generation: bool
+    enable_finalization_profiling: bool
     physical_validation: bool
     hardware_validation: bool
     software_mode: str
@@ -260,6 +263,10 @@ class EvaluationRecorderConfig:
             ),
             plot_generation=_bool(evaluation["plot_generation"], "evaluation.plot_generation"),
             report_generation=_bool(evaluation["report_generation"], "evaluation.report_generation"),
+            enable_finalization_profiling=_bool(
+                evaluation.get("enable_finalization_profiling", False),
+                "evaluation.enable_finalization_profiling",
+            ),
             physical_validation=_bool(evaluation["physical_validation"], "evaluation.physical_validation"),
             hardware_validation=_bool(evaluation["hardware_validation"], "evaluation.hardware_validation"),
             software_mode=str(project_config.get("runtime", {}).get("mode", "software_simulation")),
@@ -280,17 +287,17 @@ class EvaluationRecorderConfig:
             ),
             goal_position=(
                 goal_position_from_config(project_config)
-                if bool(project_config.get("cylindrical_lumen", {}).get("enabled", False))
+                if isinstance(project_config.get("goal"), dict)
                 else None
             ),
             goal_tolerance=(
                 goal_tolerance_from_config(project_config)
-                if bool(project_config.get("cylindrical_lumen", {}).get("enabled", False))
+                if isinstance(project_config.get("goal"), dict)
                 else None
             ),
             goal_required_hold_duration=(
                 goal_hold_duration_from_config(project_config)
-                if bool(project_config.get("cylindrical_lumen", {}).get("enabled", False))
+                if isinstance(project_config.get("goal"), dict)
                 else None
             ),
         )
@@ -332,6 +339,28 @@ class ProducerRenderError(RuntimeError):
 
 class ProducerStagingError(RuntimeError):
     """A producer failed while writing its artifact to staging."""
+
+
+class PromotionStatus(str, Enum):
+    """Filesystem-only outcome of the Slice 3 promotion boundary."""
+
+    PRE_PROMOTION_FAILED = "PRE_PROMOTION_FAILED"
+    PROMOTION_REFUSED = "PROMOTION_REFUSED"
+    PROMOTION_FAILED = "PROMOTION_FAILED"
+    PROMOTED_AND_OBSERVED = "PROMOTED_AND_OBSERVED"
+    PROMOTED_OBSERVATION_FAILED = "PROMOTED_OBSERVATION_FAILED"
+
+
+@dataclass(frozen=True)
+class PromotionResult:
+    """Non-authoritative evidence about staging and final-path observation."""
+
+    status: PromotionStatus
+    staging_dir: Path
+    final_dir: Path
+    reason: str | None = None
+    observed_paths: tuple[Path, ...] = ()
+    failure_evidence_dir: Path | None = None
 
 
 def _prepromotion_order(
@@ -399,9 +428,7 @@ def prepare_prepromotion_ledger(
         )
     if acquire_staging:
         if staging_root.exists():
-            raise StagingSetupError(
-                f"staging root already exists: {staging_root}"
-            )
+            raise StagingSetupError(f"staging root already exists: {staging_root}")
         try:
             staging_root.mkdir(parents=True, exist_ok=False)
         except OSError as exc:
@@ -614,28 +641,6 @@ def prepare_prepromotion_ledger(
     return PrePromotionLedger(ordered_records, specs, staging_root)
 
 
-class PromotionStatus(str, Enum):
-    """Filesystem-only outcome of the Slice 3 promotion boundary."""
-
-    PRE_PROMOTION_FAILED = "PRE_PROMOTION_FAILED"
-    PROMOTION_REFUSED = "PROMOTION_REFUSED"
-    PROMOTION_FAILED = "PROMOTION_FAILED"
-    PROMOTED_AND_OBSERVED = "PROMOTED_AND_OBSERVED"
-    PROMOTED_OBSERVATION_FAILED = "PROMOTED_OBSERVATION_FAILED"
-
-
-@dataclass(frozen=True)
-class PromotionResult:
-    """Non-authoritative evidence about staging and final-path observation."""
-
-    status: PromotionStatus
-    staging_dir: Path
-    final_dir: Path
-    reason: str | None = None
-    observed_paths: tuple[Path, ...] = ()
-    failure_evidence_dir: Path | None = None
-
-
 def _owned_path(root: Path, relative_path: str) -> Path:
     root_resolved = root.resolve()
     candidate = root / relative_path
@@ -754,9 +759,7 @@ def promote_prepromotion_ledger(
                 "; ".join(reason_parts),
                 failure_evidence_dir=final_dir,
             )
-        observed = tuple(
-            sorted((final_dir / path for path in expected), key=str)
-        )
+        observed = tuple(sorted((final_dir / path for path in expected), key=str))
         return PromotionResult(
             PromotionStatus.PROMOTED_AND_OBSERVED,
             staging_dir,
@@ -788,421 +791,14 @@ class ExperimentRecorder:
         self.stop_monotonic_time: float | None = None
         self.metadata_override: dict[str, Any] = {}
         self.finalization_result: FinalizationResult | None = None
+        self._finalization_trace: list[dict[str, Any]] = []
+        self._finalization_trace_path: Path | None = None
+        self._metric_trace_start_ns: int | None = None
         self.reset_buffers()
 
-    def reset_buffers(self) -> None:
-        self.states: list[TimedState] = []
-        self.tip_records: list[dict[str, float]] = []
-        self.references: list[TimedReference] = []
-        self.raw_commands: list[TimedCommand] = []
-        self.safe_commands: list[TimedCommand] = []
-        self.solves: list[TimedSolve] = []
-        self.topic_counts: dict[str, int] = {}
-        self.invalid_counts: dict[str, int] = {
-            "state": 0,
-            "reference": 0,
-            "command": 0,
-            "solve": 0,
-            "dimension": 0,
-            "command_limit": 0,
-            "state_limit": 0,
-        }
-        self.horizon_records: list[dict[str, Any]] = []
-        self.path_records: list[dict[str, Any]] = []
-        self.backbone_records: list[dict[str, Any]] = []
-        self.initial_state_q: list[float] | None = None
-        self.initial_tip_position: list[float] | None = None
-
-    def _reject_existing_run_id(self, run_id: str) -> None:
-        group_dir = self.config.output_root / self.config.experiment_group
-        partial_dir = group_dir / f"{run_id}.partial"
-        final_dir = group_dir / run_id
-        if partial_dir.exists():
-            raise FileExistsError(f"partial result directory already exists: {partial_dir}")
-        if final_dir.exists():
-            raise FileExistsError(
-                f"final result directory already exists: {final_dir}"
-            )
-
-    def start(
-        self,
-        *,
-        experiment_name: str,
-        metadata: dict[str, Any] | None = None,
-        monotonic_time: float = 0.0,
-    ) -> str:
-        if self.lifecycle_state == STATE_RECORDING:
-            raise RuntimeError("an experiment is already recording")
-        if self.lifecycle_state == STATE_FINALIZING:
-            raise RuntimeError("an experiment is finalizing")
-        if self.lifecycle_state not in {STATE_IDLE, STATE_COMPLETED}:
-            raise RuntimeError(f"cannot start experiment from lifecycle state {self.lifecycle_state}")
-        self.reset_buffers()
-        self.finalization_result = None
-        safe_name = sanitize_name(experiment_name or self.config.controller_label)
-        requested_run_id = requested_run_id_from_metadata(metadata or {})
-        if requested_run_id:
-            self.run_id = requested_run_id
-            self._reject_existing_run_id(self.run_id)
-        else:
-            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            self.run_id = f"{timestamp}_{safe_name}_{uuid.uuid4().hex[:8]}"
-        self.experiment_name = experiment_name or safe_name
-        self.start_wall_time = datetime.now(timezone.utc)
-        self.stop_wall_time = None
-        self.start_monotonic_time = float(monotonic_time)
-        self.stop_monotonic_time = None
-        self.metadata_override = dict(metadata or {})
-        self.lifecycle_state = STATE_RECORDING
-        return self.run_id
-
-    def stop(self, *, monotonic_time: float, interrupted: bool = False) -> FinalizationResult:
-        if self.lifecycle_state == STATE_COMPLETED:
-            if self.finalization_result is not None:
-                return self.finalization_result
-            raise RuntimeError("experiment is completed without a finalization result")
-        if self.lifecycle_state == STATE_FINALIZING:
-            raise RuntimeError("experiment finalization is already in progress")
-        if self.lifecycle_state != STATE_RECORDING:
-            raise RuntimeError("no experiment is recording")
-        self.stop_monotonic_time = float(monotonic_time)
-        self.stop_wall_time = datetime.now(timezone.utc)
-        self._record_optional_diagnostic(
-            "data_collection_disabled", phase="end", status="ok"
-        )
-        return self.finalize(interrupted=interrupted)
-
-    def finalize(self, *, interrupted: bool = False) -> FinalizationResult:
-        if self.lifecycle_state == STATE_COMPLETED:
-            if self.finalization_result is not None:
-                return self.finalization_result
-            raise RuntimeError("experiment is completed without a finalization result")
-        if self.lifecycle_state == STATE_FINALIZING:
-            raise RuntimeError("experiment finalization is already in progress")
-        if self.lifecycle_state != STATE_RECORDING:
-            raise RuntimeError("cannot finalize unless an experiment is recording")
-        if self.run_id is None:
-            raise RuntimeError("cannot finalize before start")
-        self.lifecycle_state = STATE_FINALIZING
-        group_dir = self.config.output_root / self.config.experiment_group
-        partial_dir = group_dir / f"{self.run_id}.partial"
-        final_dir = group_dir / self.run_id
-        if partial_dir.exists():
-            raise FileExistsError(f"partial result directory already exists: {partial_dir}")
-        if final_dir.exists():
-            raise FileExistsError(
-                f"final result directory already exists: {final_dir}"
-            )
-        partial_dir.mkdir(parents=True)
-        self._set_optional_trace_path(partial_dir / "finalization_trace.json")
-        self._record_optional_diagnostic(
-            "finalization", phase="start", status="started"
-        )
-        try:
-            self._record_optional_diagnostic(
-                "data_snapshot", phase="start", status="started"
-            )
-            metadata = self._metadata(interrupted=interrupted)
-            metadata["initial_state_q"] = self.initial_state_q
-            metadata["initial_tip_position"] = self.initial_tip_position
-            selected_commands = self.safe_commands if self.safe_commands else self.raw_commands
-            alignment_states = self._states_for_evaluation_window(metadata)
-            alignment = align_samples(
-                states=alignment_states,
-                references=self.references,
-                commands=selected_commands,
-                solves=self.solves,
-                config=self.config.alignment,
-            )
-            self._record_optional_diagnostic(
-                "data_snapshot", phase="end", status="ok"
-            )
-            metadata["alignment_window"] = {
-                "state_samples_recorded": len(self.states),
-                "state_samples_evaluated": len(alignment_states),
-                "reference_samples_recorded": len(self.references),
-                "command_samples_recorded": len(selected_commands),
-            }
-            metadata["actual_evaluation_window_duration_s"] = (
-                max(0.0, alignment.samples[-1].timestamp - alignment.samples[0].timestamp)
-                if alignment.samples
-                else 0.0
-            )
-            alignment_start_ns = time.monotonic_ns()
-            self._record_optional_metric_stage_end(
-                "alignment",
-                alignment_start_ns,
-                status="ok",
-                details={"aligned_count": len(alignment.samples)},
-            )
-            preparation_failures: dict[str, str] = {}
-            raw_artifacts = (
-                "raw_state",
-                "raw_tip",
-                "raw_reference",
-                "raw_command",
-                "solve_timing",
-                "horizon",
-                "reference_path",
-                "backbone",
-                "cylinder_navigation",
-            )
-            raw_start_ns = time.monotonic_ns()
-            self._record_optional_diagnostic(
-                "metric_calculation.raw_data_write",
-                phase="start",
-                status="started",
-            )
-            try:
-                self._write_raw_files(partial_dir)
-            except Exception as exc:
-                reason = (
-                    f"raw artifact write failed: {type(exc).__name__}: {exc}"
-                )
-                for logical_name in raw_artifacts:
-                    preparation_failures[logical_name] = reason
-            self._record_optional_metric_stage_end(
-                "raw_data_write",
-                raw_start_ns,
-                status="ok",
-                details={"state_count": len(self.states)},
-            )
-            lumen_profile = self._start_optional_profile()
-            lumen_start_ns = time.monotonic_ns()
-            self._record_optional_diagnostic(
-                "metric_calculation.lumen_evaluation",
-                phase="start",
-                status="started",
-            )
-            lumen_result = None
-            lumen_status = "ok"
-            try:
-                lumen_result = self._lumen_evaluation_result(
-                    alignment=alignment, metadata=metadata
-                )
-            except BaseException as exc:
-                lumen_status = "error"
-                preparation_failures["lumen_evaluation"] = (
-                    f"lumen evaluation failed: {type(exc).__name__}: {exc}"
-                )
-                lumen_result = LumenRecorderResult(required=True)
-            finally:
-                self._record_optional_metric_stage_end(
-                    "lumen_evaluation",
-                    lumen_start_ns,
-                    status=lumen_status,
-                    details={"aligned_count": len(alignment.samples)},
-                )
-                self._finish_optional_profile(lumen_profile)
-            lumen_result = self._write_lumen_evaluation_csv_if_available(
-                partial_dir, lumen_result
-            )
-            if (
-                lumen_result.required
-                and not (partial_dir / "lumen_evaluation.csv").is_file()
-            ):
-                preparation_failures.setdefault(
-                    "lumen_evaluation",
-                    "lumen evaluation did not produce lumen_evaluation.csv",
-                )
-            try:
-                summary = self._summary(
-                    alignment=alignment,
-                    metadata=metadata,
-                    lumen_result=lumen_result,
-                )
-            except Exception as exc:
-                summary = {}
-                preparation_failures["summary"] = (
-                    f"summary write failed: {type(exc).__name__}: {exc}"
-                )
-            summary_start_ns = time.monotonic_ns()
-            self._record_optional_metric_stage_end(
-                "summary",
-                summary_start_ns,
-                status="ok",
-                details={"summary_keys": len(summary)},
-            )
-            try:
-                write_yaml(partial_dir / "metadata.yaml", metadata)
-            except Exception as exc:
-                preparation_failures["metadata"] = (
-                    f"metadata write failed: {type(exc).__name__}: {exc}"
-                )
-            try:
-                write_json(partial_dir / "summary.json", summary)
-            except Exception as exc:
-                preparation_failures["summary"] = (
-                    f"summary write failed: {type(exc).__name__}: {exc}"
-                )
-            try:
-                write_aligned_csv(
-                    partial_dir / "aligned_samples.csv", alignment
-                )
-            except Exception as exc:
-                preparation_failures["aligned_samples"] = (
-                    f"aligned sample write failed: {type(exc).__name__}: {exc}"
-                )
-
-            comparison = None
-
-            comparison_applicable = bool(self.config.baseline_result_dir)
-            if comparison_applicable:
-                self._record_optional_diagnostic(
-                    "comparison_metadata_update",
-                    phase="start",
-                    status="started",
-                )
-                from ctr_evaluation.compare_results import compare_result_dirs
-
-                try:
-                    comparison = compare_result_dirs(
-                        candidate_dir=partial_dir,
-                        baseline_dir=Path(self.config.baseline_result_dir),
-                        duration_tolerance=(
-                            self.config.duration_compatibility_tolerance
-                        ),
-                        initial_state_tolerance=(
-                            self.config.initial_state_compatibility_tolerance
-                        ),
-                        near_zero_epsilon=(
-                            self.config.thresholds.near_zero_baseline_epsilon
-                        ),
-                    )
-                    summary = self._apply_baseline_acceptance(
-                        summary, comparison
-                    )
-                    write_json(partial_dir / "summary.json", summary)
-                except Exception as exc:
-                    comparison = None
-                    preparation_failures["comparison"] = (
-                        f"comparison failed: {type(exc).__name__}: {exc}"
-                    )
-                    preparation_failures["comparison_report"] = (
-                        f"comparison failed: {type(exc).__name__}: {exc}"
-                    )
-                self._record_optional_diagnostic(
-                    "comparison_metadata_update",
-                    phase="end",
-                    status="ok",
-                )
-
-            try:
-                ledger = self._prepare_finalization_ledger(
-                    partial_dir=partial_dir,
-                    metadata=metadata,
-                    summary=summary,
-                    comparison=comparison,
-                    alignment=alignment,
-                    interrupted=interrupted,
-                    preparation_failures=preparation_failures,
-                    comparison_applicable=comparison_applicable,
-                )
-            except (StagingSetupError, TypeError, ValueError) as exc:
-                promotion = PromotionResult(
-                    PromotionStatus.PRE_PROMOTION_FAILED,
-                    partial_dir,
-                    final_dir,
-                    str(exc),
-                    failure_evidence_dir=partial_dir,
-                )
-                try:
-                    self._write_finalization_error(partial_dir, exc)
-                except Exception:
-                    pass
-                self.lifecycle_state = STATE_COMPLETED
-                self.finalization_result = FinalizationResult(
-                    run_id=self.run_id,
-                    run_dir=partial_dir,
-                    summary=summary,
-                    metadata=metadata,
-                    comparison=comparison,
-                    output_files=sorted(
-                        path
-                        for path in partial_dir.iterdir()
-                        if path.is_file()
-                    ),
-                    promotion=promotion,
-                )
-                return self.finalization_result
-            promotion = promote_prepromotion_ledger(ledger, final_dir)
-            if promotion.status is not PromotionStatus.PROMOTED_AND_OBSERVED:
-                evidence_dir = promotion.failure_evidence_dir or partial_dir
-                try:
-                    self._write_finalization_error(
-                        evidence_dir,
-                        RuntimeError(
-                            promotion.reason or promotion.status.value
-                        ),
-                    )
-                except Exception:
-                    pass
-                if promotion.final_dir.is_dir():
-                    self._record_optional_diagnostic(
-                        "final_path_observation",
-                        phase="error",
-                        status=promotion.status.value,
-                        error_message=promotion.reason,
-                    )
-                self.lifecycle_state = STATE_COMPLETED
-                self.finalization_result = FinalizationResult(
-                    run_id=self.run_id,
-                    run_dir=(
-                        promotion.final_dir
-                        if promotion.final_dir.is_dir()
-                        else partial_dir
-                    ),
-                    summary=summary,
-                    metadata=metadata,
-                    comparison=comparison,
-                    output_files=sorted(
-                        path
-                        for path in (
-                            promotion.final_dir
-                            if promotion.final_dir.is_dir()
-                            else partial_dir
-                        ).iterdir()
-                        if path.is_file()
-                    ),
-                    promotion=promotion,
-                )
-                return self.finalization_result
-            self._set_optional_trace_path(
-                final_dir / "finalization_trace.json"
-            )
-            self._record_optional_diagnostic(
-                "final_artifact_rename", phase="end", status="ok"
-            )
-            self._write_aggregate(group_dir)
-            self._record_optional_diagnostic(
-                "aggregate_write", phase="end", status="ok"
-            )
-            self.lifecycle_state = STATE_COMPLETED
-            self.finalization_result = FinalizationResult(
-                run_id=self.run_id,
-                run_dir=final_dir,
-                summary=summary,
-                metadata=metadata,
-                comparison=comparison,
-                output_files=sorted(
-                    path for path in final_dir.iterdir() if path.is_file()
-                ),
-                promotion=promotion,
-            )
-            self._record_optional_diagnostic(
-                "finalization", phase="end", status="ok"
-            )
-            return self.finalization_result
-        except Exception as exc:
-            self._record_optional_diagnostic(
-                "finalization",
-                phase="error",
-                status="error",
-                error_type=type(exc).__name__,
-                error_message=str(exc),
-            )
-            self._write_finalization_error(partial_dir, exc)
-            raise
+    def prepare_prepromotion_ledger(self, **kwargs: Any) -> PrePromotionLedger:
+        """Expose the disconnected coordinator without changing finalization."""
+        return prepare_prepromotion_ledger(**kwargs)
 
     @staticmethod
     def _existing_artifact_producer(path: Path) -> None:
@@ -1417,6 +1013,502 @@ class ExperimentRecorder:
             orchestration_producer=orchestration,
             comparison_producer=existing,
             acquire_staging=False,
+        )
+
+    def reset_buffers(self) -> None:
+        self.states: list[TimedState] = []
+        self.tip_records: list[dict[str, float]] = []
+        self.references: list[TimedReference] = []
+        self.raw_commands: list[TimedCommand] = []
+        self.safe_commands: list[TimedCommand] = []
+        self.solves: list[TimedSolve] = []
+        self.topic_counts: dict[str, int] = {}
+        self.invalid_counts: dict[str, int] = {
+            "state": 0,
+            "reference": 0,
+            "command": 0,
+            "solve": 0,
+            "dimension": 0,
+            "command_limit": 0,
+            "state_limit": 0,
+        }
+        self.horizon_records: list[dict[str, Any]] = []
+        self.path_records: list[dict[str, Any]] = []
+        self.backbone_records: list[dict[str, Any]] = []
+        self.initial_state_q: list[float] | None = None
+        self.initial_tip_position: list[float] | None = None
+
+    def _reject_existing_run_id(self, run_id: str) -> None:
+        group_dir = self.config.output_root / self.config.experiment_group
+        partial_dir = group_dir / f"{run_id}.partial"
+        final_dir = group_dir / run_id
+        if partial_dir.exists():
+            raise FileExistsError(f"partial result directory already exists: {partial_dir}")
+        if final_dir.exists():
+            raise FileExistsError(f"final result directory already exists: {final_dir}")
+
+    def start(
+        self,
+        *,
+        experiment_name: str,
+        metadata: dict[str, Any] | None = None,
+        monotonic_time: float = 0.0,
+    ) -> str:
+        if self.lifecycle_state == STATE_RECORDING:
+            raise RuntimeError("an experiment is already recording")
+        if self.lifecycle_state == STATE_FINALIZING:
+            raise RuntimeError("an experiment is finalizing")
+        if self.lifecycle_state not in {STATE_IDLE, STATE_COMPLETED}:
+            raise RuntimeError(f"cannot start experiment from lifecycle state {self.lifecycle_state}")
+        self.reset_buffers()
+        self.finalization_result = None
+        self._finalization_trace = []
+        self._finalization_trace_path = None
+        self._metric_trace_start_ns = None
+        safe_name = sanitize_name(experiment_name or self.config.controller_label)
+        requested_run_id = requested_run_id_from_metadata(metadata or {})
+        if requested_run_id:
+            self.run_id = requested_run_id
+            self._reject_existing_run_id(self.run_id)
+        else:
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            self.run_id = f"{timestamp}_{safe_name}_{uuid.uuid4().hex[:8]}"
+        self.experiment_name = experiment_name or safe_name
+        self.start_wall_time = datetime.now(timezone.utc)
+        self.stop_wall_time = None
+        self.start_monotonic_time = float(monotonic_time)
+        self.stop_monotonic_time = None
+        self.metadata_override = dict(metadata or {})
+        self.lifecycle_state = STATE_RECORDING
+        return self.run_id
+
+    def stop(self, *, monotonic_time: float, interrupted: bool = False) -> FinalizationResult:
+        if self.lifecycle_state == STATE_COMPLETED:
+            if self.finalization_result is not None:
+                return self.finalization_result
+            raise RuntimeError("experiment is completed without a finalization result")
+        if self.lifecycle_state == STATE_FINALIZING:
+            raise RuntimeError("experiment finalization is already in progress")
+        if self.lifecycle_state != STATE_RECORDING:
+            raise RuntimeError("no experiment is recording")
+        self.stop_monotonic_time = float(monotonic_time)
+        self.stop_wall_time = datetime.now(timezone.utc)
+        self._record_optional_diagnostic(
+            "data_collection_disabled", phase="end", status="ok"
+        )
+        return self.finalize(interrupted=interrupted)
+
+    def finalize(self, *, interrupted: bool = False) -> FinalizationResult:
+        if self.lifecycle_state == STATE_COMPLETED:
+            if self.finalization_result is not None:
+                return self.finalization_result
+            raise RuntimeError("experiment is completed without a finalization result")
+        if self.lifecycle_state == STATE_FINALIZING:
+            raise RuntimeError("experiment finalization is already in progress")
+        if self.lifecycle_state != STATE_RECORDING:
+            raise RuntimeError("cannot finalize unless an experiment is recording")
+        if self.run_id is None:
+            raise RuntimeError("cannot finalize before start")
+        self.lifecycle_state = STATE_FINALIZING
+        group_dir = self.config.output_root / self.config.experiment_group
+        partial_dir = group_dir / f"{self.run_id}.partial"
+        final_dir = group_dir / self.run_id
+        if partial_dir.exists():
+            raise FileExistsError(f"partial result directory already exists: {partial_dir}")
+        if final_dir.exists():
+            raise FileExistsError(f"final result directory already exists: {final_dir}")
+        partial_dir.mkdir(parents=True)
+        self._set_optional_trace_path(partial_dir / "finalization_trace.json")
+        self._record_optional_diagnostic(
+            "finalization", phase="start", status="started"
+        )
+        try:
+            self._record_optional_diagnostic(
+                "data_snapshot", phase="start", status="started"
+            )
+            metadata = self._metadata(interrupted=interrupted)
+            metadata["initial_state_q"] = self.initial_state_q
+            metadata["initial_tip_position"] = self.initial_tip_position
+            selected_commands = self.safe_commands if self.safe_commands else self.raw_commands
+            alignment_states = self._states_for_evaluation_window(metadata)
+            alignment = align_samples(
+                states=alignment_states,
+                references=self.references,
+                commands=selected_commands,
+                solves=self.solves,
+                config=self.config.alignment,
+            )
+            self._record_optional_diagnostic(
+                "data_snapshot", phase="end", status="ok"
+            )
+            metadata["alignment_window"] = {
+                "state_samples_recorded": len(self.states),
+                "state_samples_evaluated": len(alignment_states),
+                "reference_samples_recorded": len(self.references),
+                "command_samples_recorded": len(selected_commands),
+            }
+            metadata["actual_evaluation_window_duration_s"] = (
+                max(0.0, alignment.samples[-1].timestamp - alignment.samples[0].timestamp)
+                if alignment.samples
+                else 0.0
+            )
+            alignment_start_ns = time.monotonic_ns()
+            self._record_optional_metric_stage_end(
+                "alignment",
+                alignment_start_ns,
+                status="ok",
+                details={"aligned_count": len(alignment.samples)},
+            )
+            preparation_failures: dict[str, str] = {}
+            raw_artifacts = (
+                "raw_state",
+                "raw_tip",
+                "raw_reference",
+                "raw_command",
+                "solve_timing",
+                "horizon",
+                "reference_path",
+                "backbone",
+                "cylinder_navigation",
+            )
+            raw_start_ns = time.monotonic_ns()
+            self._record_optional_diagnostic(
+                "metric_calculation.raw_data_write",
+                phase="start",
+                status="started",
+            )
+            try:
+                self._write_raw_files(partial_dir)
+            except Exception as exc:
+                reason = f"raw artifact write failed: {type(exc).__name__}: {exc}"
+                for logical_name in raw_artifacts:
+                    preparation_failures[logical_name] = reason
+            self._record_optional_metric_stage_end(
+                "raw_data_write",
+                raw_start_ns,
+                status="ok",
+                details={"state_count": len(self.states)},
+            )
+            lumen_profile = self._start_optional_profile()
+            lumen_start_ns = time.monotonic_ns()
+            self._record_optional_diagnostic(
+                "metric_calculation.lumen_evaluation",
+                phase="start",
+                status="started",
+            )
+            lumen_result = None
+            lumen_status = "ok"
+            try:
+                lumen_result = self._lumen_evaluation_result(alignment=alignment, metadata=metadata)
+            except BaseException as exc:
+                lumen_status = "error"
+                preparation_failures["lumen_evaluation"] = (
+                    f"lumen evaluation failed: {type(exc).__name__}: {exc}"
+                )
+                lumen_result = LumenRecorderResult(required=True)
+            finally:
+                self._record_optional_metric_stage_end(
+                    "lumen_evaluation",
+                    lumen_start_ns,
+                    status=lumen_status,
+                    details={"aligned_count": len(alignment.samples)},
+                )
+                self._finish_optional_profile(lumen_profile)
+            lumen_result = self._write_lumen_evaluation_csv_if_available(
+                partial_dir, lumen_result
+            )
+            if (
+                lumen_result.required
+                and not (partial_dir / "lumen_evaluation.csv").is_file()
+            ):
+                preparation_failures.setdefault(
+                    "lumen_evaluation",
+                    "lumen evaluation did not produce lumen_evaluation.csv",
+                )
+            try:
+                summary = self._summary(
+                    alignment=alignment,
+                    metadata=metadata,
+                    lumen_result=lumen_result,
+                )
+            except Exception as exc:
+                summary = {}
+                preparation_failures["summary"] = (
+                    f"summary write failed: {type(exc).__name__}: {exc}"
+                )
+            summary_start_ns = time.monotonic_ns()
+            self._record_optional_metric_stage_end(
+                "summary",
+                summary_start_ns,
+                status="ok",
+                details={"summary_keys": len(summary)},
+            )
+            try:
+                write_yaml(partial_dir / "metadata.yaml", metadata)
+            except Exception as exc:
+                preparation_failures["metadata"] = (
+                    f"metadata write failed: {type(exc).__name__}: {exc}"
+                )
+            try:
+                write_json(partial_dir / "summary.json", summary)
+            except Exception as exc:
+                preparation_failures["summary"] = (
+                    f"summary write failed: {type(exc).__name__}: {exc}"
+                )
+            try:
+                write_aligned_csv(partial_dir / "aligned_samples.csv", alignment)
+            except Exception as exc:
+                preparation_failures["aligned_samples"] = (
+                    f"aligned sample write failed: {type(exc).__name__}: {exc}"
+                )
+
+            comparison = None
+
+            comparison_applicable = bool(self.config.baseline_result_dir)
+            if comparison_applicable:
+                self._record_optional_diagnostic(
+                    "comparison_metadata_update",
+                    phase="start",
+                    status="started",
+                )
+                from ctr_evaluation.compare_results import compare_result_dirs
+
+                try:
+                    comparison = compare_result_dirs(
+                        candidate_dir=partial_dir,
+                        baseline_dir=Path(self.config.baseline_result_dir),
+                        duration_tolerance=self.config.duration_compatibility_tolerance,
+                        initial_state_tolerance=self.config.initial_state_compatibility_tolerance,
+                        near_zero_epsilon=self.config.thresholds.near_zero_baseline_epsilon,
+                    )
+                    summary = self._apply_baseline_acceptance(summary, comparison)
+                    write_json(partial_dir / "summary.json", summary)
+                except Exception as exc:
+                    comparison = None
+                    preparation_failures["comparison"] = (
+                        f"comparison failed: {type(exc).__name__}: {exc}"
+                    )
+                    preparation_failures["comparison_report"] = (
+                        f"comparison failed: {type(exc).__name__}: {exc}"
+                    )
+                self._record_optional_diagnostic(
+                    "comparison_metadata_update",
+                    phase="end",
+                    status="ok",
+                )
+
+            try:
+                ledger = self._prepare_finalization_ledger(
+                    partial_dir=partial_dir,
+                    metadata=metadata,
+                    summary=summary,
+                    comparison=comparison,
+                    alignment=alignment,
+                    interrupted=interrupted,
+                    preparation_failures=preparation_failures,
+                    comparison_applicable=comparison_applicable,
+                )
+            except (StagingSetupError, TypeError, ValueError) as exc:
+                promotion = PromotionResult(
+                    PromotionStatus.PRE_PROMOTION_FAILED,
+                    partial_dir,
+                    final_dir,
+                    str(exc),
+                    failure_evidence_dir=partial_dir,
+                )
+                try:
+                    self._write_finalization_error(partial_dir, exc)
+                except Exception:
+                    pass
+                self.lifecycle_state = STATE_COMPLETED
+                self.finalization_result = FinalizationResult(
+                    run_id=self.run_id,
+                    run_dir=partial_dir,
+                    summary=summary,
+                    metadata=metadata,
+                    comparison=comparison,
+                    output_files=sorted(
+                        path
+                        for path in partial_dir.iterdir()
+                        if path.is_file()
+                    ),
+                    promotion=promotion,
+                )
+                return self.finalization_result
+            promotion = promote_prepromotion_ledger(ledger, final_dir)
+            if promotion.status is not PromotionStatus.PROMOTED_AND_OBSERVED:
+                evidence_dir = promotion.failure_evidence_dir or partial_dir
+                try:
+                    self._write_finalization_error(
+                        evidence_dir,
+                        RuntimeError(promotion.reason or promotion.status.value),
+                    )
+                except Exception:
+                    pass
+                if promotion.final_dir.is_dir():
+                    self._record_optional_diagnostic(
+                        "final_path_observation",
+                        phase="error",
+                        status=promotion.status.value,
+                        error_message=promotion.reason,
+                    )
+                self.lifecycle_state = STATE_COMPLETED
+                self.finalization_result = FinalizationResult(
+                    run_id=self.run_id,
+                    run_dir=(
+                        promotion.final_dir
+                        if promotion.final_dir.is_dir()
+                        else partial_dir
+                    ),
+                    summary=summary,
+                    metadata=metadata,
+                    comparison=comparison,
+                    output_files=sorted(
+                        path
+                        for path in (
+                            promotion.final_dir
+                            if promotion.final_dir.is_dir()
+                            else partial_dir
+                        ).iterdir()
+                        if path.is_file()
+                    ),
+                    promotion=promotion,
+                )
+                return self.finalization_result
+            self._set_optional_trace_path(
+                final_dir / "finalization_trace.json"
+            )
+            self._record_optional_diagnostic(
+                "final_artifact_rename", phase="end", status="ok"
+            )
+            self._write_aggregate(group_dir)
+            self._record_optional_diagnostic(
+                "aggregate_write", phase="end", status="ok"
+            )
+            self.lifecycle_state = STATE_COMPLETED
+            self.finalization_result = FinalizationResult(
+                run_id=self.run_id,
+                run_dir=final_dir,
+                summary=summary,
+                metadata=metadata,
+                comparison=comparison,
+                output_files=sorted(
+                    path for path in final_dir.iterdir() if path.is_file()
+                ),
+                promotion=promotion,
+            )
+            self._record_optional_diagnostic(
+                "finalization", phase="end", status="ok"
+            )
+            return self.finalization_result
+        except Exception as exc:
+            self._record_optional_diagnostic(
+                "finalization",
+                phase="error",
+                status="error",
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+            self._write_finalization_error(partial_dir, exc)
+            raise
+
+    def record_diagnostic_event(
+        self,
+        stage: str,
+        *,
+        phase: str,
+        status: str,
+        error_type: str | None = None,
+        error_message: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        event = {
+            "monotonic_ns": time.monotonic_ns(),
+            "utc": datetime.now(timezone.utc).isoformat(),
+            "pid": os.getpid(),
+            "thread_id": threading.get_ident(),
+            "run_id": self.run_id,
+            "experiment_group": self.config.experiment_group,
+            "run_role": self.metadata_override.get("run_role"),
+            "stage": stage,
+            "phase": phase,
+            "status": status,
+            "error_type": error_type,
+            "error_message": error_message,
+        }
+        if details:
+            event["details"] = sanitize_for_json(details)
+        self._finalization_trace.append(event)
+        if self._finalization_trace_path is not None:
+            write_json(
+                self._finalization_trace_path,
+                {"schema_version": "finalization_trace_v1", "events": self._finalization_trace},
+            )
+
+    def _record_metric_stage_end(
+        self,
+        stage: str,
+        start_ns: int,
+        *,
+        status: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        payload = dict(details or {})
+        end_ns = time.monotonic_ns()
+        payload.update(
+            {
+                "elapsed_s": (end_ns - start_ns) / 1.0e9,
+                "call_count": 1,
+                "cumulative_s": (
+                    (end_ns - self._metric_trace_start_ns) / 1.0e9
+                    if self._metric_trace_start_ns is not None
+                    else None
+                ),
+            }
+        )
+        self.record_diagnostic_event(
+            f"metric_calculation.{stage}",
+            phase="end",
+            status=status,
+            details=payload,
+        )
+
+    def _lumen_geometry_point_count(self, result: Any) -> int | None:
+        if not result or not result.section:
+            return None
+        geometry = result.section.get("geometry", {})
+        points = geometry.get("centerline_points") if isinstance(geometry, dict) else None
+        return len(points) if isinstance(points, list) else None
+
+    def _record_metric_profile(self, profile: cProfile.Profile | None) -> None:
+        if profile is None:
+            self.record_diagnostic_event(
+                "metric_calculation.profile",
+                phase="end",
+                status="disabled",
+                details={"enabled": False, "function_count": 0, "top_functions": []},
+            )
+            return
+        stream = io.StringIO()
+        stats = pstats.Stats(profile, stream=stream).sort_stats("cumulative")
+        rows = []
+        for function in stats.fcn_list[:20]:
+            values = stats.stats[function]
+            primitive, calls, total, cumulative, _callers = values
+            rows.append(
+                {
+                    "function": f"{function[0]}:{function[1]}:{function[2]}",
+                    "calls": calls,
+                    "primitive_calls": primitive,
+                    "self_s": total,
+                    "cumulative_s": cumulative,
+                }
+            )
+        self.record_diagnostic_event(
+            "metric_calculation.profile",
+            phase="end",
+            status="ok",
+            details={"enabled": True, "function_count": len(stats.stats), "top_functions": rows},
         )
 
     def record_state(self, *, timestamp: float, q: Any, q_dot: Any, tip_position: Any, backbone_points: Any | None = None) -> None:
@@ -1938,6 +2030,19 @@ class ExperimentRecorder:
                 ),
             )
 
+        clearance_start_ns = time.monotonic_ns()
+        self.record_diagnostic_event(
+            "metric_calculation.lumen_clearance_and_progress",
+            phase="start",
+            status="started",
+            details={
+                "aligned_count": len(backbone_data.backbones),
+                "backbone_point_count_total": sum(len(points) for points in backbone_data.backbones),
+                "backbone_point_count_max": max((len(points) for points in backbone_data.backbones), default=0),
+                "geometry_point_count": len(getattr(geometry, "centerline_points", [])),
+            },
+        )
+        clearance_status = "ok"
         try:
             metrics = compute_lumen_evaluation_metrics(
                 geometry=geometry,
@@ -1948,6 +2053,18 @@ class ExperimentRecorder:
                 tip_backbone_tolerance=TIP_BACKBONE_CONSISTENCY_TOLERANCE,
             )
         except Exception as exc:
+            clearance_status = "error"
+            self._record_metric_stage_end(
+                "lumen_clearance_and_progress",
+                clearance_start_ns,
+                status=clearance_status,
+                details={
+                    "aligned_count": len(backbone_data.backbones),
+                    "backbone_point_count_total": sum(len(points) for points in backbone_data.backbones),
+                    "backbone_point_count_max": max((len(points) for points in backbone_data.backbones), default=0),
+                    "geometry_point_count": len(getattr(geometry, "centerline_points", [])),
+                },
+            )
             updated = dict(identity)
             updated["reconstructed_geometry_fingerprint"] = reconstructed_fingerprint
             updated["geometry_fingerprint_match"] = True
@@ -1963,6 +2080,32 @@ class ExperimentRecorder:
                     reasons=[f"lumen_metric_computation_failed: {exc}"],
                 ),
             )
+        except BaseException:
+            clearance_status = "error"
+            self._record_metric_stage_end(
+                "lumen_clearance_and_progress",
+                clearance_start_ns,
+                status=clearance_status,
+                details={
+                    "aligned_count": len(backbone_data.backbones),
+                    "backbone_point_count_total": sum(len(points) for points in backbone_data.backbones),
+                    "backbone_point_count_max": max((len(points) for points in backbone_data.backbones), default=0),
+                    "geometry_point_count": len(getattr(geometry, "centerline_points", [])),
+                },
+            )
+            raise
+
+        self._record_metric_stage_end(
+            "lumen_clearance_and_progress",
+            clearance_start_ns,
+            status=clearance_status,
+            details={
+                "aligned_count": len(backbone_data.backbones),
+                "backbone_point_count_total": sum(len(points) for points in backbone_data.backbones),
+                "backbone_point_count_max": max((len(points) for points in backbone_data.backbones), default=0),
+                "geometry_point_count": len(getattr(geometry, "centerline_points", [])),
+            },
+        )
 
         updated_identity = dict(identity)
         updated_identity["reconstructed_geometry_fingerprint"] = reconstructed_fingerprint
@@ -2212,6 +2355,7 @@ def _curved_lumen_identity(metadata: dict[str, Any]) -> tuple[dict[str, Any], li
     identity: dict[str, Any] = {
         "task": _canonical_orchestration_task(metadata),
         "reference_mode": _metadata_value(metadata, "reference_mode"),
+        "target_mode": _metadata_value(metadata, "target_mode"),
         "curved_lumen_type": _metadata_value(metadata, "curved_lumen_type"),
         "scenario_id": _metadata_value(metadata, "scenario_id"),
         "scenario_policy_version": _metadata_value(metadata, "scenario_policy_version"),
@@ -2227,11 +2371,15 @@ def _curved_lumen_identity(metadata: dict[str, Any]) -> tuple[dict[str, Any], li
         "requested_target": None,
         "executed_target": None,
         "validated_target": None,
+        "centerline_fraction": None,
+        "centerline_arc_length": None,
+        "radial_offset": None,
         "override_used": None,
     }
     for key in (
         "task",
         "reference_mode",
+        "target_mode",
         "curved_lumen_type",
         "scenario_id",
         "scenario_policy_version",
@@ -2250,6 +2398,8 @@ def _curved_lumen_identity(metadata: dict[str, Any]) -> tuple[dict[str, Any], li
         reasons.append("invalid_curved_identity:task")
     if identity["reference_mode"] is not None and identity["reference_mode"] != REFERENCE_MODE_FIXED_TARGET:
         reasons.append("invalid_curved_identity:reference_mode")
+    if identity["target_mode"] is not None and identity["target_mode"] != REFERENCE_MODE_FIXED_TARGET:
+        reasons.append("invalid_curved_identity:target_mode")
     if identity["curved_lumen_type"] is not None and identity["curved_lumen_type"] not in CURVED_LUMEN_TYPES:
         reasons.append("invalid_curved_identity:curved_lumen_type")
     if identity["scenario_id"] is not None and identity["scenario_id"] not in CURVED_LUMEN_SCENARIO_IDS:
@@ -2276,9 +2426,27 @@ def _curved_lumen_identity(metadata: dict[str, Any]) -> tuple[dict[str, Any], li
     if override_value is None:
         reasons.append("missing_curved_identity:override_used")
     elif not isinstance(override_value, bool):
-        reasons.append("invalid_curved_identity:override_used")
+            reasons.append("invalid_curved_identity:override_used")
     else:
         identity["override_used"] = bool(override_value)
+
+    for key in ("centerline_fraction", "centerline_arc_length", "radial_offset"):
+        raw_value = _metadata_value(metadata, key)
+        if raw_value is None:
+            reasons.append(f"missing_curved_identity:{key}")
+            continue
+        if isinstance(raw_value, bool):
+            reasons.append(f"invalid_curved_identity:{key}")
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            reasons.append(f"invalid_curved_identity:{key}")
+            continue
+        if not math.isfinite(value):
+            reasons.append(f"invalid_curved_identity:{key}")
+            continue
+        identity[key] = value
 
     if identity["executed_target"] is not None and identity["validated_target"] is not None:
         if not _vectors_close(identity["executed_target"], identity["validated_target"], tolerance=1.0e-12):
@@ -2498,6 +2666,7 @@ def _lumen_identity_section(identity: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "task",
         "reference_mode",
+        "target_mode",
         "curved_lumen_type",
         "scenario_id",
         "scenario_policy_version",
@@ -2511,6 +2680,9 @@ def _lumen_identity_section(identity: dict[str, Any]) -> dict[str, Any]:
         "requested_target",
         "executed_target",
         "validated_target",
+        "centerline_fraction",
+        "centerline_arc_length",
+        "radial_offset",
         "override_used",
         "shared_environment_hash",
         "run_role",
@@ -2945,12 +3117,18 @@ def promoted_orchestration_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "override_used",
         "target_override_used",
         "reference_mode",
+        "target_mode",
+        "target_tolerance",
+        "required_hold_duration",
         "curved_lumen_type",
         "scenario_id",
         "scenario_policy_version",
         "scenario_fingerprint",
         "geometry_frame",
         "geometry_fingerprint",
+        "centerline_fraction",
+        "centerline_arc_length",
+        "radial_offset",
     )
     result = {key: metadata[key] for key in keys if key in metadata}
     reference = metadata.get("reference_configuration")
@@ -2968,12 +3146,18 @@ def promoted_orchestration_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
                 "override_used",
                 "target_override_used",
                 "reference_mode",
+                "target_mode",
+                "target_tolerance",
+                "required_hold_duration",
                 "curved_lumen_type",
                 "scenario_id",
                 "scenario_policy_version",
                 "scenario_fingerprint",
                 "geometry_frame",
                 "geometry_fingerprint",
+                "centerline_fraction",
+                "centerline_arc_length",
+                "radial_offset",
             ):
                 if key in scenario and key not in result:
                     result[key] = scenario[key]

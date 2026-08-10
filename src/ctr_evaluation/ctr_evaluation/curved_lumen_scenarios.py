@@ -34,16 +34,23 @@ CURVED_SCENARIO_POLICY_VERSION = "curved_scenario_v1"
 CENTERLINE_TARGET = "centerline_target"
 LATERAL_OFFSET_TARGET = "lateral_offset_target"
 NEAR_SAFETY_BOUNDARY_TARGET = "near_safety_boundary_target"
+S_CURVE_MIDDLE_TARGET = "s_curve_middle_target"
+S_CURVE_NEAR_OUTLET_TARGET = "s_curve_near_outlet_target"
 CURVED_LUMEN_SCENARIO_IDS = (
     CENTERLINE_TARGET,
     LATERAL_OFFSET_TARGET,
     NEAR_SAFETY_BOUNDARY_TARGET,
+    S_CURVE_MIDDLE_TARGET,
+    S_CURVE_NEAR_OUTLET_TARGET,
 )
+S_CURVE_SCENARIO_IDS = (S_CURVE_MIDDLE_TARGET, S_CURVE_NEAR_OUTLET_TARGET)
 
 SCENARIO_CENTERLINE_FRACTIONS = {
     CENTERLINE_TARGET: 0.70,
     LATERAL_OFFSET_TARGET: 0.72,
     NEAR_SAFETY_BOUNDARY_TARGET: 0.75,
+    S_CURVE_MIDDLE_TARGET: 0.50,
+    S_CURVE_NEAR_OUTLET_TARGET: 0.90,
 }
 
 GEOMETRY_MODE_CURVED = "curved"
@@ -55,6 +62,7 @@ class CurvedLumenScenario:
     """Resolved deterministic fixed-target scenario for a curved lumen."""
 
     scenario_id: str
+    target_mode: str
     policy_version: str
     curved_lumen_type: str
     geometry_mode: str
@@ -102,6 +110,8 @@ class CurvedLumenScenario:
             raise ValueError("centerline_segment_index must be a non-negative integer")
         if not isinstance(self.override_used, bool):
             raise ValueError("override_used must be a bool")
+        if self.target_mode != "fixed_target":
+            raise ValueError("target_mode must be `fixed_target`")
         if not isinstance(self.require_safety_margin, bool):
             raise ValueError("require_safety_margin must be a bool")
         if not isinstance(self.near_boundary, bool):
@@ -129,6 +139,8 @@ def resolve_curved_lumen_scenario(
 
     scenario_key = _scenario_id(scenario_id)
     lumen_type = _curved_lumen_type(config, curved_lumen_type)
+    if scenario_key in S_CURVE_SCENARIO_IDS and lumen_type != "s_curve":
+        raise ValueError(f"scenario `{scenario_key}` requires curved_lumen.type=s_curve")
     effective_config = config_with_lumen_overrides(
         deepcopy(dict(config)),
         enable_cylindrical_lumen=False,
@@ -153,7 +165,7 @@ def resolve_curved_lumen_scenario(
     local_radius = _local_radius(resolved_geometry, sample.segment_index, sample.segment_parameter)
     preferred_radius = _preferred_radius(resolved_geometry, local_radius)
     boundary_guard = 0.0
-    if scenario_key == CENTERLINE_TARGET:
+    if scenario_key in (CENTERLINE_TARGET, *S_CURVE_SCENARIO_IDS):
         radial_offset = 0.0
     elif scenario_key == LATERAL_OFFSET_TARGET:
         radial_offset = 0.5 * preferred_radius
@@ -183,6 +195,7 @@ def resolve_curved_lumen_scenario(
     geometry_fingerprint = lumen_geometry_fingerprint(resolved_geometry)
     identity_payload = _scenario_identity_payload(
         scenario_id=scenario_key,
+        target_mode="fixed_target",
         curved_lumen_type=lumen_type,
         geometry_frame=resolved_geometry.frame_id,
         geometry_fingerprint=geometry_fingerprint,
@@ -204,6 +217,7 @@ def resolve_curved_lumen_scenario(
 
     return CurvedLumenScenario(
         scenario_id=scenario_key,
+        target_mode="fixed_target",
         policy_version=CURVED_SCENARIO_POLICY_VERSION,
         curved_lumen_type=lumen_type,
         geometry_mode=GEOMETRY_MODE_CURVED,
