@@ -277,7 +277,9 @@ class MPPICore:
 
         if final_model_result is None:
             raise ValueError("rollout sequence is empty")
-        terminal_result = self._validated_model_result(q)
+        # The last rollout step already evaluated this exact deterministic
+        # state. Reuse it for terminal costs instead of repeating kinematics.
+        terminal_result = final_model_result
         terminal = terminal_result.tip_position
         total += self._weight("terminal") * terminal_tip_cost(terminal, reference_sequence[-1])
         total += self._lumen_cost(terminal_result.backbone_points, terminal=True)
