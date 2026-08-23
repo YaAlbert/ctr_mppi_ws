@@ -78,7 +78,7 @@ The live seed-11 visualization showed the curved lumen, lumen centerline/referen
 - [Final/converged view](visual/seed11_final.png)
 - [Alternate camera view](visual/seed11_alternate_angle.png)
 
-No video was created because no screen-video encoder was installed. The local X11 RViz workflow itself ran successfully. Two repeat shutdowns were clean after one non-reproduced transient safety-node SIGSEGV during the first Ctrl-C; no process survived any run.
+No video was created because no screen-video encoder was installed. The local X11 RViz workflow itself ran successfully. The initial safety-node SIGSEGV did not reproduce in later controlled testing. After correcting a separately observed shutdown-only ROS 2 Humble message-conversion exception, a fresh 10/10 visual shutdown run completed with all required exit codes zero and no surviving process. See [the shutdown reliability report](visual_shutdown_reliability.md).
 
 ## Reproduction
 
@@ -119,5 +119,5 @@ DISPLAY=:0 ROS_DOMAIN_ID=166 ros2 launch ctr_bringup \
 
 - This is simulator-only development evidence; no physical hardware or production authority path ran.
 - The optimized Python controller remains about 1.30 Hz in the full ROS workflow and is not claimed to be real time.
-- The first RViz Ctrl-C exposed one transient safety-node shutdown SIGSEGV that did not reproduce in two subsequent runs; it remains a follow-up reliability item even though teardown left zero children.
+- The first RViz Ctrl-C exposed one transient safety-node shutdown SIGSEGV that did not reproduce in the later 10-cycle controlled run. EVAL-005 remains a historical, low-priority observation rather than a claim of exhaustive graphics-stack reliability.
 - Production attempts consumed: 0.

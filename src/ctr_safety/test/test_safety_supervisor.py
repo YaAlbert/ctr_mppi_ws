@@ -4,6 +4,7 @@ import threading
 import types
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 
 try:
@@ -81,6 +82,7 @@ except ImportError:
     sys.modules["ctr_interfaces.msg"] = message_module
     sys.modules["ctr_interfaces.srv"] = service_module
 
+from ctr_safety.nodes import safety_supervisor_node as supervisor_module
 from ctr_safety.nodes.safety_supervisor_node import SafetySupervisorNode, _zero_command
 
 
@@ -90,6 +92,42 @@ class FakeGeometry:
 
     def check_backbone(self, points):
         return self.safe, "geometry_safe" if self.safe else "whole_backbone_safety_margin", 0.001
+
+
+class SafetySupervisorMainShutdownTest(unittest.TestCase):
+    def test_shutdown_context_normalizes_executor_runtime_error(self):
+        node = mock.Mock()
+        with (
+            mock.patch.object(supervisor_module.rclpy, "init"),
+            mock.patch.object(supervisor_module, "SafetySupervisorNode", return_value=node),
+            mock.patch.object(
+                supervisor_module.rclpy,
+                "spin",
+                side_effect=RuntimeError("Unable to convert call argument to Python object"),
+            ),
+            mock.patch.object(supervisor_module.rclpy, "ok", return_value=False),
+            mock.patch.object(supervisor_module.rclpy, "shutdown") as shutdown,
+        ):
+            supervisor_module.main()
+
+        node.destroy_node.assert_called_once_with()
+        shutdown.assert_not_called()
+
+    def test_active_context_preserves_executor_runtime_error(self):
+        node = mock.Mock()
+        failure = RuntimeError("active executor failure")
+        with (
+            mock.patch.object(supervisor_module.rclpy, "init"),
+            mock.patch.object(supervisor_module, "SafetySupervisorNode", return_value=node),
+            mock.patch.object(supervisor_module.rclpy, "spin", side_effect=failure),
+            mock.patch.object(supervisor_module.rclpy, "ok", return_value=True),
+            mock.patch.object(supervisor_module.rclpy, "shutdown") as shutdown,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "active executor failure"):
+                supervisor_module.main()
+
+        node.destroy_node.assert_called_once_with()
+        shutdown.assert_called_once_with()
 
 
 def stamp(message, nanoseconds):

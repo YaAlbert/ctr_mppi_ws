@@ -426,6 +426,14 @@ def main(args=None) -> None:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+    except RuntimeError:
+        # ROS 2 Humble can surface a subscription-conversion RuntimeError when
+        # SIGINT invalidates the context while the executor is taking a
+        # message.  Treat that race as normal shutdown only after the context
+        # is no longer active; a RuntimeError during normal operation remains
+        # a real failure and must retain its traceback.
+        if rclpy.ok():
+            raise
     finally:
         if node is not None:
             node.destroy_node()

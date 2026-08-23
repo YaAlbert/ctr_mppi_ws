@@ -169,8 +169,16 @@ are under
 RViz was also launched successfully with the curved-lumen markers, CTR
 visualization, reference path, tip display, and OK global status. One first-run
 Ctrl-C produced a transient safety-node SIGSEGV, but two immediate repeat
-launches shut down every node cleanly and no run left a child process; the
-non-reproduced shutdown event remains a low-priority reliability follow-up.
+launches shut down every node cleanly. A later bounded reliability run did not
+reproduce the SIGSEGV, but did expose one shutdown-only ROS 2 Humble message
+conversion `RuntimeError` in the safety-node entry point. The entry point now
+normalizes that race only after the ROS context is inactive and preserves the
+same exception while the context is active. The installed correction passed
+884 functional tests and a fresh 10/10 controlled RViz shutdown run on domains
+181--190: every required process exited zero after one SIGINT, no escalation or
+crash marker occurred, and no child survived. EVAL-005 remains a historical,
+non-reproduced low-priority observation. The detailed result is
+`evaluation_results/slice_7g_performance_optimized_20260823T014418Z/visual_shutdown_reliability.md`.
 This development run created no production authority, budget, evidence seal,
 or attempt and is not a Slice 7G promotion result.
 
