@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+import fcntl
 import json
 import math
 import os
 from pathlib import Path
 import re
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -23,6 +25,10 @@ import numpy as np
 import yaml
 
 from ctr_bringup.parameter_validation import load_parameter_files, validate_config_paths, validate_or_raise
+from ctr_bringup.slice_7g_profile import (
+    apply_slice_7g_development_simulation_profile,
+    apply_slice_7g_simulation_profile,
+)
 from ctr_evaluation.compare_results import compare_result_dirs, read_json, write_json
 from ctr_evaluation.curved_lumen_scenarios import (
     CENTERLINE_TARGET,
@@ -60,11 +66,31 @@ CONFIG_NAMES = (
     "safety_params.yaml",
     "tactile_params.yaml",
     "hardware_params.yaml",
+    "slice_7g_runtime_params.yaml",
 )
 COMMAND_TOPICS = ("/ctr/mppi_command", "/ctr/safe_command")
+SLICE_7G_AUTHORIZATION_ENV = "CTR_SLICE_7G_RUNTIME_AUTHORIZATION_IDENTITY"
+SLICE_7G_LEDGER_ENV = "CTR_SLICE_7G_ATTEMPT_LEDGER_IDENTITY"
+SLICE_7G_PLAN_ENV = "CTR_SLICE_7G_CAMPAIGN_PLAN_IDENTITY"
+SLICE_7G_CELL_ENV = "CTR_SLICE_7G_CELL_ID"
+SLICE_7G_CAMPAIGN_ENV = "CTR_SLICE_7G_CAMPAIGN_ID"
+SLICE_7G_ROOT_ENV = "CTR_SLICE_7G_CAMPAIGN_OUTPUT_ROOT"
+SLICE_7G_CELL_ROOT_ENV = "CTR_SLICE_7G_CELL_OUTPUT_ROOT"
+SLICE_7G_CHARTER_ENV = "CTR_SLICE_7G_CHARTER_IDENTITY"
+SLICE_7G_LEDGER_REVISION_ENV = "CTR_SLICE_7G_ATTEMPT_LEDGER_REVISION"
+SLICE_7G_PROCESS_EVENT_ENV = "CTR_SLICE_7G_PROCESS_START_EVENT_IDENTITY"
+SLICE_7G_DOMAIN_LEASE_ENV = "CTR_SLICE_7G_DOMAIN_LEASE_IDENTITY"
+SLICE_7G_DOMAIN_BINDING_ENV = "CTR_SLICE_7G_DOMAIN_COMMITTED_BINDING_IDENTITY"
+SLICE_7G_WORKING_DIRECTORY_ENV = "CTR_SLICE_7G_WORKING_DIRECTORY"
+SLICE_7G_RUNNER_RECEIPT_SCHEMA = "ctr-slice-7g-runner-result-receipt-1"
+SLICE_7G_RUNNER_RECEIPT_PATH = "slice_7g_runner_result.json"
 EXPERIMENT_GROUP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 MAX_EXPERIMENT_GROUP_LENGTH = 128
 TARGET_IDENTITY_ATOL = 1.0e-9
+DEVELOPMENT_SIMULATION_DISCLAIMER = (
+    "Development-simulation result only; not production promotion evidence."
+)
+DEVELOPMENT_DOMAIN_ROOT = Path("/tmp/ctr_mppi_slice_7g_development_domains")
 RUN_STARTED_RE = re.compile(r"started evaluation run (?P<run_id>[A-Za-z0-9_-]+)")
 RUN_COMPLETED_RE = re.compile(r"completed evaluation run (?P<run_id>[A-Za-z0-9_-]+): (?P<path>.+)$")
 
@@ -199,7 +225,27 @@ class OrchestrationError(RuntimeError):
     """Raised when a deterministic evaluation prerequisite fails."""
 
 
+@dataclass
+class DevelopmentDomainLease:
+    """User-level exclusion lock for one development ROS domain."""
+
+    domain_id: int
+    descriptor: int
+    path: Path
+
+    def close(self) -> None:
+        descriptor = self.descriptor
+        if descriptor < 0:
+            return
+        self.descriptor = -1
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description="Run a deterministic zero-command baseline and MPPI candidate evaluation pair.")
     parser.add_argument("--experiment-group", required=True)
     parser.add_argument("--trajectory", default="circle", choices=("circle", "ellipse", "helix"))
@@ -213,15 +259,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--candidate", default="mppi")
     parser.add_argument("--duration", type=float, required=True)
     parser.add_argument("--runtime-mode", default="simulation")
+    parser.add_argument(
+        "--development-simulation",
+        action="store_true",
+        help=(
+            "Explicitly use the user-level simulator-only Slice 7G workflow; "
+            "this bypasses production authority and creates no promotion evidence."
+        ),
+    )
     parser.add_argument("--require-improvement", action="store_true")
     parser.add_argument("--require-sampled-reachable", action="store_true")
     parser.add_argument("--output-root", default="")
     parser.add_argument("--config-path", action="append", default=[])
-    return parser.parse_args(argv)
+    parsed = parser.parse_args(raw_argv)
+    parsed._slice_7g_raw_argv = tuple(raw_argv)
+    return parsed
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.development_simulation:
+        print(f"WARNING: {DEVELOPMENT_SIMULATION_DISCLAIMER}", file=sys.stderr)
     try:
         args.experiment_group = validate_experiment_group(args.experiment_group)
         result = EvaluationOrchestrator(args).run_pair()
@@ -246,8 +304,102 @@ def main(argv: list[str] | None = None) -> int:
     if args.require_improvement and not result["baseline_improvement_pass"]:
         print("ctr_run_evaluation failed: --require-improvement was set and baseline_improvement_pass is false")
         return 4
+    if slice_7g_domain_from_environment() is not None:
+        try:
+            write_slice_7g_runner_receipt(args, result)
+        except Exception as exc:
+            print(f"ctr_run_evaluation failed: governed result receipt was not retained: {exc}")
+            return 2
     print(json.dumps(sanitize_for_json(result), indent=2, allow_nan=False))
     return 0
+
+
+def write_slice_7g_runner_receipt(args: argparse.Namespace, result: dict[str, Any]) -> Path:
+    """Retain the canonical runner-to-governance handoff for one governed cell."""
+
+    required_environment = {
+        "charter_logical_identity": SLICE_7G_CHARTER_ENV,
+        "runtime_authorization_identity": SLICE_7G_AUTHORIZATION_ENV,
+        "attempt_ledger_identity": SLICE_7G_LEDGER_ENV,
+        "attempt_ledger_revision": SLICE_7G_LEDGER_REVISION_ENV,
+        "process_start_event_identity": SLICE_7G_PROCESS_EVENT_ENV,
+        "campaign_plan_identity": SLICE_7G_PLAN_ENV,
+        "domain_lease_identity": SLICE_7G_DOMAIN_LEASE_ENV,
+        "domain_committed_binding_identity": SLICE_7G_DOMAIN_BINDING_ENV,
+        "cell_id": SLICE_7G_CELL_ENV,
+        "campaign_id": SLICE_7G_CAMPAIGN_ENV,
+        "campaign_output_root": SLICE_7G_ROOT_ENV,
+        "cell_output_root": SLICE_7G_CELL_ROOT_ENV,
+    }
+    values: dict[str, str] = {}
+    for field, name in required_environment.items():
+        value = os.environ.get(name)
+        if not value:
+            raise OrchestrationError(f"missing governed receipt binding: {name}")
+        values[field] = value
+    try:
+        ledger_revision = int(values.pop("attempt_ledger_revision"))
+    except ValueError as exc:
+        raise OrchestrationError("governed ledger revision is not an integer") from exc
+    cell_root = Path(values["cell_output_root"])
+    if (
+        not cell_root.is_absolute()
+        or "//" in values["cell_output_root"]
+        or any(part in {"", ".", ".."} for part in values["cell_output_root"][1:].split("/"))
+    ):
+        raise OrchestrationError("governed cell output root is not canonical")
+    baseline = Path(result["baseline_dir"])
+    candidate = Path(result["candidate_dir"])
+    try:
+        baseline_relative = baseline.relative_to(cell_root).as_posix()
+        candidate_relative = candidate.relative_to(cell_root).as_posix()
+    except (KeyError, TypeError, ValueError) as exc:
+        raise OrchestrationError("runner result directories escape the governed cell root") from exc
+    raw_argv = getattr(args, "_slice_7g_raw_argv", ())
+    if type(raw_argv) is not tuple or any(type(item) is not str for item in raw_argv):
+        raise OrchestrationError("governed raw argv was not retained")
+    receipt = {
+        "schema_version": SLICE_7G_RUNNER_RECEIPT_SCHEMA,
+        **values,
+        "attempt_ledger_revision": ledger_revision,
+        "ros_domain_id": slice_7g_domain_from_environment(),
+        "task": args.task,
+        "geometry": args.curved_lumen_type,
+        "scenario": args.scenario,
+        "seed": args.seed,
+        "duration_seconds": args.duration,
+        "runtime_mode": args.runtime_mode,
+        "argv": ["ctr_run_evaluation", *raw_argv],
+        "process_exit_status": 0,
+        "baseline_relative_path": baseline_relative,
+        "candidate_relative_path": candidate_relative,
+    }
+    raw = json.dumps(
+        sanitize_for_json(receipt), sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False, allow_nan=False,
+    ).encode("utf-8")
+    path = cell_root / SLICE_7G_RUNNER_RECEIPT_PATH
+    descriptor = os.open(
+        path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o600,
+    )
+    try:
+        view = memoryview(raw)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OrchestrationError("short governed receipt write")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.fchmod(descriptor, 0o444)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    directory = os.open(cell_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    return path
 
 
 def is_fixed_target_task(task: str) -> bool:
@@ -268,6 +420,13 @@ def validate_task_options(args: argparse.Namespace) -> None:
             raise OrchestrationError("--curved-lumen-type is only valid with --task curved_lumen_navigation")
         if args.scenario is not None:
             raise OrchestrationError("--scenario is only valid with --task curved_lumen_navigation")
+    if args.development_simulation:
+        if args.runtime_mode != "simulation":
+            raise OrchestrationError("--development-simulation requires --runtime-mode simulation")
+        if args.task != TASK_CURVED_LUMEN_NAVIGATION:
+            raise OrchestrationError(
+                "--development-simulation requires --task curved_lumen_navigation"
+            )
 
 
 class EvaluationOrchestrator:
@@ -293,10 +452,40 @@ class EvaluationOrchestrator:
                 random_seed="" if args.seed is None else args.seed,
             )
         validate_or_raise(self.project_config)
+        self.slice_7g_governed = slice_7g_domain_from_environment() is not None
+        self.development_simulation = bool(args.development_simulation)
+        if self.slice_7g_governed and self.development_simulation:
+            raise OrchestrationError(
+                "development simulation cannot use production Slice 7G authority bindings"
+            )
+        self.slice_7g_profile_enabled = self.slice_7g_governed or self.development_simulation
+        if self.slice_7g_profile_enabled:
+            if not is_curved_lumen_task(args.task):
+                raise OrchestrationError("Slice 7G simulation profile requires curved_lumen_navigation")
+            self.project_config = (
+                apply_slice_7g_development_simulation_profile(
+                    self.project_config, enabled=True
+                )
+                if self.development_simulation
+                else apply_slice_7g_simulation_profile(self.project_config, enabled=True)
+            )
+            validate_or_raise(self.project_config)
         self.output_root = output_root_from_config(self.project_config, args.output_root)
+        if self.slice_7g_governed:
+            validate_slice_7g_runtime_binding(args, self.output_root)
+        elif self.development_simulation:
+            self.output_root = validate_development_output_root(self.output_root)
         self.settings = orchestration_settings_from_config(self.project_config)
         self.orchestration_id = f"m5d1_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}"
-        self.process_manager = ProcessManager(Path.cwd())
+        if self.slice_7g_governed:
+            working_directory = os.environ.get(SLICE_7G_WORKING_DIRECTORY_ENV)
+            if type(working_directory) is not str or not Path(working_directory).is_absolute():
+                raise OrchestrationError("governed Slice 7G working directory binding is missing")
+            if Path.cwd().resolve(strict=True) != Path(working_directory).resolve(strict=True):
+                raise OrchestrationError("governed Slice 7G working directory differs from authority")
+            self.process_manager = ProcessManager(Path(working_directory))
+        else:
+            self.process_manager = ProcessManager(Path.cwd())
         self.used_domain_ids: set[int] = set()
         self.cylinder_setup = self._validate_cylinder_setup() if args.task == TASK_CYLINDER_NAVIGATION else {}
 
@@ -335,45 +524,78 @@ class EvaluationOrchestrator:
         return effective_config
 
     def run_pair(self) -> dict[str, Any]:
-        baseline = self._run_one(role="baseline", controller_label=self.args.baseline, baseline_dir=None)
-        if is_fixed_target_task(self.args.task):
-            validate_target_identity_metadata(
-                {**baseline.metadata, **baseline.orchestration},
-                expected_target=self._target_position_for_launch(),
-                label="baseline",
+        domain_lease: DevelopmentDomainLease | None = None
+        try:
+            if self.development_simulation:
+                domain_lease = acquire_development_ros_domain()
+                domain_id = domain_lease.domain_id
+                self.used_domain_ids.add(domain_id)
+            else:
+                domain_id = self._fresh_domain_id()
+            baseline = self._run_one(role="baseline", controller_label=self.args.baseline, baseline_dir=None, domain_id=domain_id)
+            if is_fixed_target_task(self.args.task):
+                validate_target_identity_metadata(
+                    {**baseline.metadata, **baseline.orchestration},
+                    expected_target=self._target_position_for_launch(),
+                    label="baseline",
+                )
+            candidate = self._run_one(role="candidate", controller_label=self.args.candidate, baseline_dir=baseline.run_dir, domain_id=domain_id)
+            if is_fixed_target_task(self.args.task):
+                validate_target_identity_metadata(
+                    {**candidate.metadata, **candidate.orchestration},
+                    expected_target=self._target_position_for_launch(),
+                    label="candidate",
+                )
+            comparison = compare_result_dirs(
+                candidate_dir=candidate.run_dir,
+                baseline_dir=baseline.run_dir,
+                duration_tolerance=float(self.project_config["evaluation"]["duration_compatibility_tolerance"]),
+                initial_state_tolerance=self.settings.baseline_candidate_q_tolerance,
+                near_zero_epsilon=float(self.project_config["evaluation"]["near_zero_baseline_epsilon"]),
             )
-        candidate = self._run_one(role="candidate", controller_label=self.args.candidate, baseline_dir=baseline.run_dir)
-        if is_fixed_target_task(self.args.task):
-            validate_target_identity_metadata(
-                {**candidate.metadata, **candidate.orchestration},
-                expected_target=self._target_position_for_launch(),
-                label="candidate",
-            )
-        comparison = compare_result_dirs(
-            candidate_dir=candidate.run_dir,
-            baseline_dir=baseline.run_dir,
-            duration_tolerance=float(self.project_config["evaluation"]["duration_compatibility_tolerance"]),
-            initial_state_tolerance=self.settings.baseline_candidate_q_tolerance,
-            near_zero_epsilon=float(self.project_config["evaluation"]["near_zero_baseline_epsilon"]),
-        )
-        candidate.orchestration["comparison_valid"] = comparison.get("comparison_valid", False)
-        write_json(candidate.run_dir / "orchestration.json", candidate.orchestration)
-        candidate_summary = read_json(candidate.run_dir / "summary.json")
-        baseline_improvement_pass = bool(candidate_summary.get("acceptance", {}).get("baseline_improvement_pass", False))
-        return {
-            "orchestration_success": True,
-            "orchestration_id": self.orchestration_id,
-            "baseline_dir": str(baseline.run_dir),
-            "candidate_dir": str(candidate.run_dir),
-            "comparison": comparison,
-            "comparison_valid": bool(comparison.get("comparison_valid", False)),
-            "baseline_improvement_pass": baseline_improvement_pass,
-            "timing_pass": bool(candidate_summary.get("acceptance", {}).get("timing_pass", False)),
-            "real_time_pass": bool(candidate_summary.get("acceptance", {}).get("real_time_pass", False)),
-        }
+            candidate.orchestration["comparison_valid"] = comparison.get("comparison_valid", False)
+            write_json(candidate.run_dir / "orchestration.json", candidate.orchestration)
+            candidate_summary = read_json(candidate.run_dir / "summary.json")
+            baseline_improvement_pass = bool(candidate_summary.get("acceptance", {}).get("baseline_improvement_pass", False))
+            return {
+                "orchestration_success": True,
+                "orchestration_id": self.orchestration_id,
+                "baseline_dir": str(baseline.run_dir),
+                "candidate_dir": str(candidate.run_dir),
+                "comparison": comparison,
+                "comparison_valid": bool(comparison.get("comparison_valid", False)),
+                "baseline_improvement_pass": baseline_improvement_pass,
+                "timing_pass": bool(candidate_summary.get("acceptance", {}).get("timing_pass", False)),
+                "real_time_pass": bool(candidate_summary.get("acceptance", {}).get("real_time_pass", False)),
+                "development_simulation": self.development_simulation,
+                "production_promotion_evidence": False if self.development_simulation else None,
+                "development_disclaimer": (
+                    DEVELOPMENT_SIMULATION_DISCLAIMER if self.development_simulation else None
+                ),
+                "ros_domain_id": domain_id,
+            }
+        finally:
+            if domain_lease is not None:
+                domain_lease.close()
 
-    def _run_one(self, *, role: str, controller_label: str, baseline_dir: Path | None) -> RunResult:
-        domain_id = self._fresh_domain_id()
+    def _run_one(
+        self,
+        *,
+        role: str,
+        controller_label: str,
+        baseline_dir: Path | None,
+        domain_id: int | None = None,
+    ) -> RunResult:
+        self.slice_7g_governed = bool(getattr(self, "slice_7g_governed", False))
+        self.slice_7g_profile_enabled = bool(
+            getattr(self, "slice_7g_profile_enabled", self.slice_7g_governed)
+        )
+        if domain_id is None:
+            domain_id = self._fresh_domain_id()
+        if type(domain_id) is not int or not 0 <= domain_id <= 232:
+            raise OrchestrationError("supplied ROS domain must be an exact integer in 0..232")
+        if self.slice_7g_governed and domain_id != slice_7g_domain_from_environment():
+            raise OrchestrationError("lower-level ROS domain differs from the authorized Slice 7G domain")
         run_id = build_run_id(self.orchestration_id, role, controller_label)
         records: list[ProcessRecord] = []
         monitor: RosRunMonitor | None = None
@@ -394,9 +616,13 @@ class EvaluationOrchestrator:
                 mppi_profile=self.args.mppi_profile,
                 random_seed=self.args.seed,
                 run_role=role,
+                slice_7g_profile=self.slice_7g_profile_enabled,
+                development_simulation=bool(
+                    getattr(self, "development_simulation", False)
+                ),
             )
             records.append(self.process_manager.start(role=f"{role}_base", command=base_command, env=env))
-            monitor = RosRunMonitor(domain_id=domain_id)
+            monitor = RosRunMonitor(domain_id=domain_id, slice_7g_governed=self.slice_7g_profile_enabled)
             monitor.record_runner_event("runner_start", orchestration_id=self.orchestration_id, run_role=role)
             monitor.record_runner_event(
                 "launch_process_created",
@@ -406,18 +632,30 @@ class EvaluationOrchestrator:
             )
             monitor.set_diagnostic_settings(self.settings)
             monitor.wait_for_services(self.settings.service_timeout)
-            monitor.wait_for_state_tip(self.settings.topic_ready_timeout)
+            readiness_deadline = time.monotonic() + self.settings.topic_ready_timeout
+
+            def readiness_remaining() -> float:
+                remaining = readiness_deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise OrchestrationError("Slice 7G readiness timeout")
+                return remaining
+
+            monitor.wait_for_state_tip(
+                readiness_remaining() if self.slice_7g_profile_enabled else self.settings.topic_ready_timeout
+            )
+            if self.slice_7g_profile_enabled:
+                monitor.wait_for_slice_7g_readiness(readiness_remaining())
             if role == "baseline" and process_name_running("mppi_controller_node"):
                 raise OrchestrationError("MPPI controller process is running during baseline startup")
             publisher_counts = monitor.command_publisher_counts()
             audit = monitor.command_audit_since_now(publisher_counts)
-            if unexpected_command_publishers(publisher_counts):
+            if unexpected_command_publishers(publisher_counts, slice_7g_governed=self.slice_7g_profile_enabled):
                 raise OrchestrationError(f"unexpected command publisher exists: {publisher_counts}")
             time.sleep(simulator_command_timeout())
             monitor.spin_for(simulator_command_timeout())
             samples = monitor.collect_stability_samples(
                 duration_s=self.settings.initial_stability_duration,
-                timeout_s=self.settings.topic_ready_timeout,
+                timeout_s=readiness_remaining() if self.slice_7g_profile_enabled else self.settings.topic_ready_timeout,
                 minimum_samples=self.settings.initial_stability_samples,
             )
             stability_entry_time = time.monotonic()
@@ -431,6 +669,9 @@ class EvaluationOrchestrator:
                     file=sys.stderr,
                 )
                 raise OrchestrationError(f"initial state is not stable: {stability.reason}")
+            if self.slice_7g_profile_enabled:
+                monitor.require_slice_7g_ready()
+                monitor.arm_safety_fault_monitor()
             monitor.record_runner_event("readiness_completed", evaluated_sample_count=len(samples))
             if audit.nonzero_count(self.settings.command_zero_tolerance) > 0:
                 raise OrchestrationError("nonzero command received before recording")
@@ -482,6 +723,8 @@ class EvaluationOrchestrator:
                     raise OrchestrationError("candidate command timestamp is before recording start")
 
             monitor.spin_until_time(evaluation_window_end)
+            if self.slice_7g_profile_enabled and monitor.safety_fault_count:
+                raise OrchestrationError("slice_7g_safety_fault_during_cell")
             monitor.record_runner_event(
                 "recording_duration_complete",
                 scheduled_end=evaluation_window_end,
@@ -692,6 +935,12 @@ class EvaluationOrchestrator:
         return result, None, None
 
     def _fresh_domain_id(self) -> int:
+        governed = slice_7g_domain_from_environment()
+        if governed is not None:
+            if governed in self.used_domain_ids:
+                return governed
+            self.used_domain_ids.add(governed)
+            return governed
         for _ in range(1000):
             domain_id = fresh_ros_domain_id()
             if domain_id not in self.used_domain_ids:
@@ -740,6 +989,15 @@ class EvaluationOrchestrator:
         target_identity = self._target_identity_metadata()
         return {
             "requested_run_id": run_id,
+            "development_simulation": bool(getattr(self, "development_simulation", False)),
+            "production_promotion_evidence": (
+                False if bool(getattr(self, "development_simulation", False)) else None
+            ),
+            "development_disclaimer": (
+                DEVELOPMENT_SIMULATION_DISCLAIMER
+                if bool(getattr(self, "development_simulation", False))
+                else None
+            ),
             "orchestration_id": self.orchestration_id,
             "run_role": role,
             "experiment_group": self.experiment_group,
@@ -771,7 +1029,12 @@ class EvaluationOrchestrator:
             "baseline_safe_command_publisher_count": publisher_counts.get("/ctr/safe_command", 0),
             "pre_roll_command_message_count": len(audit.events),
             "pre_roll_nonzero_command_count": audit.nonzero_count(self.settings.command_zero_tolerance),
-            "unexpected_command_publishers": unexpected_command_publishers(publisher_counts),
+            "unexpected_command_publishers": unexpected_command_publishers(
+                publisher_counts,
+                slice_7g_governed=bool(
+                    getattr(self, "slice_7g_profile_enabled", self.slice_7g_governed)
+                ),
+            ),
             **target_identity,
             "reference_configuration": {
                 "task": self.args.task,
@@ -929,6 +1192,11 @@ class EvaluationOrchestrator:
             f"reference_type:={self.args.trajectory}",
             "publish_safe_command_for_simulation:=true",
         ]
+        if bool(getattr(self, "slice_7g_profile_enabled", self.slice_7g_governed)):
+            command[-1] = "publish_safe_command_for_simulation:=false"
+            command.append("slice_7g_profile:=true")
+        if bool(getattr(self, "development_simulation", False)):
+            command.append("development_simulation:=true")
         if is_fixed_target_task(self.args.task):
             command.extend(self._fixed_target_launch_arguments())
         return command
@@ -1007,6 +1275,15 @@ class EvaluationOrchestrator:
             reference_epoch = metadata.get("scheduled_reference_epoch_s")
         runtime_metadata = {
             "orchestration_success": True,
+            "development_simulation": bool(getattr(self, "development_simulation", False)),
+            "production_promotion_evidence": (
+                False if bool(getattr(self, "development_simulation", False)) else None
+            ),
+            "development_disclaimer": (
+                DEVELOPMENT_SIMULATION_DISCLAIMER
+                if bool(getattr(self, "development_simulation", False))
+                else None
+            ),
             "orchestration_id": self.orchestration_id,
             "run_id": run_id,
             "run_role": role,
@@ -1036,11 +1313,11 @@ class EvaluationOrchestrator:
 
 
 class RosRunMonitor:
-    def __init__(self, *, domain_id: int):
+    def __init__(self, *, domain_id: int, slice_7g_governed: bool = False):
         import rclpy
         from rclpy.context import Context
         from rclpy.executors import SingleThreadedExecutor
-        from ctr_interfaces.msg import CtrJointCommand, CtrState
+        from ctr_interfaces.msg import CtrJointCommand, CtrSafetyStatus, CtrState, CtrTactileState
         from ctr_interfaces.srv import StartExperiment, StopExperiment
         from geometry_msgs.msg import PoseStamped
         from nav_msgs.msg import Path as NavPath
@@ -1051,6 +1328,8 @@ class RosRunMonitor:
         try:
             rclpy.init(args=None, context=self.context, domain_id=domain_id)
         except TypeError:
+            if slice_7g_governed:
+                raise OrchestrationError("rclpy domain_id argument is required for governed Slice 7G execution")
             os.environ["ROS_DOMAIN_ID"] = str(domain_id)
             rclpy.init(args=None, context=self.context)
         self.node = rclpy.create_node("ctr_run_evaluation_monitor", context=self.context)
@@ -1104,6 +1383,14 @@ class RosRunMonitor:
         self.first_reference_tip_timestamp: float | None = None
         self.latest_reference_horizon_first: list[float] | None = None
         self.command_events: list[CommandEvent] = []
+        self.slice_7g_governed = bool(slice_7g_governed)
+        self.latest_tactile_receive_time: float | None = None
+        self.latest_tactile_valid = False
+        self.latest_safety_receive_time: float | None = None
+        self.latest_safety_ready = False
+        self.latest_safety_fault = True
+        self.safety_fault_count = 0
+        self._safety_fault_monitor_armed = False
         self.state_sub = self.node.create_subscription(CtrState, "/ctr/state", self._on_state, 10)
         self.tip_sub = self.node.create_subscription(PoseStamped, "/ctr/tip", self._on_tip, 10)
         self.ref_tip_sub = self.node.create_subscription(PoseStamped, "/ctr/reference/tip", lambda msg: self._on_reference("tip", msg), 10)
@@ -1113,6 +1400,8 @@ class RosRunMonitor:
             self.node.create_subscription(CtrJointCommand, topic, lambda msg, topic=topic: self._on_command(topic, msg), 10)
             for topic in COMMAND_TOPICS
         ]
+        self.tactile_sub = self.node.create_subscription(CtrTactileState, "/ctr/tactile/state", self._on_tactile, 10)
+        self.safety_sub = self.node.create_subscription(CtrSafetyStatus, "/ctr/safety/status", self._on_safety, 10)
         self.start_client = self.node.create_client(StartExperiment, "/ctr/start_experiment")
         self.stop_client = self.node.create_client(StopExperiment, "/ctr/stop_experiment")
         self._diagnostics["subscription_created_monotonic"] = time.monotonic()
@@ -1139,6 +1428,48 @@ class RosRunMonitor:
 
     def wait_for_state_tip(self, timeout_s: float) -> None:
         self._spin_until(lambda: self.latest_state is not None and self.latest_tip is not None, timeout_s, "state/tip readiness")
+
+    def wait_for_slice_7g_readiness(self, timeout_s: float) -> None:
+        self._spin_until(self._slice_7g_ready, timeout_s, "Slice 7G tactile/safety readiness")
+
+    def _slice_7g_ready(self) -> bool:
+        now = time.monotonic()
+        tactile_fresh = (
+            self.latest_tactile_receive_time is not None
+            and now - self.latest_tactile_receive_time <= 0.10
+            and self.latest_tactile_valid
+        )
+        safety_fresh = (
+            self.latest_safety_receive_time is not None
+            and now - self.latest_safety_receive_time <= 0.10
+            and self.latest_safety_ready
+            and not self.latest_safety_fault
+        )
+        return bool(tactile_fresh and safety_fresh)
+
+    def require_slice_7g_ready(self) -> None:
+        if not self._slice_7g_ready():
+            raise OrchestrationError("Slice 7G tactile/safety status became stale or faulted during readiness")
+        now = time.monotonic()
+        self._diagnostics["slice_7g_readiness_snapshot"] = {
+            "authenticated": True,
+            "observed_monotonic": now,
+            "tactile_receive_age_seconds": now - float(self.latest_tactile_receive_time),
+            "tactile_valid": self.latest_tactile_valid,
+            "safety_receive_age_seconds": now - float(self.latest_safety_receive_time),
+            "safety_ready": self.latest_safety_ready,
+            "safety_fault": self.latest_safety_fault,
+        }
+
+    def arm_safety_fault_monitor(self) -> None:
+        """Begin cell fault accounting only after authenticated readiness."""
+
+        if not self.slice_7g_governed:
+            return
+        if not self.latest_safety_ready or self.latest_safety_fault:
+            raise OrchestrationError("Slice 7G safety monitor cannot arm before fault-free readiness")
+        self.safety_fault_count = 0
+        self._safety_fault_monitor_armed = True
 
     def wait_for_reference(self, timeout_s: float, *, require_horizon: bool = True) -> None:
         self._spin_until(
@@ -1269,7 +1600,20 @@ class RosRunMonitor:
         self._diagnostic_settings = settings
 
     def readiness_diagnostics(self) -> dict[str, Any]:
-        return sanitize_for_json(self._diagnostics)
+        now = time.monotonic()
+        diagnostics = dict(self._diagnostics)
+        tactile_receive_time = getattr(self, "latest_tactile_receive_time", None)
+        safety_receive_time = getattr(self, "latest_safety_receive_time", None)
+        diagnostics["tactile_receive_age_seconds"] = (
+            None if tactile_receive_time is None else now - tactile_receive_time
+        )
+        diagnostics["tactile_valid"] = bool(getattr(self, "latest_tactile_valid", False))
+        diagnostics["safety_receive_age_seconds"] = (
+            None if safety_receive_time is None else now - safety_receive_time
+        )
+        diagnostics["safety_ready"] = bool(getattr(self, "latest_safety_ready", False))
+        diagnostics["safety_fault"] = bool(getattr(self, "latest_safety_fault", True))
+        return sanitize_for_json(diagnostics)
 
     def record_runner_event(self, event: str, *, status: str = "ok", **details: Any) -> None:
         record = {
@@ -1457,6 +1801,22 @@ class RosRunMonitor:
     def _on_command(self, topic: str, msg) -> None:
         self.command_events.append(command_event_from_message(topic, msg, receive_time=time.monotonic(), receive_timestamp=self.now()))
 
+    def _on_tactile(self, msg) -> None:
+        self.latest_tactile_receive_time = time.monotonic()
+        self.latest_tactile_valid = bool(getattr(msg, "valid", False)) and getattr(msg, "source", "") == "simulated"
+
+    def _on_safety(self, msg) -> None:
+        self.latest_safety_receive_time = time.monotonic()
+        fault = bool(getattr(msg, "fault", True)) or bool(getattr(msg, "emergency_stop", True))
+        self.latest_safety_fault = fault
+        self.latest_safety_ready = (
+            bool(getattr(msg, "valid", False))
+            and getattr(msg, "state_name", "") in {"ready", "warning"}
+            and not fault
+        )
+        if fault and self._safety_fault_monitor_armed:
+            self.safety_fault_count += 1
+
 
 class ProcessManager:
     def __init__(self, workspace: Path):
@@ -1546,6 +1906,134 @@ def default_config_paths(extra_paths: list[str] | None = None) -> list[str]:
 def output_root_from_config(config: dict[str, Any], override: str = "") -> Path:
     value = override or str(config["evaluation"]["output_root"])
     return Path(value).expanduser().resolve()
+
+
+def validate_development_output_root(path: Path) -> Path:
+    """Accept only user-owned development output parents under the workspace or /tmp."""
+
+    if not isinstance(path, Path):
+        raise OrchestrationError("development output root must be a pathlib.Path")
+    expanded = path.expanduser()
+    lexical = expanded if expanded.is_absolute() else Path.cwd() / expanded
+    resolved = lexical.resolve(strict=False)
+    workspace_results = (Path.cwd() / "evaluation_results").resolve(strict=False)
+    temporary_root = Path("/tmp").resolve(strict=True)
+    if not any(path_is_relative_to(resolved, parent) for parent in (workspace_results, temporary_root)):
+        raise OrchestrationError(
+            "development output root must be beneath the workspace evaluation_results directory or /tmp"
+        )
+    if resolved in {Path("/").resolve(), Path.home().resolve(), temporary_root}:
+        raise OrchestrationError("development output root is too broad")
+    current = Path(lexical.anchor)
+    existing: list[Path] = [current]
+    for part in lexical.parts[1:]:
+        candidate = current / part
+        try:
+            info = candidate.lstat()
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(info.st_mode):
+            raise OrchestrationError(f"development output path contains a symlink: {candidate}")
+        if not stat.S_ISDIR(info.st_mode):
+            raise OrchestrationError(f"development output component is not a directory: {candidate}")
+        existing.append(candidate)
+        current = candidate
+    owned_boundary = workspace_results if path_is_relative_to(resolved, workspace_results) else temporary_root
+    for component in existing:
+        if component == temporary_root:
+            continue
+        if path_is_relative_to(component, owned_boundary) and component.lstat().st_uid != os.geteuid():
+            raise OrchestrationError(
+                f"development output component is not owned by the current user: {component}"
+            )
+    return resolved
+
+
+def acquire_development_ros_domain() -> DevelopmentDomainLease:
+    """Select and retain one apparently unused ROS domain for a development run."""
+
+    root = DEVELOPMENT_DOMAIN_ROOT
+    root.mkdir(mode=0o700, parents=False, exist_ok=True)
+    root_info = root.lstat()
+    if (
+        not root.is_dir()
+        or root.is_symlink()
+        or root_info.st_uid != os.geteuid()
+        or (root_info.st_mode & 0o777) != 0o700
+    ):
+        raise OrchestrationError("development ROS domain lock root has unsafe ownership or mode")
+    first = 100 + (uuid.uuid4().int % 100)
+    for offset in range(100):
+        domain_id = 100 + ((first - 100 + offset) % 100)
+        path = root / f"domain-{domain_id:03d}.lock"
+        descriptor = os.open(
+            path,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            info = os.fstat(descriptor)
+            named = os.stat(path, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or info.st_nlink != 1
+                or (info.st_dev, info.st_ino) != (named.st_dev, named.st_ino)
+            ):
+                raise OrchestrationError("development ROS domain lock identity is unsafe")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(descriptor)
+                continue
+            if development_ros_domain_in_use(domain_id):
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+                continue
+            return DevelopmentDomainLease(domain_id=domain_id, descriptor=descriptor, path=path)
+        except BaseException:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
+    raise OrchestrationError("no unused development ROS domain is available in 100..199")
+
+
+def development_ros_domain_in_use(domain_id: int) -> bool:
+    if type(domain_id) is not int or not 100 <= domain_id <= 199:
+        raise OrchestrationError("development ROS domain must be an integer in 100..199")
+    marker = f"ROS_DOMAIN_ID={domain_id}".encode("ascii")
+    try:
+        process_names = (name for name in os.listdir("/proc") if name.isdecimal())
+    except OSError:
+        process_names = ()
+    for name in process_names:
+        try:
+            values = Path(f"/proc/{name}/environ").read_bytes().split(b"\0")
+        except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+            continue
+        if marker in values:
+            return True
+    lower = 7400 + 250 * domain_id
+    upper = lower + 249
+    for table in (Path("/proc/net/udp"), Path("/proc/net/udp6")):
+        try:
+            lines = table.read_text(encoding="ascii").splitlines()[1:]
+        except (FileNotFoundError, PermissionError, OSError, UnicodeError):
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 2 or ":" not in fields[1]:
+                continue
+            try:
+                port = int(fields[1].rsplit(":", 1)[1], 16)
+            except ValueError:
+                continue
+            if lower <= port <= upper:
+                return True
+    return False
 
 
 def orchestration_settings_from_config(config: dict[str, Any]) -> OrchestrationSettings:
@@ -1674,8 +2162,13 @@ def resolve_result_dir(
     return result
 
 
-def unexpected_command_publishers(publisher_counts: dict[str, int]) -> dict[str, int]:
-    return {topic: count for topic, count in publisher_counts.items() if count > 0}
+def unexpected_command_publishers(
+    publisher_counts: dict[str, int], *, slice_7g_governed: bool = False,
+) -> dict[str, int]:
+    expected = {"/ctr/mppi_command": 0, "/ctr/safe_command": 1} if slice_7g_governed else {
+        "/ctr/mppi_command": 0, "/ctr/safe_command": 0,
+    }
+    return {topic: count for topic, count in publisher_counts.items() if count != expected.get(topic, 0)}
 
 
 def audit_start_receive_time(audit: CommandAudit) -> float:
@@ -1937,6 +2430,8 @@ def build_base_simulation_command(
     mppi_profile: str = "",
     random_seed: int | None = None,
     run_role: str = "",
+    slice_7g_profile: bool = False,
+    development_simulation: bool = False,
 ) -> list[str]:
     command = [
         "ros2",
@@ -1952,6 +2447,20 @@ def build_base_simulation_command(
         f"evaluation_experiment_group:={experiment_group}",
         f"evaluation_controller_label:={controller_label}",
     ]
+    if slice_7g_profile:
+        command.extend(
+            [
+                "slice_7g_profile:=true",
+                "tactile_enabled:=true",
+                "start_safety_supervisor:=true",
+            ]
+        )
+    if development_simulation:
+        if not slice_7g_profile:
+            raise OrchestrationError(
+                "development simulation requires the Slice 7G simulation profile"
+            )
+        command.append("development_simulation:=true")
     if output_root is not None:
         command.append(f"evaluation_output_root:={output_root}")
     if task == TASK_CYLINDER_NAVIGATION:
@@ -2092,8 +2601,103 @@ def fresh_ros_domain_id() -> int:
     return 100 + (uuid.uuid4().int % 100)
 
 
+def slice_7g_domain_from_environment() -> int | None:
+    authorization = os.environ.get(SLICE_7G_AUTHORIZATION_ENV)
+    ledger_identity = os.environ.get(SLICE_7G_LEDGER_ENV)
+    value = os.environ.get("ROS_DOMAIN_ID")
+    if authorization is None and ledger_identity is None:
+        return None
+    if not authorization or not ledger_identity or value is None:
+        raise OrchestrationError("governed Slice 7G environment is missing authorization, ledger, or ROS domain")
+    if not re.fullmatch(r"[0-9a-f]{64}", authorization) or not re.fullmatch(r"[0-9a-f]{64}", ledger_identity):
+        raise OrchestrationError("governed Slice 7G identities must be lowercase SHA-256 values")
+    if not value.isascii() or not value.isdigit():
+        raise OrchestrationError("governed ROS_DOMAIN_ID must be an ASCII integer")
+    domain = int(value)
+    if not 100 <= domain <= 199:
+        raise OrchestrationError("governed ROS_DOMAIN_ID must be in 100..199")
+    return domain
+
+
+def validate_slice_7g_runtime_binding(args: argparse.Namespace, output_root: Path) -> None:
+    """Bind one CLI cell to the coordinator-provided immutable plan context."""
+
+    required = {
+        SLICE_7G_AUTHORIZATION_ENV: os.environ.get(SLICE_7G_AUTHORIZATION_ENV),
+        SLICE_7G_LEDGER_ENV: os.environ.get(SLICE_7G_LEDGER_ENV),
+        SLICE_7G_PLAN_ENV: os.environ.get(SLICE_7G_PLAN_ENV),
+    }
+    for name, value in required.items():
+        if value is None or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise OrchestrationError(f"governed Slice 7G environment has invalid {name}")
+    text_fields = {
+        SLICE_7G_CELL_ENV: os.environ.get(SLICE_7G_CELL_ENV),
+        SLICE_7G_CAMPAIGN_ENV: os.environ.get(SLICE_7G_CAMPAIGN_ENV),
+        SLICE_7G_ROOT_ENV: os.environ.get(SLICE_7G_ROOT_ENV),
+        SLICE_7G_CELL_ROOT_ENV: os.environ.get(SLICE_7G_CELL_ROOT_ENV),
+    }
+    if any(type(value) is not str or not value for value in text_fields.values()):
+        raise OrchestrationError("governed Slice 7G cell/campaign path binding is incomplete")
+    source_to_public = {
+        "centerline_target": "centerline",
+        "lateral_offset_target": "lateral_offset",
+        "near_safety_boundary_target": "near_safety_boundary",
+    }
+    public = source_to_public.get(args.scenario)
+    if public is None or type(args.seed) is not int or args.seed not in {11, 22, 33, 44, 55}:
+        raise OrchestrationError("governed Slice 7G scenario/seed is outside the immutable plan")
+    expected_cell = f"{public}.seed_{args.seed:010d}"
+    if text_fields[SLICE_7G_CELL_ENV] != expected_cell:
+        raise OrchestrationError("governed Slice 7G cell identity differs from argv")
+    if args.experiment_group != text_fields[SLICE_7G_CAMPAIGN_ENV]:
+        raise OrchestrationError("governed Slice 7G campaign ID differs from argv")
+    if args.task != TASK_CURVED_LUMEN_NAVIGATION or args.curved_lumen_type != "circular_arc":
+        raise OrchestrationError("governed Slice 7G task/geometry differs from the immutable plan")
+    if float(args.duration) != 25.0 or args.runtime_mode != "simulation":
+        raise OrchestrationError("governed Slice 7G duration/runtime differs from the immutable plan")
+    campaign_root = text_fields[SLICE_7G_ROOT_ENV]
+    cell_root = text_fields[SLICE_7G_CELL_ROOT_ENV]
+    if str(output_root) != cell_root or cell_root != f"{campaign_root}/cells/{expected_cell}":
+        raise OrchestrationError("governed Slice 7G output root differs from the immutable plan")
+    expected_raw_argv = (
+        "--experiment-group", text_fields[SLICE_7G_CAMPAIGN_ENV],
+        "--task", TASK_CURVED_LUMEN_NAVIGATION,
+        "--curved-lumen-type", "circular_arc",
+        "--scenario", args.scenario,
+        "--seed", str(args.seed),
+        "--duration", "25.0",
+        "--runtime-mode", "simulation",
+        "--output-root", cell_root,
+    )
+    if getattr(args, "_slice_7g_raw_argv", None) != expected_raw_argv:
+        raise OrchestrationError("governed Slice 7G raw argv differs from the immutable plan")
+
+
 def run_environment(domain_id: int) -> dict[str, str]:
-    env = dict(os.environ)
+    governed = slice_7g_domain_from_environment()
+    if governed is not None and governed != domain_id:
+        raise OrchestrationError("lower-level code cannot replace the ledger-bound ROS domain")
+    if governed is not None:
+        permitted = {
+            "PATH", "PYTHONPATH", "AMENT_PREFIX_PATH", "CMAKE_PREFIX_PATH",
+            "LD_LIBRARY_PATH", "RMW_IMPLEMENTATION", "ROS_HOME", "ROS_LOG_DIR",
+            "ROS_LOCALHOST_ONLY", "ROS_DISTRO", "HOME", "XDG_CACHE_HOME",
+            "MPLCONFIGDIR", "PYTHONDONTWRITEBYTECODE", "PYTHONNOUSERSITE", "ROS_DOMAIN_ID",
+            SLICE_7G_AUTHORIZATION_ENV, SLICE_7G_LEDGER_ENV, SLICE_7G_PLAN_ENV,
+            SLICE_7G_CELL_ENV, SLICE_7G_CAMPAIGN_ENV, SLICE_7G_ROOT_ENV,
+            SLICE_7G_CELL_ROOT_ENV, SLICE_7G_CHARTER_ENV, SLICE_7G_LEDGER_REVISION_ENV,
+            SLICE_7G_PROCESS_EVENT_ENV, SLICE_7G_DOMAIN_LEASE_ENV,
+            SLICE_7G_DOMAIN_BINDING_ENV, SLICE_7G_WORKING_DIRECTORY_ENV,
+        }
+        required = permitted - {"CMAKE_PREFIX_PATH"}
+        missing = sorted(key for key in required if key not in os.environ)
+        if missing:
+            raise OrchestrationError(f"governed Slice 7G environment is incomplete: {missing!r}")
+        env = {key: os.environ[key] for key in sorted(permitted) if key in os.environ}
+    else:
+        # Non-governed evaluation retains its historical interactive behavior;
+        # the Slice 7G authority path above never inherits caller extras.
+        env = dict(os.environ)
     env["ROS_DOMAIN_ID"] = str(domain_id)
     log_dir = Path(os.environ.get("ROS_LOG_DIR", f"/tmp/ctr_mppi_ros_log_{domain_id}"))
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -2171,27 +2775,22 @@ def list_process_group(pgid: int) -> list[dict[str, Any]]:
 
 
 def list_processes() -> list[dict[str, Any]]:
-    try:
-        result = subprocess.run(
-            ["ps", "-eo", "pid=,pgid=,stat=,args="],
-            check=True,
-            text=True,
-            capture_output=True,
-            timeout=2.0,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return []
     processes = []
-    for line in result.stdout.splitlines():
-        parts = line.strip().split(maxsplit=3)
-        if len(parts) < 4:
-            continue
+    try:
+        entries = sorted(name for name in os.listdir("/proc") if name.isdecimal())
+    except OSError:
+        return processes
+    for name in entries:
+        pid = int(name)
         try:
-            pid = int(parts[0])
-            pgid = int(parts[1])
-        except ValueError:
+            stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            suffix = stat_text.rsplit(")", 1)[1].strip().split()
+            process_state = suffix[0]
+            pgid = int(suffix[2])
+            args = process_command_line(pid)
+        except (OSError, ValueError, IndexError, UnicodeError):
             continue
-        processes.append({"pid": pid, "pgid": pgid, "stat": parts[2], "args": parts[3]})
+        processes.append({"pid": pid, "pgid": pgid, "stat": process_state, "args": args})
     return processes
 
 

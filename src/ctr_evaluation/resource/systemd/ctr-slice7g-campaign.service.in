@@ -1,0 +1,60 @@
+[Unit]
+Description=CTR Slice 7G exactly-once campaign coordinator
+Requires=ctr-slice7g-authority.service
+After=ctr-slice7g-authority.service
+
+[Service]
+Type=simple
+User=ctr7g-campaign
+Group=ctr7g-runtime
+SupplementaryGroups=
+ExecStart=/usr/bin/python3.10 -I @INSTALLED_RUNTIME_ROOT@/lib/python3.10/site-packages/ctr_evaluation/slice_7g_runtime.py
+WorkingDirectory=@WORKING_DIRECTORY@
+Environment=HOME=/run/ctr-slice7g-campaign/home
+Environment=XDG_CACHE_HOME=/run/ctr-slice7g-campaign/cache
+Environment=MPLCONFIGDIR=/run/ctr-slice7g-campaign/matplotlib
+Environment=PATH=@PATH@
+Environment=PYTHONPATH=@PYTHONPATH@
+Environment=AMENT_PREFIX_PATH=@AMENT_PREFIX_PATH@
+Environment=CMAKE_PREFIX_PATH=@CMAKE_PREFIX_PATH@
+Environment=LD_LIBRARY_PATH=@LD_LIBRARY_PATH@
+Environment=RMW_IMPLEMENTATION=@RMW_IMPLEMENTATION@
+Environment=ROS_HOME=@ROS_HOME@
+Environment=ROS_LOG_DIR=@ROS_LOG_DIR@
+Environment=ROS_LOCALHOST_ONLY=@ROS_LOCALHOST_ONLY@
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONNOUSERSITE=1
+Environment=CTR_SLICE_7G_WORKING_DIRECTORY=@WORKING_DIRECTORY@
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+# ROS 2 DDS is confined to localhost by the authenticated environment, while
+# its middleware still requires local AF_INET/AF_INET6 sockets.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+InaccessiblePaths=/run/systemd/private /run/dbus/system_bus_socket
+ReadOnlyPaths=@INSTALLED_RUNTIME_ROOT@ /etc/ctr-mppi/slice-7g-authority
+ReadWritePaths=/run/ctr-slice7g-campaign /home/ankid/ctr_mppi_evidence/slice_7g
+RuntimeDirectory=ctr-slice7g-campaign
+RuntimeDirectoryMode=0700
+KillMode=control-group
+KillSignal=SIGINT
+FinalKillSignal=SIGKILL
+SendSIGKILL=yes
+TimeoutStopSec=@TOTAL_STOP_TIMEOUT_SECONDS@s
+Delegate=no
+Restart=no

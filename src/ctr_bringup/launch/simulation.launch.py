@@ -7,6 +7,7 @@ from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.substitutions import PythonExpression
 from launch.substitutions import LaunchConfiguration
+from launch.substitutions import PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -20,6 +21,7 @@ CONFIG_NAMES = (
     "safety_params.yaml",
     "tactile_params.yaml",
     "hardware_params.yaml",
+    "slice_7g_runtime_params.yaml",
 )
 REFERENCE_MODES = ("fixed_target", "trajectory", "external_target")
 
@@ -27,6 +29,20 @@ REFERENCE_MODES = ("fixed_target", "trajectory", "external_target")
 def _config_paths():
     config_dir = Path(get_package_share_directory("ctr_bringup")) / "config"
     return validate_config_paths([str(config_dir / name) for name in CONFIG_NAMES])
+
+
+def _config_path_substitutions(config_root):
+    return [PathJoinSubstitution([config_root, name]) for name in CONFIG_NAMES]
+
+
+def _config_path_parameter(config_root):
+    """Preserve each independently resolved file path as a STRING_ARRAY."""
+
+    # Each nested list forces launch_ros to retain one substitution per array element.
+    return ParameterValue(
+        [[path] for path in _config_path_substitutions(config_root)],
+        value_type=list[str],
+    )
 
 
 def _validate_reference_launch_arguments(context, *args, **kwargs):
@@ -39,6 +55,49 @@ def _validate_reference_launch_arguments(context, *args, **kwargs):
     )
     if mode == "external_target" and start_manager:
         raise RuntimeError("reference_mode=external_target cannot be combined with start_reference_manager=true")
+    try:
+        start_safety = parse_launch_bool(
+            LaunchConfiguration("start_safety_supervisor").perform(context), "start_safety_supervisor"
+        )
+    except Exception:
+        # Direct unit tests may call this validator with the pre-7E context.
+        start_safety = False
+    if start_safety and parse_launch_bool(
+        LaunchConfiguration("mppi_publish_safe_for_simulation").perform(context),
+        "mppi_publish_safe_for_simulation",
+    ):
+        raise RuntimeError("start_safety_supervisor=true cannot be combined with mppi_publish_safe_for_simulation=true")
+    if start_safety and parse_launch_bool(
+        LaunchConfiguration("start_manual_command_publisher").perform(context),
+        "start_manual_command_publisher",
+    ):
+        raise RuntimeError("start_safety_supervisor=true cannot be combined with start_manual_command_publisher=true")
+    try:
+        slice_7g = parse_launch_bool(
+            LaunchConfiguration("slice_7g_profile").perform(context),
+            "slice_7g_profile",
+        )
+    except Exception:
+        # Preserve direct legacy validator tests whose synthetic context predates Slice 7G.
+        slice_7g = False
+    if slice_7g:
+        if LaunchConfiguration("runtime_mode").perform(context) != "simulation":
+            raise RuntimeError("slice_7g_profile=true requires runtime_mode=simulation")
+        if not start_safety:
+            raise RuntimeError("slice_7g_profile=true requires start_safety_supervisor=true")
+        if not parse_launch_bool(LaunchConfiguration("tactile_enabled").perform(context), "tactile_enabled"):
+            raise RuntimeError("slice_7g_profile=true requires tactile_enabled=true")
+    try:
+        development = parse_launch_bool(
+            LaunchConfiguration("development_simulation").perform(context),
+            "development_simulation",
+        )
+    except Exception:
+        development = False
+    if development and not slice_7g:
+        raise RuntimeError("development_simulation=true requires slice_7g_profile=true")
+    if development and LaunchConfiguration("runtime_mode").perform(context) != "simulation":
+        raise RuntimeError("development_simulation=true requires runtime_mode=simulation")
     return []
 
 
@@ -46,6 +105,7 @@ def generate_launch_description():
     runtime_mode = LaunchConfiguration("runtime_mode")
     start_manual_command_publisher = LaunchConfiguration("start_manual_command_publisher")
     start_mppi_controller = LaunchConfiguration("start_mppi_controller")
+    start_safety_supervisor = LaunchConfiguration("start_safety_supervisor")
     start_reference_manager = LaunchConfiguration("start_reference_manager")
     reference_mode = LaunchConfiguration("reference_mode")
     reference_type = LaunchConfiguration("reference_type")
@@ -64,6 +124,10 @@ def generate_launch_description():
     cylinder_target_z = LaunchConfiguration("cylinder_target_z")
     mppi_random_seed = LaunchConfiguration("mppi_random_seed")
     run_role = LaunchConfiguration("run_role")
+    tactile_enabled = LaunchConfiguration("tactile_enabled")
+    config_root = LaunchConfiguration("config_root")
+    slice_7g_profile = LaunchConfiguration("slice_7g_profile")
+    development_simulation = LaunchConfiguration("development_simulation")
     cylinder_target_position = ParameterValue(
         [
             [cylinder_target_x],
@@ -109,6 +173,16 @@ def generate_launch_description():
                 "start_mppi_controller",
                 default_value="false",
                 description="Start the Milestone 4 MPPI ROS2 wrapper.",
+            ),
+            DeclareLaunchArgument(
+                "start_safety_supervisor",
+                default_value="false",
+                description="Start the independent CTR safety supervisor.",
+            ),
+            DeclareLaunchArgument(
+                "config_root",
+                default_value=str(Path(get_package_share_directory("ctr_bringup")) / "config"),
+                description="Directory containing the ordered project YAML configuration files.",
             ),
             DeclareLaunchArgument(
                 "start_reference_manager",
@@ -200,6 +274,21 @@ def generate_launch_description():
                 default_value="",
                 description="Optional evaluation run role metadata.",
             ),
+            DeclareLaunchArgument(
+                "tactile_enabled",
+                default_value="false",
+                description="Enable the simulation-only Slice 7B tactile publisher.",
+            ),
+            DeclareLaunchArgument(
+                "slice_7g_profile",
+                default_value="false",
+                description="Apply the authenticated simulation-only Slice 7G effective configuration.",
+            ),
+            DeclareLaunchArgument(
+                "development_simulation",
+                default_value="false",
+                description="Explicit non-production user-level Slice 7G workflow.",
+            ),
             OpaqueFunction(function=_validate_reference_launch_arguments),
             Node(
                 package="ctr_bringup",
@@ -208,7 +297,7 @@ def generate_launch_description():
                 output="screen",
                 parameters=[
                     {
-                        "config_paths": _config_paths(),
+                        "config_paths": _config_path_parameter(config_root),
                         "runtime_mode": ParameterValue(runtime_mode, value_type=str),
                         "enable_hardware_io": False,
                         "reference_mode": ParameterValue(reference_mode, value_type=str),
@@ -219,6 +308,10 @@ def generate_launch_description():
                         "cylinder_profile": ParameterValue(cylinder_profile, value_type=str),
                         "cylinder_target_position": cylinder_target_position,
                         "mppi_random_seed": ParameterValue(mppi_random_seed, value_type=str),
+                        "slice_7g_profile": ParameterValue(slice_7g_profile, value_type=bool),
+                        "development_simulation": ParameterValue(
+                            development_simulation, value_type=bool
+                        ),
                     }
                 ],
             ),
@@ -229,7 +322,7 @@ def generate_launch_description():
                 output="screen",
                 parameters=[
                     {
-                        "config_paths": _config_paths(),
+                        "config_paths": _config_path_parameter(config_root),
                         "runtime_mode": runtime_mode,
                         "target_position": [0.0, 0.0, 0.08],
                         "command_timeout": 0.25,
@@ -237,6 +330,11 @@ def generate_launch_description():
                         "enable_curved_lumen": enable_curved_lumen,
                         "curved_lumen_type": curved_lumen_type,
                         "cylinder_target_position": cylinder_target_position,
+                        "tactile_enabled": ParameterValue(tactile_enabled, value_type=bool),
+                        "slice_7g_profile": ParameterValue(slice_7g_profile, value_type=bool),
+                        "development_simulation": ParameterValue(
+                            development_simulation, value_type=bool
+                        ),
                     }
                 ],
             ),
@@ -256,6 +354,27 @@ def generate_launch_description():
                 ],
             ),
             Node(
+                package="ctr_safety",
+                executable="safety_supervisor_node",
+                name="safety_supervisor",
+                output="screen",
+                condition=IfCondition(start_safety_supervisor),
+                parameters=[
+                    {
+                        "config_paths": _config_path_parameter(config_root),
+                        "runtime_mode": runtime_mode,
+                        "enable_cylindrical_lumen": ParameterValue(enable_cylindrical_lumen, value_type=bool),
+                        "enable_curved_lumen": ParameterValue(enable_curved_lumen, value_type=bool),
+                        "curved_lumen_type": ParameterValue(curved_lumen_type, value_type=str),
+                        "cylinder_target_position": cylinder_target_position,
+                        "slice_7g_profile": ParameterValue(slice_7g_profile, value_type=bool),
+                        "development_simulation": ParameterValue(
+                            development_simulation, value_type=bool
+                        ),
+                    }
+                ],
+            ),
+            Node(
                 package="ctr_mppi_controller",
                 executable="mppi_controller_node",
                 name="mppi_controller",
@@ -263,7 +382,7 @@ def generate_launch_description():
                 condition=IfCondition(start_mppi_controller),
                 parameters=[
                     {
-                        "config_paths": _config_paths(),
+                        "config_paths": _config_path_parameter(config_root),
                         "runtime_mode": runtime_mode,
                         "target_position": [0.0, 0.0, 0.08],
                         "reference_mode": reference_mode,
@@ -275,6 +394,10 @@ def generate_launch_description():
                         "cylinder_profile": cylinder_profile,
                         "cylinder_target_position": cylinder_target_position,
                         "mppi_random_seed": mppi_random_seed,
+                        "slice_7g_profile": ParameterValue(slice_7g_profile, value_type=bool),
+                        "development_simulation": ParameterValue(
+                            development_simulation, value_type=bool
+                        ),
                     }
                 ],
             ),
@@ -286,7 +409,7 @@ def generate_launch_description():
                 condition=reference_manager_condition,
                 parameters=[
                     {
-                        "config_paths": _config_paths(),
+                        "config_paths": _config_path_parameter(config_root),
                         "runtime_mode": runtime_mode,
                         "reference_mode": reference_mode,
                         "reference_type": reference_type,
@@ -307,7 +430,7 @@ def generate_launch_description():
                 condition=IfCondition(start_evaluation),
                 parameters=[
                     {
-                        "config_paths": _config_paths(),
+                        "config_paths": _config_path_parameter(config_root),
                         "runtime_mode": runtime_mode,
                         "experiment_group": evaluation_experiment_group,
                         "controller_label": evaluation_controller_label,
@@ -320,6 +443,10 @@ def generate_launch_description():
                         "cylinder_target_position": cylinder_target_position,
                         "mppi_random_seed": mppi_random_seed,
                         "run_role": run_role,
+                        "slice_7g_profile": ParameterValue(slice_7g_profile, value_type=bool),
+                        "development_simulation": ParameterValue(
+                            development_simulation, value_type=bool
+                        ),
                     }
                 ],
             ),

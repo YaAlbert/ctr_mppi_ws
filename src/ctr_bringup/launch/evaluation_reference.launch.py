@@ -18,6 +18,7 @@ CONFIG_NAMES = (
     "safety_params.yaml",
     "tactile_params.yaml",
     "hardware_params.yaml",
+    "slice_7g_runtime_params.yaml",
 )
 
 

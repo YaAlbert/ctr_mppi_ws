@@ -27,6 +27,16 @@ mppi:
     joint_limit: 100000.0
     stability: 0.0
 
+  tactile:
+    enabled: false
+    max_age_s: 0.10
+    force_saturation_n: 10.0
+    proximity_margin_m: 0.0020
+    no_contact_multiplier: 0.0
+    contact_multiplier: 1.0
+    warning_multiplier: 2.0
+    stop_multiplier: 4.0
+
   convergence:
     tip_tolerance: 0.002
     shape_tolerance: 0.003

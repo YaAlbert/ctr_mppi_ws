@@ -24,6 +24,7 @@ from ctr_mppi_controller.cylindrical_lumen import (  # noqa: E402
     lumen_geometry_from_config,
 )
 from ctr_mppi_controller.mppi_core import MPPICore  # noqa: E402
+from ctr_mppi_controller.tactile_cost import REGION_CONTACT, snapshot_from_values  # noqa: E402
 from ctr_sim.simulation_core import CTRSimulationCore  # noqa: E402
 
 
@@ -162,6 +163,49 @@ class MPPICoreTest(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(rollout.final_q)))
         self.assertTrue(np.all(np.isfinite(rollout.final_tip)))
         self.assertTrue(np.isfinite(rollout.cost))
+
+    def test_tactile_cost_changes_relative_rollout_cost_and_weights(self):
+        config = make_test_config()
+        config["mppi"]["tactile"]["enabled"] = True
+        config["mppi"]["weights"]["force"] = 10.0
+        config["mppi"]["horizon"] = 2
+        config["mppi"]["num_samples"] = 2
+        config["mppi"]["dt"] = 1.0
+
+        class TipClearance:
+            safety_margin = 0.002
+
+            def validate_target(self, *_args, **_kwargs):
+                return SimpleNamespace(valid=True)
+
+            def point_clearance(self, point):
+                return SimpleNamespace(physical_clearance=0.002 - abs(float(point[0])))
+
+        core = MPPICore(
+            config,
+            FirstThreeJointTipModel(),
+            lumen_geometry=TipClearance(),
+            lumen_cost_weights=LumenCostWeights(0.0, 0.0, 0.0, 0.0),
+        )
+        snapshot = snapshot_from_values(
+            timestamp_s=1.0, frame_id="base_link", source="simulated", valid=True,
+            contact=True, warning=False, stop=False, region=REGION_CONTACT, force_magnitude_n=1.0,
+        )
+        safe_sequence = np.zeros((2, 6), dtype=float)
+        near_wall_sequence = np.zeros((2, 6), dtype=float)
+        near_wall_sequence[:, 0] = 0.001
+        safe = core.rollout_candidate(
+            q0=np.zeros(6), sequence=safe_sequence, previous_command=np.zeros(6),
+            target_tip=np.zeros(3), tactile_snapshot=snapshot,
+        )
+        near = core.rollout_candidate(
+            q0=np.zeros(6), sequence=near_wall_sequence, previous_command=np.zeros(6),
+            target_tip=np.zeros(3), tactile_snapshot=snapshot,
+        )
+        self.assertGreater(near.tactile_cost, safe.tactile_cost)
+        weights = core.normalized_importance_weights(np.array([safe.cost, near.cost]))
+        self.assertNotEqual(float(weights[0]), float(weights[1]))
+        self.assertTrue(np.all(np.isfinite(weights)))
 
     def test_normalized_importance_weights(self):
         _, _, controller = make_controller()

@@ -34,6 +34,8 @@ class ParameterValidatorNode(Node):
         self.declare_parameter("cylinder_profile", "")
         self.declare_parameter("cylinder_target_position", Parameter.Type.DOUBLE_ARRAY)
         self.declare_parameter("mppi_random_seed", "")
+        self.declare_parameter("slice_7g_profile", False)
+        self.declare_parameter("development_simulation", False)
 
         config_paths = validate_config_paths(self.get_parameter("config_paths").value, required=True)
         runtime_mode = self.get_parameter("runtime_mode").value
@@ -56,6 +58,8 @@ class ParameterValidatorNode(Node):
             cylinder_target_position=self.get_parameter("cylinder_target_position").value,
             mppi_profile=self.get_parameter("cylinder_profile").value,
             mppi_random_seed=self.get_parameter("mppi_random_seed").value,
+            slice_7g_profile=self.get_parameter("slice_7g_profile").value,
+            development_simulation=self.get_parameter("development_simulation").value,
         )
         validate_or_raise(config)
         missing_sections = sorted(set(REQUIRED_SECTIONS) - set(config.keys()))

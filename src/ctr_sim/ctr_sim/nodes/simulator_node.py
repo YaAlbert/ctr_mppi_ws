@@ -20,8 +20,12 @@ from ctr_bringup.parameter_validation import (
     validate_config_paths,
     validate_or_raise,
 )
+from ctr_bringup.slice_7g_profile import (
+    apply_slice_7g_development_simulation_profile,
+    apply_slice_7g_simulation_profile,
+)
 from ctr_bringup.placeholder_node import run_node_until_shutdown
-from ctr_interfaces.msg import CtrBackbone, CtrJointCommand, CtrJointState, CtrState
+from ctr_interfaces.msg import CtrBackbone, CtrJointCommand, CtrJointState, CtrState, CtrTactileState
 from ctr_model.approximate_model import ApproximateCTRModel
 from ctr_mppi_controller.curved_lumen import CurvedLumen
 from ctr_mppi_controller.cylindrical_lumen import CylindricalLumen, goal_position_from_config
@@ -44,6 +48,8 @@ from ctr_sim.lumen_markers import (
 )
 from ctr_sim.lumen_diagnostics import LumenRuntimeDiagnostic, build_lumen_runtime_diagnostic
 from ctr_sim.simulation_core import CTRSimulationCore
+from ctr_tactile.simulated_tactile import SimulatedTactileParameters, simulate_tactile
+from ctr_tactile.tactile_processing import TactileProcessor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 
@@ -61,6 +67,9 @@ class CTRSimulatorNode(Node):
         self.declare_parameter("enable_curved_lumen", False)
         self.declare_parameter("curved_lumen_type", "")
         self.declare_parameter("cylinder_target_position", Parameter.Type.DOUBLE_ARRAY)
+        self.declare_parameter("tactile_enabled", False)
+        self.declare_parameter("slice_7g_profile", False)
+        self.declare_parameter("development_simulation", False)
 
         config_paths = validate_config_paths(self.get_parameter("config_paths").value)
 
@@ -79,6 +88,22 @@ class CTRSimulatorNode(Node):
             enable_curved_lumen=enable_curved_lumen,
             curved_lumen_type=str(self.get_parameter("curved_lumen_type").value or ""),
             target=_optional_vector3_parameter(self.get_parameter("cylinder_target_position").value),
+        )
+        self.config.setdefault("runtime", {})["mode"] = str(
+            self.get_parameter("runtime_mode").value
+        )
+        slice_7g_enabled = parse_launch_bool(
+            self.get_parameter("slice_7g_profile").value,
+            "slice_7g_profile",
+        )
+        development_enabled = parse_launch_bool(
+            self.get_parameter("development_simulation").value,
+            "development_simulation",
+        )
+        self.config = (
+            apply_slice_7g_development_simulation_profile(self.config, enabled=True)
+            if development_enabled
+            else apply_slice_7g_simulation_profile(self.config, enabled=slice_7g_enabled)
         )
         validate_or_raise(self.config)
         self.lumen_mode = lumen_mode_from_config(self.config)
@@ -101,6 +126,16 @@ class CTRSimulatorNode(Node):
         )
         self.lumen_geometry = lumen_geometry_from_config(self.config)
         self.lumen = self.lumen_geometry
+        self.tactile_enabled = slice_7g_enabled or parse_launch_bool(
+            self.get_parameter("tactile_enabled").value,
+            "tactile_enabled",
+        )
+        self.tactile_parameters = (
+            SimulatedTactileParameters.from_mapping(self.config) if self.tactile_enabled else None
+        )
+        self.tactile_processor = (
+            TactileProcessor.from_mapping(self.config) if self.tactile_enabled else None
+        )
         self._static_lumen_cache_key = None
         self._static_lumen_markers: list[Marker] = []
         self._static_lumen_marker_keys: tuple[tuple[str, int], ...] = ()
@@ -137,6 +172,11 @@ class CTRSimulatorNode(Node):
         self.backbone_pub = self.create_publisher(CtrBackbone, "/ctr/backbone", 10)
         self.tip_pub = self.create_publisher(PoseStamped, "/ctr/tip", 10)
         self.state_pub = self.create_publisher(CtrState, "/ctr/state", 10)
+        self.tactile_pub = (
+            self.create_publisher(CtrTactileState, "/ctr/tactile/state", 10)
+            if self.tactile_enabled
+            else None
+        )
         self.diagnostics_pub = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
         self.marker_pub = self.create_publisher(MarkerArray, "/ctr/visualization", 10)
 
@@ -191,6 +231,8 @@ class CTRSimulatorNode(Node):
         self.backbone_pub.publish(self._backbone_msg(stamp, backbone_points))
         self.tip_pub.publish(tip_pose)
         self.state_pub.publish(self._state_msg(stamp, step.q, step.q_dot, backbone_points, tip_pose))
+        if self.tactile_pub is not None:
+            self.tactile_pub.publish(self._tactile_msg(stamp, model_result.tip_position))
         self.diagnostics_pub.publish(self._diagnostics_msg(stamp, command_age, model_result.diagnostic_status))
         self.marker_pub.publish(self._marker_array_msg(stamp, backbone_points, model_result.backbone_points))
 
@@ -258,6 +300,38 @@ class CTRSimulatorNode(Node):
         msg.contact = False
         msg.valid = True
         msg.diagnostic_status = self.last_diagnostic_status
+        return msg
+
+    def _tactile_msg(self, stamp, tip_position: np.ndarray) -> CtrTactileState:
+        if self.lumen is None:
+            sample = simulate_tactile(None, self.tactile_parameters)
+        else:
+            clearance = self.lumen.point_clearance(tip_position).physical_clearance
+            sample = simulate_tactile(clearance, self.tactile_parameters)
+        processed = self.tactile_processor.process(
+            [sample.raw_signal] if sample.valid else None,
+            clearance_m=sample.clearance_m,
+            geometric_contact=sample.contact,
+            timestamp_s=stamp.sec + stamp.nanosec * 1e-9,
+        )
+
+        msg = CtrTactileState()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.frame_id
+        msg.raw_values = [float(sample.raw_signal)]
+        msg.filtered_values = [float(processed.filtered_signal)]
+        msg.force.x = 0.0
+        msg.force.y = 0.0
+        msg.force.z = 0.0
+        msg.force_magnitude = float(processed.force_n)
+        msg.contact = bool(processed.contact)
+        msg.warning = bool(processed.warning)
+        msg.stop = bool(processed.stop)
+        msg.valid = bool(processed.valid)
+        msg.diagnostic_status = processed.diagnostic_status
+        msg.clearance_m = float(processed.clearance_m)
+        msg.source = "simulated"
+        msg.region = int(processed.region)
         return msg
 
     def _diagnostics_msg(self, stamp, command_age: float, model_status: str) -> DiagnosticArray:

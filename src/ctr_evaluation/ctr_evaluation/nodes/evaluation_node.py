@@ -14,8 +14,18 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path as NavPath
 
 from ctr_bringup.parameter_validation import load_parameter_files, validate_config_paths, validate_or_raise
+from ctr_bringup.slice_7g_profile import (
+    apply_slice_7g_development_simulation_profile,
+    apply_slice_7g_simulation_profile,
+)
 from ctr_evaluation.experiment_recorder import EvaluationRecorderConfig, ExperimentRecorder, STATE_RECORDING
-from ctr_interfaces.msg import CtrControllerMetrics, CtrJointCommand, CtrState
+from ctr_interfaces.msg import (
+    CtrControllerMetrics,
+    CtrJointCommand,
+    CtrSafetyStatus,
+    CtrState,
+    CtrTactileState,
+)
 from ctr_interfaces.srv import StartExperiment, StopExperiment
 from ctr_mppi_controller.lumen_factory import config_with_lumen_overrides
 from rclpy.node import Node
@@ -44,6 +54,8 @@ class EvaluationNode(Node):
         self.declare_parameter("cylinder_target_position", Parameter.Type.DOUBLE_ARRAY)
         self.declare_parameter("mppi_random_seed", -1)
         self.declare_parameter("run_role", "")
+        self.declare_parameter("slice_7g_profile", False)
+        self.declare_parameter("development_simulation", False)
 
         config_paths = validate_config_paths(self.get_parameter("config_paths").value)
         raw_config = load_parameter_files(config_paths)
@@ -58,6 +70,19 @@ class EvaluationNode(Node):
         )
         runtime_mode = str(self.get_parameter("runtime_mode").value)
         self.project_config.setdefault("runtime", {})["mode"] = runtime_mode
+        development_enabled = _bool_value(
+            self.get_parameter("development_simulation").value
+        )
+        self.project_config = (
+            apply_slice_7g_development_simulation_profile(
+                self.project_config, enabled=True
+            )
+            if development_enabled
+            else apply_slice_7g_simulation_profile(
+                self.project_config,
+                enabled=_bool_value(self.get_parameter("slice_7g_profile").value),
+            )
+        )
         output_root = str(self.get_parameter("output_root").value or "")
         if output_root:
             self.project_config.setdefault("evaluation", {})["output_root"] = output_root
@@ -110,6 +135,24 @@ class EvaluationNode(Node):
             DiagnosticArray,
             "/diagnostics",
             lambda msg: self.recorder.record_topic("/diagnostics"),
+            10,
+        )
+        self.tactile_sub = self.create_subscription(
+            CtrTactileState,
+            "/ctr/tactile/state",
+            lambda msg: self.recorder.record_slice_7g_tactile(
+                valid=bool(msg.valid), source=str(msg.source),
+            ),
+            10,
+        )
+        self.safety_status_sub = self.create_subscription(
+            CtrSafetyStatus,
+            "/ctr/safety/status",
+            lambda msg: self.recorder.record_slice_7g_safety(
+                valid=bool(msg.valid),
+                fault=bool(msg.fault),
+                emergency_stop=bool(msg.emergency_stop),
+            ),
             10,
         )
 

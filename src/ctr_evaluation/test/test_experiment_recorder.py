@@ -175,6 +175,22 @@ def strict_json_load(path: Path):
 
 
 class ExperimentRecorderTest(unittest.TestCase):
+    def test_slice_7g_fault_accounting_starts_with_recording_window(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = make_recorder(temp_dir)
+            recorder.record_slice_7g_tactile(valid=False, source="unknown")
+            recorder.record_slice_7g_safety(valid=False, fault=True, emergency_stop=True)
+            self.assertEqual(0, recorder.slice_7g_tactile_invalid_count)
+            self.assertEqual(0, recorder.slice_7g_safety_fault_count)
+            self.assertEqual(1, recorder.topic_counts["/ctr/tactile/state"])
+            self.assertEqual(1, recorder.topic_counts["/ctr/safety/status"])
+
+            recorder.lifecycle_state = STATE_RECORDING
+            recorder.record_slice_7g_tactile(valid=False, source="unknown")
+            recorder.record_slice_7g_safety(valid=False, fault=True, emergency_stop=True)
+            self.assertEqual(1, recorder.slice_7g_tactile_invalid_count)
+            self.assertEqual(1, recorder.slice_7g_safety_fault_count)
+
     def test_recorder_promotes_authoritative_curved_identity(self):
         scenario = {
             "target_mode": "fixed_target",

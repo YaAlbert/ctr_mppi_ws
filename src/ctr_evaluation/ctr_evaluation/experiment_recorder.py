@@ -1037,6 +1037,8 @@ class ExperimentRecorder:
         self.backbone_records: list[dict[str, Any]] = []
         self.initial_state_q: list[float] | None = None
         self.initial_tip_position: list[float] | None = None
+        self.slice_7g_safety_fault_count = 0
+        self.slice_7g_tactile_invalid_count = 0
 
     def _reject_existing_run_id(self, run_id: str) -> None:
         group_dir = self.config.output_root / self.config.experiment_group
@@ -1617,6 +1619,31 @@ class ExperimentRecorder:
     def record_topic(self, topic: str) -> None:
         self.topic_counts[topic] = self.topic_counts.get(topic, 0) + 1
 
+    def record_slice_7g_tactile(self, *, valid: bool, source: str) -> None:
+        """Retain Slice 7G tactile topic presence and invalid-sample accounting."""
+
+        self.record_topic("/ctr/tactile/state")
+        if self.lifecycle_state != STATE_RECORDING:
+            return
+        if type(valid) is not bool or type(source) is not str or not valid or source != "simulated":
+            self.slice_7g_tactile_invalid_count += 1
+
+    def record_slice_7g_safety(self, *, valid: bool, fault: bool, emergency_stop: bool) -> None:
+        """Retain supervisor status; only recording-window faults count toward acceptance."""
+
+        self.record_topic("/ctr/safety/status")
+        if self.lifecycle_state != STATE_RECORDING:
+            return
+        if (
+            type(valid) is not bool
+            or type(fault) is not bool
+            or type(emergency_stop) is not bool
+            or not valid
+            or fault
+            or emergency_stop
+        ):
+            self.slice_7g_safety_fault_count += 1
+
     def _accept_sample(self, topic: str) -> bool:
         if self.lifecycle_state != STATE_RECORDING:
             return False
@@ -1844,7 +1871,11 @@ class ExperimentRecorder:
             experiment_wall_duration=float(metadata["actual_duration"]),
             valid_aligned_evaluation_duration=valid_duration,
         )
-        missing_topic_count = sum(1 for topic in required_topics() if self.topic_counts.get(topic, 0) == 0)
+        slice_7g_profile = self.project_config.get("runtime", {}).get("slice_7g_profile") is True
+        missing_topic_count = sum(
+            1 for topic in required_topics(slice_7g_profile=slice_7g_profile)
+            if self.topic_counts.get(topic, 0) == 0
+        )
         numerical = NumericalSafetyMetrics(
             nonfinite_state_samples=self.invalid_counts["state"],
             nonfinite_reference_samples=self.invalid_counts["reference"],
@@ -1942,6 +1973,13 @@ class ExperimentRecorder:
             summary["motion"] = dataclass_to_plain(motion)
         summary["alignment_rejection_reasons"] = alignment.diagnostics.rejection_reasons
         summary["topic_status"] = self._topic_status()
+        if slice_7g_profile:
+            summary["slice_7g_safety"] = {
+                "fault_count": int(self.slice_7g_safety_fault_count),
+            }
+            summary["slice_7g_tactile"] = {
+                "invalid_sample_count": int(self.slice_7g_tactile_invalid_count),
+            }
         if lumen_result is not None and lumen_result.required and lumen_result.section is not None:
             summary["lumen_evaluation"] = lumen_result.section
             summary["navigation"] = _curved_navigation_summary(lumen_result.section, goal_metrics)
@@ -3051,8 +3089,11 @@ def observed_topics() -> tuple[str, ...]:
     )
 
 
-def required_topics() -> tuple[str, ...]:
-    return ("/ctr/state", "/ctr/reference/tip")
+def required_topics(*, slice_7g_profile: bool = False) -> tuple[str, ...]:
+    topics = ("/ctr/state", "/ctr/reference/tip")
+    if slice_7g_profile:
+        topics += ("/ctr/tip", "/ctr/tactile/state", "/ctr/safety/status", "/ctr/safe_command")
+    return topics
 
 
 def sanitize_name(value: str) -> str:
