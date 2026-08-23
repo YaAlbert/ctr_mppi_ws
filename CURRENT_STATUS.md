@@ -124,8 +124,10 @@ predecessor only and is explicitly rejected by the v2-only build verifier; it
 is not silently upgraded from current filesystem modes. No durable v2 artifact
 has been created.
 This is source and unit/static-test status only.
-No build, ROS execution, domain lease, campaign attempt, acceptance result or
-promotion has been authorized or completed.
+No production authority installation, governed ROS observer execution, domain
+lease, campaign attempt, acceptance result, or promotion has been authorized
+or completed. The separate non-production development build and simulator run
+are recorded below.
 
 ## Slice 7G development-simulation result
 
