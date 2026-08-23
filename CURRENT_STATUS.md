@@ -140,8 +140,9 @@ services or the production budget. The mode validates that runtime mode is
 safe user-owned roots, and labels every result as non-production evidence.
 
 On 2026-08-23 the eight requested packages built successfully in an isolated,
-non-symlink install. A practical package/launch/runtime test selection passed
-870 tests, followed by focused regression checks. One 5-second seed-11 smoke
+non-symlink install. After the profile-guided optimization described below, a
+practical package/launch/runtime test selection passed 882 tests. One 5-second
+seed-11 smoke
 pair and 25-second pairs for seeds 11, 22, and 33 all reached readiness,
 published commands and changing state, completed valid baseline/candidate
 comparisons, recorded zero collision/safety/tactile events, and left no owned
@@ -151,10 +152,27 @@ The batch used independently selected ROS domains 186, 197, 194, and 126.
 Results are under
 `evaluation_results/slice_7g_development_20260823T005500Z/`.
 
-RViz was also launched successfully on domain 166 with the curved-lumen
-markers, CTR visualization, reference path, and tip display. This development
-run created no production authority, budget, evidence seal, or attempt and is
-not a Slice 7G promotion result.
+The unchanged 36-sample, seven-step `cylinder_fast` profile was then optimized
+without changing its horizon, sample count, weights, or production defaults.
+NumPy batch projection replaced the per-backbone-point curved-lumen loop,
+immutable model limits/scales are cached, and the deterministic final rollout
+result is reused for terminal costs. Eight-solve profiling reduced mean MPPI
+solve time from 1.4669 s to 0.3702 s. Repeated 25-second simulator runs raised
+mean effective solve frequency from 0.3373 Hz to 1.2969 Hz across seeds 11, 22,
+and 33, while mean trajectory RMSE improved from 0.004058 m to 0.002462 m,
+mean minimum wall clearance increased from 0.025437 m to 0.026922 m, and all
+three runs retained zero collisions and clean orchestration cleanup. The
+controller is still not claimed to be real time. Results and four RViz captures
+are under
+`evaluation_results/slice_7g_performance_optimized_20260823T014418Z/`.
+
+RViz was also launched successfully with the curved-lumen markers, CTR
+visualization, reference path, tip display, and OK global status. One first-run
+Ctrl-C produced a transient safety-node SIGSEGV, but two immediate repeat
+launches shut down every node cleanly and no run left a child process; the
+non-reproduced shutdown event remains a low-priority reliability follow-up.
+This development run created no production authority, budget, evidence seal,
+or attempt and is not a Slice 7G promotion result.
 
 ## Ubuntu environment and build-readiness summary
 
