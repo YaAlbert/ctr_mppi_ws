@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import math
 import os
 import signal
@@ -7,7 +8,9 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
+from types import SimpleNamespace
 
 import yaml
 
@@ -28,6 +31,8 @@ from ctr_evaluation.run_evaluation import (  # noqa: E402
     OrchestrationError,
     OrchestrationSettings,
     ProcessManager,
+    RosRunMonitor,
+    StabilityStats,
     StateTipSample,
     build_controller_configuration_hash,
     build_base_simulation_command,
@@ -173,6 +178,637 @@ def write_metadata(run_dir, *, orchestration_id="orch", run_role="baseline"):
 
 
 class RunEvaluationHelpersTest(unittest.TestCase):
+    def run_one_with_fake_runtime(
+        self,
+        stop_actions,
+        *,
+        pre_stop_error=None,
+        cleanup=None,
+        metadata_write_error=False,
+    ):
+        import ctr_evaluation.run_evaluation as module
+
+        class FakeRecord:
+            def __init__(self, role):
+                self.role = role
+                self.identity = SimpleNamespace(pid=1234)
+
+            def to_dict(self):
+                return {"role": self.role, "pid": self.identity.pid}
+
+        class FakeProcessManager:
+            def __init__(self):
+                self.start_calls = []
+                self.shutdown_calls = 0
+                self.audit_calls = 0
+
+            def start(self, *, role, command, env):
+                self.start_calls.append(role)
+                return FakeRecord(role)
+
+            def shutdown_all(self, records, settings):
+                self.shutdown_calls += 1
+
+            def audit_cleanup(self, records):
+                self.audit_calls += 1
+                return cleanup or {"clean": True, "records": []}
+
+        class FakeMonitor:
+            def __init__(self, actions):
+                self.stop_actions = list(actions)
+                self.stop_calls = 0
+                self.events = []
+                self.now_calls = 0
+
+            def record_runner_event(self, event, **details):
+                self.events.append((event, details))
+
+            def set_diagnostic_settings(self, settings):
+                pass
+
+            def wait_for_services(self, timeout):
+                pass
+
+            def wait_for_state_tip(self, timeout):
+                pass
+
+            def command_publisher_counts(self):
+                return {"/ctr/mppi_command": 0, "/ctr/safe_command": 0}
+
+            def command_audit_since_now(self, publisher_counts):
+                return CommandAudit(publisher_counts=publisher_counts)
+
+            def spin_for(self, duration):
+                pass
+
+            def collect_stability_samples(self, *, duration_s, timeout_s, minimum_samples):
+                return stable_samples(minimum_samples)
+
+            def record_stability_result(self, samples, stability, entry_time):
+                pass
+
+            def command_events_since(self, receive_time):
+                return []
+
+            def now(self):
+                self.now_calls += 1
+                return 1.0 if self.now_calls == 1 else 3.0
+
+            def start_experiment(self, *, experiment_name, metadata, timeout_s):
+                return "run_1"
+
+            def wait_for_reference(self, timeout, *, require_horizon):
+                if pre_stop_error is not None:
+                    raise pre_stop_error
+
+            def verify_fixed_reference_target(self, target, atol):
+                pass
+
+            def spin_until_time(self, target):
+                pass
+
+            def wait_for_first_command(self, timeout):
+                return CommandEvent("/ctr/mppi_command", 1.1, "fake", 1.1, [0.0] * 6)
+
+            def stop_experiment(self, *, timeout_s):
+                self.stop_calls += 1
+                action = self.stop_actions.pop(0)
+                if isinstance(action, Exception):
+                    raise action
+                if action == "__response__":
+                    return f"completed evaluation run run_1: {self.response_path}"
+                return action
+
+            def readiness_diagnostics(self):
+                return {"evaluated_sample_count": 10, "evaluated_receive_time_span_s": 0.5}
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_dir = root / "fake_group" / "run_1"
+            write_metadata(run_dir, orchestration_id="orch", run_role="candidate")
+            (run_dir / "summary.json").write_text(json.dumps(summary()), encoding="utf-8")
+            (run_dir / "report.md").write_text("# report\n", encoding="utf-8")
+            monitor = FakeMonitor(stop_actions)
+            monitor.response_path = run_dir
+            process_manager = FakeProcessManager()
+            orchestrator = object.__new__(EvaluationOrchestrator)
+            orchestrator.args = SimpleNamespace(
+                task="cylinder_navigation",
+                duration=1.0,
+                trajectory="circle",
+                baseline="zero_command",
+                candidate="mppi",
+                mppi_profile="",
+                seed=11,
+            )
+            orchestrator.output_root = root
+            orchestrator.experiment_group = "fake_group"
+            orchestrator.orchestration_id = "orch"
+            orchestrator.curved_lumen_type = "circular_arc"
+            orchestrator.settings = settings()
+            orchestrator.process_manager = process_manager
+            orchestrator._fresh_domain_id = lambda: 7
+            orchestrator._target_position_for_launch = lambda: [0.01, 0.0, 0.1]
+            orchestrator._start_metadata = mock.Mock(return_value={})
+            orchestrator._reference_command = mock.Mock(return_value=["reference"])
+            orchestrator._controller_command = mock.Mock(return_value=["controller"])
+            orchestrator._runtime_metadata = mock.Mock(
+                return_value={
+                    "reference_matches_requested_target": True,
+                    "requested_target": [0.01, 0.0, 0.1],
+                    "executed_target": [0.01, 0.0, 0.1],
+                    "target_replaced": False,
+                    "target_identity_valid": True,
+                }
+            )
+
+            real_write_json = module.write_json
+
+            def write_json_with_failure(path, data):
+                if metadata_write_error and Path(path).name == "orchestration.json":
+                    raise RuntimeError("metadata write failed")
+                return real_write_json(path, data)
+
+            stable = StabilityStats(
+                stable=True,
+                reason="stable",
+                first_q=[0.0] * 6,
+                first_tip=[0.0, 0.0, 0.08],
+                mean_q_variation=0.0,
+                max_q_variation=0.0,
+                mean_tip_variation=0.0,
+                max_tip_variation=0.0,
+                sample_count=10,
+                consecutive_stable_samples=10,
+                duration_s=0.5,
+            )
+            with mock.patch.object(module, "run_environment", return_value={}), \
+                mock.patch.object(module, "build_base_simulation_command", return_value=["base"]), \
+                mock.patch.object(module, "RosRunMonitor", return_value=monitor), \
+                mock.patch.object(module, "build_run_id", return_value="run_1"), \
+                mock.patch.object(module, "process_name_running", return_value=False), \
+                mock.patch.object(module, "simulator_command_timeout", return_value=0.0), \
+                mock.patch.object(module.time, "sleep"), \
+                mock.patch.object(module, "compute_initial_stability", return_value=stable), \
+                mock.patch.object(module, "write_json", side_effect=write_json_with_failure):
+                try:
+                    result = orchestrator._run_one(role="candidate", controller_label="mppi", baseline_dir=None)
+                    error = None
+                except Exception as exc:
+                    result = None
+                    error = exc
+
+            persisted = None
+            metadata_path = run_dir / "orchestration.json"
+            if metadata_path.is_file():
+                persisted = json.loads(metadata_path.read_text(encoding="utf-8"))
+            return result, error, persisted, monitor, process_manager
+
+    def diagnostic_monitor(self):
+        monitor = object.__new__(RosRunMonitor)
+        monitor._diagnostic_settings = settings()
+        monitor._diagnostics = {
+            "state_callback_count": 13,
+            "tip_callback_count": 13,
+            "state_callback_count_before_collection": 3,
+            "tip_callback_count_before_collection": 3,
+            "state_callback_count_during_collection": 10,
+            "tip_callback_count_during_collection": 10,
+            "stability_collection_start_monotonic": 10.0,
+            "stability_deadline_monotonic": 11.0,
+            "stability_collection_end_monotonic": 10.7,
+            "evaluated_samples": [],
+            "evaluated_sample_count": 0,
+            "first_evaluated_sample_receive_monotonic": None,
+            "last_evaluated_sample_receive_monotonic": None,
+            "evaluated_receive_time_span_s": None,
+            "criteria": None,
+            "readiness_result": None,
+            "readiness_failure_reason": None,
+        }
+        monitor._state_callback_sequence = 0
+        monitor._readiness_state_queue = []
+        monitor._readiness_collection_active = False
+        return monitor
+
+    def collect_with_batches(self, batches, *, pre_window=False, duration=0.5, minimum_samples=10):
+        monitor = self.diagnostic_monitor()
+        monitor._state_callback_sequence = 5
+        if pre_window:
+            monitor._readiness_state_queue = [(5, stable_samples(1)[0])]
+        batch_index = 0
+
+        def spin_once(_timeout):
+            nonlocal batch_index
+            if batch_index < len(batches):
+                for sample in batches[batch_index]:
+                    monitor._state_callback_sequence += 1
+                    monitor._readiness_state_queue.append((monitor._state_callback_sequence, sample))
+                batch_index += 1
+
+        monitor.spin_once = spin_once
+        clock_value = 0.0
+
+        def monotonic():
+            nonlocal clock_value
+            value = clock_value
+            clock_value += 0.1
+            return value
+
+        with mock.patch("ctr_evaluation.run_evaluation.time.monotonic", side_effect=monotonic):
+            return monitor, monitor.collect_stability_samples(
+                duration_s=duration,
+                timeout_s=10.0,
+                minimum_samples=minimum_samples,
+            )
+
+    def test_collection_excludes_pre_window_state_and_counts_each_new_callback(self):
+        batches = [[sample] for sample in stable_samples(8)]
+        monitor, samples = self.collect_with_batches(batches, pre_window=True)
+        self.assertEqual(8, len(samples))
+        self.assertEqual(8, monitor.readiness_diagnostics()["evaluated_sample_count"])
+        self.assertEqual(5, monitor.readiness_diagnostics()["stability_collection_state_sequence"])
+
+    def test_collection_waits_for_sample_count_after_duration(self):
+        samples = stable_samples(12)
+        samples = [StateTipSample(item.timestamp, item.q, item.tip, 0.0 if i == 0 else 0.6 + i * 0.01) for i, item in enumerate(samples)]
+        monitor, collected = self.collect_with_batches([[item] for item in samples])
+        self.assertEqual(10, len(collected))
+        self.assertTrue(monitor.readiness_diagnostics()["evaluated_receive_time_span_s"] >= 0.5)
+
+    def test_collection_waits_for_duration_after_sample_count(self):
+        samples = stable_samples(60)
+        samples = [StateTipSample(item.timestamp, item.q, item.tip, i * 0.01) for i, item in enumerate(samples)]
+        monitor, collected = self.collect_with_batches([[item] for item in samples])
+        self.assertGreaterEqual(len(collected), 50)
+        self.assertGreaterEqual(monitor.readiness_diagnostics()["evaluated_receive_time_span_s"], 0.5)
+
+    def test_collection_passes_only_after_both_requirements(self):
+        samples = stable_samples(10)
+        samples = [StateTipSample(item.timestamp, item.q, item.tip, i * (0.5 / 9.0)) for i, item in enumerate(samples)]
+        monitor, collected = self.collect_with_batches([[item] for item in samples])
+        stats = compute_initial_stability(collected, settings())
+        monitor.record_stability_result(collected, stats, 1.0)
+        diagnostics = monitor.readiness_diagnostics()
+        self.assertEqual(10, len(collected))
+        self.assertEqual({"finite_values": True, "sample_count": True, "duration": True, "q_variation": True, "tip_variation": True}, diagnostics["criteria"])
+        self.assertTrue(stats.stable)
+
+    def test_collection_timeout_preserves_sample_and_duration_failures(self):
+        samples = stable_samples(8)
+        samples = [StateTipSample(item.timestamp, item.q, item.tip, i * 0.01) for i, item in enumerate(samples)]
+        monitor, collected = self.collect_with_batches([[item] for item in samples])
+        stats = compute_initial_stability(collected, settings())
+        monitor.record_stability_result(collected, stats, 1.0)
+        diagnostics = monitor.readiness_diagnostics()
+        self.assertEqual(8, diagnostics["evaluated_sample_count"])
+        self.assertFalse(diagnostics["criteria"]["sample_count"])
+        self.assertFalse(diagnostics["criteria"]["duration"])
+        self.assertIn("sample count", diagnostics["readiness_failure_reason"])
+        self.assertIn("duration", diagnostics["readiness_failure_reason"])
+
+    def test_readiness_diagnostics_report_below_sample_count(self):
+        samples = stable_samples(3)
+        stats = compute_initial_stability(samples, settings())
+        monitor = self.diagnostic_monitor()
+        monitor.record_stability_result(samples, stats, 10.1)
+        diagnostics = monitor.readiness_diagnostics()
+        self.assertEqual(13, diagnostics["state_callback_count"])
+        self.assertEqual(3, diagnostics["state_callback_count_before_collection"])
+        self.assertEqual(10, diagnostics["state_callback_count_during_collection"])
+        self.assertEqual(3, diagnostics["evaluated_sample_count"])
+        self.assertFalse(diagnostics["criteria"]["sample_count"])
+        self.assertFalse(diagnostics["criteria"]["duration"])
+        self.assertFalse(diagnostics["readiness_result"])
+        self.assertIn("sample count", diagnostics["readiness_failure_reason"])
+
+    def test_readiness_diagnostics_report_stable_success_without_changing_contract(self):
+        samples = stable_samples(10)
+        stats = compute_initial_stability(samples, settings())
+        monitor = self.diagnostic_monitor()
+        monitor.record_stability_result(samples, stats, 10.1)
+        diagnostics = monitor.readiness_diagnostics()
+        self.assertTrue(stats.stable)
+        self.assertTrue(diagnostics["readiness_result"])
+        self.assertEqual({"finite_values": True, "sample_count": True, "duration": True, "q_variation": True, "tip_variation": True}, diagnostics["criteria"])
+        self.assertEqual(10, diagnostics["evaluated_sample_count"])
+
+    def test_readiness_diagnostics_report_duration_failure(self):
+        samples = stable_samples(10)
+        samples = [StateTipSample(sample.timestamp, sample.q, sample.tip, index * 0.01) for index, sample in enumerate(samples)]
+        stats = compute_initial_stability(samples, settings())
+        monitor = self.diagnostic_monitor()
+        monitor.record_stability_result(samples, stats, 10.1)
+        diagnostics = monitor.readiness_diagnostics()
+        self.assertFalse(stats.stable)
+        self.assertFalse(diagnostics["criteria"]["duration"])
+        self.assertTrue(diagnostics["criteria"]["sample_count"])
+        self.assertIn("duration", diagnostics["readiness_failure_reason"])
+
+    def test_readiness_diagnostics_report_nonfinite_failure(self):
+        samples = stable_samples(10, nonfinite=True)
+        stats = compute_initial_stability(samples, settings())
+        monitor = self.diagnostic_monitor()
+        monitor.record_stability_result(samples, stats, 10.1)
+        diagnostics = monitor.readiness_diagnostics()
+        self.assertFalse(stats.stable)
+        self.assertFalse(diagnostics["criteria"]["finite_values"])
+        self.assertIn("non-finite", diagnostics["readiness_failure_reason"])
+
+    def test_readiness_diagnostics_are_strict_json_and_persistable_on_failure(self):
+        samples = stable_samples(3)
+        stats = compute_initial_stability(samples, settings())
+        monitor = self.diagnostic_monitor()
+        monitor.record_stability_result(samples, stats, 10.1)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = write_orchestration_failure(
+                Path(temp_dir),
+                "group",
+                "orch",
+                {"orchestration_success": False, "readiness_diagnostics": monitor.readiness_diagnostics()},
+            )
+            data = strict_json_file(path)
+        self.assertEqual(3, data["readiness_diagnostics"]["evaluated_sample_count"])
+        encoded = json.dumps(data, allow_nan=False)
+        self.assertNotIn("NaN", encoded)
+        self.assertNotIn("Infinity", encoded)
+
+    def test_stop_service_timeout_records_deadline_and_future_state(self):
+        monitor = object.__new__(RosRunMonitor)
+        monitor._diagnostics = {"runner_events": []}
+        monitor.spin_once = lambda _timeout: None
+
+        class Future:
+            def done(self):
+                return False
+
+            def cancelled(self):
+                return False
+
+            def exception(self):
+                return None
+
+        class Client:
+            def call_async(self, _request):
+                return Future()
+
+        clock = iter((0.0, 0.1, 2.0, 2.1))
+        with mock.patch("ctr_evaluation.run_evaluation.time.monotonic", side_effect=lambda: next(clock)):
+            with self.assertRaisesRegex(OrchestrationError, "StopExperiment timed out"):
+                monitor._call_service(Client(), None, 1.0, "StopExperiment")
+        timeout_event = [event for event in monitor._diagnostics["runner_events"] if event["event"] == "StopExperiment_timeout"][0]
+        wait_event = [event for event in monitor._diagnostics["runner_events"] if event["event"] == "StopExperiment_wait_start"][0]
+        self.assertEqual(1.0, wait_event["timeout_s"])
+        self.assertEqual(2.1, timeout_event["timeout_monotonic"])
+        self.assertFalse(timeout_event["future_done"])
+
+    def test_stop_timeout_retries_and_returns_authoritative_response(self):
+        orchestrator = object.__new__(EvaluationOrchestrator)
+        orchestrator.settings = settings()
+
+        class Monitor:
+            def __init__(self):
+                self.calls = 0
+                self.events = []
+
+            def stop_experiment(self, *, timeout_s):
+                self.calls += 1
+                if self.calls == 1:
+                    raise OrchestrationError("StopExperiment timed out")
+                return "completed evaluation run run_1: /tmp/results/group/run_1"
+
+            def record_runner_event(self, event, **details):
+                self.events.append((event, details))
+
+        monitor = Monitor()
+        response, recovered, recovery_error = orchestrator._stop_experiment_with_recovery(monitor)
+
+        self.assertEqual("completed evaluation run run_1: /tmp/results/group/run_1", response)
+        self.assertTrue(recovered)
+        self.assertIsInstance(recovery_error, OrchestrationError)
+        self.assertEqual(2, monitor.calls)
+        self.assertEqual("stop_recovery", monitor.events[0][0])
+        self.assertEqual("ok", monitor.events[0][1]["status"])
+
+    def test_stop_timeout_retry_failure_does_not_fabricate_success(self):
+        orchestrator = object.__new__(EvaluationOrchestrator)
+        orchestrator.settings = settings()
+
+        class Monitor:
+            def __init__(self):
+                self.calls = 0
+
+            def stop_experiment(self, *, timeout_s):
+                self.calls += 1
+                raise OrchestrationError("StopExperiment timed out" if self.calls == 1 else "service rejected")
+
+        monitor = Monitor()
+        with self.assertRaisesRegex(OrchestrationError, "StopExperiment timed out"):
+            orchestrator._stop_experiment_with_recovery(monitor)
+        self.assertEqual(2, monitor.calls)
+
+    def test_normal_stop_uses_first_response_without_recovery(self):
+        orchestrator = object.__new__(EvaluationOrchestrator)
+        orchestrator.settings = settings()
+
+        class Monitor:
+            def __init__(self):
+                self.calls = 0
+                self.events = []
+
+            def stop_experiment(self, *, timeout_s):
+                self.calls += 1
+                return "completed evaluation run run_1: /tmp/results/group/run_1"
+
+            def record_runner_event(self, event, **details):
+                self.events.append(event)
+
+        monitor = Monitor()
+        response, recovered, recovery_error = orchestrator._stop_experiment_with_recovery(monitor)
+
+        self.assertEqual("completed evaluation run run_1: /tmp/results/group/run_1", response)
+        self.assertFalse(recovered)
+        self.assertIsNone(recovery_error)
+        self.assertEqual(1, monitor.calls)
+        self.assertEqual([], monitor.events)
+
+    def test_recovered_response_persists_runtime_metadata_once(self):
+        import ctr_evaluation.run_evaluation as module
+
+        orchestrator = object.__new__(EvaluationOrchestrator)
+        orchestrator.settings = settings()
+        orchestrator.experiment_group = "recovered_stop_test"
+        orchestrator.orchestration_id = "orch"
+
+        class ProcessManager:
+            def __init__(self):
+                self.shutdown_calls = 0
+
+            def shutdown_all(self, records, settings):
+                self.shutdown_calls += 1
+
+            def audit_cleanup(self, records):
+                return {"clean": True, "records": []}
+
+        class Monitor:
+            def __init__(self):
+                self.events = []
+
+            def readiness_diagnostics(self):
+                return {"evaluated_sample_count": 10, "evaluated_receive_time_span_s": 0.5}
+
+            def record_runner_event(self, event, **details):
+                self.events.append((event, details))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            orchestrator.output_root = root
+            run_dir = root / "recovered_stop_test" / "run_1"
+            write_metadata(run_dir, orchestration_id="orch", run_role="candidate")
+            (run_dir / "summary.json").write_text(json.dumps(summary()), encoding="utf-8")
+            (run_dir / "report.md").write_text("# report\n", encoding="utf-8")
+            orchestrator.process_manager = ProcessManager()
+            orchestrator._runtime_metadata = mock.Mock(
+                return_value={
+                    "orchestration_success": True,
+                    "reference_matches_requested_target": True,
+                    "requested_target": [0.01, 0.0, 0.1],
+                    "executed_target": [0.01, 0.0, 0.1],
+                    "target_replaced": False,
+                    "target_identity_valid": True,
+                    "first_observed_reference_target": [0.01, 0.0, 0.1],
+                }
+            )
+            monitor = Monitor()
+            write_json_mock = mock.patch.object(module, "write_json", wraps=module.write_json)
+            with write_json_mock as write_json_spy:
+                result = orchestrator._finalize_run(
+                    role="candidate",
+                    run_id="run_1",
+                    domain_id=7,
+                    monitor=monitor,
+                    records=[],
+                    stability=mock.Mock(),
+                    stop_response=f"completed evaluation run run_1: {run_dir}",
+                    cleanup_state={"attempted": False},
+                    stop_recovered=True,
+                    recovery_error=OrchestrationError("StopExperiment timed out"),
+                )
+
+            persisted = json.loads((run_dir / "orchestration.json").read_text(encoding="utf-8"))
+            self.assertEqual("run_1", result.run_id)
+            self.assertTrue(persisted["reference_matches_requested_target"])
+            self.assertTrue(persisted["stop_recovered"])
+            self.assertIn("StopExperiment timed out", persisted["stop_recovery_error"])
+            self.assertEqual(10, persisted["readiness_diagnostics"]["evaluated_sample_count"])
+            self.assertTrue(persisted["cleanup_audit"]["clean"])
+            self.assertEqual(1, write_json_spy.call_count)
+            self.assertEqual(1, orchestrator.process_manager.shutdown_calls)
+            candidate_metadata = cylinder_orchestrated_meta()
+            candidate_metadata.update(persisted)
+            comparison = compare_summaries(
+                candidate_summary=summary(1.0),
+                baseline_summary=summary(2.0),
+                candidate_metadata=candidate_metadata,
+                baseline_metadata=cylinder_orchestrated_meta(
+                    run_role="baseline",
+                    requested_target=[0.01, 0.0, 0.1],
+                    executed_target=[0.01, 0.0, 0.1],
+                ),
+                near_zero_epsilon=1.0e-12,
+                duration_tolerance=0.1,
+                initial_state_tolerance=5.0e-5,
+            )
+            self.assertTrue(comparison.compatibility_valid, comparison.compatibility_reasons)
+
+    def test_run_one_preserves_pre_stop_failure_after_recovered_stop(self):
+        original_error = OrchestrationError("reference startup failed")
+        result, error, persisted, monitor, process_manager = self.run_one_with_fake_runtime(
+            ["__response__"],
+            pre_stop_error=original_error,
+        )
+
+        self.assertIsNone(result)
+        self.assertIs(error, original_error)
+        self.assertEqual(1, monitor.stop_calls)
+        self.assertEqual(1, process_manager.shutdown_calls)
+        self.assertEqual(1, process_manager.audit_calls)
+        self.assertIsNotNone(persisted)
+        self.assertFalse(persisted["orchestration_success"])
+        self.assertEqual("failed", persisted["terminal_status"])
+        self.assertEqual("reference startup failed", persisted["error"])
+        self.assertTrue(persisted["reference_matches_requested_target"])
+        self.assertTrue(persisted["cleanup_audit"]["clean"])
+
+    def test_run_one_cleanup_failure_persists_failed_terminal_state(self):
+        result, error, persisted, monitor, process_manager = self.run_one_with_fake_runtime(
+            ["__response__"],
+            cleanup={"clean": False, "reason": "controller process remained"},
+        )
+
+        self.assertIsNone(result)
+        self.assertIn("process cleanup audit failed", str(error))
+        self.assertEqual(1, monitor.stop_calls)
+        self.assertEqual(1, process_manager.shutdown_calls)
+        self.assertEqual(1, process_manager.audit_calls)
+        self.assertFalse(persisted["orchestration_success"])
+        self.assertEqual("failed", persisted["terminal_status"])
+        self.assertEqual({"clean": False, "reason": "controller process remained"}, persisted["cleanup_audit"])
+
+    def test_run_one_metadata_write_failure_does_not_retry_cleanup_or_return_success(self):
+        result, error, persisted, monitor, process_manager = self.run_one_with_fake_runtime(
+            ["__response__"],
+            metadata_write_error=True,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual("metadata write failed", str(error))
+        self.assertIsNone(persisted)
+        self.assertEqual(1, monitor.stop_calls)
+        self.assertEqual(1, process_manager.shutdown_calls)
+        self.assertEqual(1, process_manager.audit_calls)
+
+    def test_run_one_normal_stop_remains_successful_and_does_not_retry(self):
+        result, error, persisted, monitor, process_manager = self.run_one_with_fake_runtime(["__response__"])
+
+        self.assertIsNone(error)
+        self.assertIsNotNone(result)
+        self.assertEqual(1, monitor.stop_calls)
+        self.assertEqual(1, process_manager.shutdown_calls)
+        self.assertEqual(1, process_manager.audit_calls)
+        self.assertTrue(persisted["orchestration_success"])
+        self.assertEqual("completed", persisted["terminal_status"])
+
+    def test_run_one_stop_timeout_retry_succeeds_without_prior_failure(self):
+        result, error, persisted, monitor, process_manager = self.run_one_with_fake_runtime(
+            [OrchestrationError("StopExperiment timed out"), "__response__"]
+        )
+
+        self.assertIsNone(error)
+        self.assertIsNotNone(result)
+        self.assertEqual(2, monitor.stop_calls)
+        self.assertEqual(1, process_manager.shutdown_calls)
+        self.assertEqual(1, process_manager.audit_calls)
+        self.assertTrue(persisted["orchestration_success"])
+        self.assertEqual("completed", persisted["terminal_status"])
+        self.assertTrue(persisted["stop_recovered"])
+        self.assertIn("StopExperiment timed out", persisted["stop_recovery_error"])
+
+    def test_run_one_failed_stop_retry_does_not_return_success(self):
+        result, error, persisted, monitor, process_manager = self.run_one_with_fake_runtime(
+            [OrchestrationError("StopExperiment timed out"), OrchestrationError("retry rejected")]
+        )
+
+        self.assertIsNone(result)
+        self.assertIn("StopExperiment timed out", str(error))
+        self.assertEqual(2, monitor.stop_calls)
+        self.assertEqual(1, process_manager.shutdown_calls)
+        self.assertEqual(1, process_manager.audit_calls)
+        self.assertIsNone(persisted)
+
     def test_cli_argument_parsing(self):
         args = parse_args(
             [

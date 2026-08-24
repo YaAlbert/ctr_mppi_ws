@@ -11,6 +11,8 @@ from typing import Any
 
 import numpy as np
 
+from .tactile_cost import TactileCostConfig, TactileSnapshot, tactile_cost_value
+
 
 def tip_tracking_cost(tip_position: np.ndarray, target_tip: np.ndarray) -> float:
     error = np.asarray(tip_position, dtype=float) - np.asarray(target_tip, dtype=float)
@@ -43,10 +45,24 @@ def obstacle_cost(*, enabled: bool, **_: Any) -> float:
     return 0.0
 
 
-def tactile_cost(*, enabled: bool, **_: Any) -> float:
-    if enabled:
-        raise NotImplementedError("TODO-SNS-001: tactile cost interface exists but is disabled in Milestone 4.")
-    return 0.0
+def tactile_cost(
+    *,
+    enabled: bool,
+    snapshot: TactileSnapshot | None = None,
+    predicted_clearance_m: float | None = None,
+    config: TactileCostConfig | None = None,
+    **_: Any,
+) -> float:
+    if not enabled:
+        return 0.0
+    if config is None:
+        raise ValueError("enabled tactile cost requires TactileCostConfig")
+    return tactile_cost_value(
+        enabled=True,
+        snapshot=snapshot,
+        predicted_clearance_m=predicted_clearance_m,
+        config=config,
+    )
 
 
 def stability_cost(*, enabled: bool, **_: Any) -> float:

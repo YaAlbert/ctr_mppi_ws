@@ -409,6 +409,48 @@ class CurvedLumenBackboneTest(unittest.TestCase):
         self.assertEqual((50, 3), result.closest_geometry_points.shape)
         self.assertTrue(np.all(np.isfinite(result.physical_clearances)))
 
+    def test_batched_backbone_projection_matches_scalar_authority(self):
+        lumen = kinked_lumen()
+        points = np.array(
+            [
+                [0.0, 0.0, -0.001],
+                [0.002, 0.003, 0.025],
+                [0.010, -0.004, 0.050],
+                [0.025, 0.002, 0.070],
+                [0.021, 0.0, 0.101],
+            ],
+            dtype=float,
+        )
+        expected = [lumen.point_clearance(point) for point in points]
+        actual = lumen.backbone_clearance(points)
+        self.assertTrue(
+            np.allclose(actual.physical_clearances, [item.physical_clearance for item in expected])
+        )
+        self.assertTrue(
+            np.array_equal(
+                actual.closest_geometry_indices,
+                [item.closest_geometry_index for item in expected],
+            )
+        )
+        self.assertTrue(
+            np.allclose(
+                actual.closest_geometry_parameters,
+                [item.closest_geometry_parameter for item in expected],
+            )
+        )
+        self.assertTrue(
+            np.allclose(
+                actual.closest_geometry_points,
+                [item.closest_geometry_point for item in expected],
+            )
+        )
+
+    def test_batched_backbone_projection_does_not_reenter_scalar_path(self):
+        lumen = kinked_lumen()
+        with patch.object(CurvedLumen, "point_clearance", side_effect=AssertionError):
+            result = lumen.backbone_clearance([[0.0, 0.0, 0.01], [0.01, 0.0, 0.05]])
+        self.assertEqual((2,), result.physical_clearances.shape)
+
 
 class CurvedLumenGeneratorTest(unittest.TestCase):
     def test_circular_arc_includes_exact_inlet(self):

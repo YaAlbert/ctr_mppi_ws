@@ -36,6 +36,15 @@ def generate_report(
     lines = [
         "# CTR Evaluation Report",
         "",
+    ]
+    if metadata.get("development_simulation") is True:
+        lines.extend(
+            [
+                "> **Development simulation only.** This report is not production promotion evidence.",
+                "",
+            ]
+        )
+    lines.extend([
         "## Experiment Identity",
         "",
         f"- run_id: `{metadata.get('run_id', '')}`",
@@ -50,7 +59,7 @@ def generate_report(
         "",
         "## Configuration",
         "",
-    ]
+    ])
     configuration = metadata.get("configuration", {})
     for key in (
         "trajectory_type",

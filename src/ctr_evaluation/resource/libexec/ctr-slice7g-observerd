@@ -1,0 +1,370 @@
+#!/usr/bin/python3.10 -I
+"""Candidate root observer-supervisor wrapper; never accepts a command line."""
+
+import hashlib
+import json
+import os
+from pathlib import PurePosixPath
+import stat
+import sys
+import sysconfig
+
+
+BOOTSTRAP = "/etc/ctr-mppi/slice-7g-authority/bootstrap.json"
+AUTHORITY_STATE_ROOT = "/var/lib/ctr-mppi/slice-7g-authority"
+BOOTSTRAP_SCHEMA = "ctr-slice-7g-authority-bootstrap-3"
+MANIFEST_SCHEMA = "ctr-slice-7g-installed-runtime-manifest-3"
+MEMBERS = (
+    "lib/python3.10/site-packages/ctr_evaluation/__init__.py",
+    "lib/python3.10/site-packages/ctr_evaluation/slice_7g_cleanup_authority.py",
+    "lib/python3.10/site-packages/ctr_evaluation/slice_7g_observer_supervisor.py",
+    "lib/python3.10/site-packages/ctr_evaluation/slice_7g_privileged_protocol.py",
+)
+SERVICE_EXECUTABLES = (
+    "/usr/libexec/ctr-mppi/ctr-slice7g-authorityd",
+    "/usr/libexec/ctr-mppi/ctr-slice7g-cleanupd",
+    "/usr/libexec/ctr-mppi/ctr-slice7g-observerd",
+)
+PROCESS_SCHEMA = "ctr-slice-7g-process-manifest-2"
+ENVIRONMENT_SCHEMA = "ctr-slice-7g-environment-manifest-1"
+PRIVILEGED_SERVICE_SCHEMA = "ctr-slice-7g-privileged-service-manifest-1"
+BUDGET_SCHEMA = "ctr-slice-7g-global-attempt-budget-4"
+RECORD_PATHS = {
+    "build_test_approval": "/var/lib/ctr-mppi/slice-7g-authority/public/build.json",
+    "environment_manifest": "/var/lib/ctr-mppi/slice-7g-authority/public/environment.json",
+    "global_budget": "/var/lib/ctr-mppi/slice-7g-authority/global-budget/revision-00000000000000000000.json",
+    "installed_runtime_manifest": "/var/lib/ctr-mppi/slice-7g-authority/public/installed.json",
+    "privileged_service_manifest": "/var/lib/ctr-mppi/slice-7g-authority/public/privileged-services.json",
+    "process_manifest": "/var/lib/ctr-mppi/slice-7g-authority/public/process.json",
+    "runtime_authorization": "/var/lib/ctr-mppi/slice-7g-authority/public/authorization.json",
+}
+SCHEMAS = {
+    "build_test_approval": "ctr-slice-7g-isolated-build-test-approval-1",
+    "environment_manifest": ENVIRONMENT_SCHEMA,
+    "global_budget": BUDGET_SCHEMA,
+    "installed_runtime_manifest": MANIFEST_SCHEMA,
+    "privileged_service_manifest": PRIVILEGED_SERVICE_SCHEMA,
+    "process_manifest": PROCESS_SCHEMA,
+    "runtime_authorization": "ctr-slice-7g-runtime-authorization-3",
+}
+PROTOCOL_LIMITS = {
+    "maximum_connections": 8, "maximum_frame_bytes": 262144,
+    "maximum_frames_per_connection": 128, "maximum_list_items": 65536,
+    "maximum_record_depth": 24, "maximum_transferred_fds": 2,
+}
+SYSTEMD_UNITS = {
+    "authority": "ctr-slice7g-authority.service",
+    "campaign": "ctr-slice7g-campaign.service",
+    "cleanup_authority": "ctr-slice7g-cleanup-authority.service",
+    "observer_supervisor": "ctr-slice7g-observer-supervisor.service",
+    "revocation_path": "ctr-slice7g-revocation.path",
+    "revocation_service": "ctr-slice7g-revocation.service",
+}
+OBSERVER_ENVIRONMENT_KEYS = {
+    "AMENT_PREFIX_PATH", "CMAKE_PREFIX_PATH", "HOME", "LD_LIBRARY_PATH",
+    "MPLCONFIGDIR", "PATH", "PYTHONDONTWRITEBYTECODE", "PYTHONNOUSERSITE",
+    "PYTHONPATH", "RMW_IMPLEMENTATION", "ROS_HOME", "ROS_LOCALHOST_ONLY",
+    "ROS_DISTRO", "ROS_LOG_DIR", "XDG_CACHE_HOME",
+}
+
+
+def _canonical(value):
+    return json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _read(path, maximum, allow_unprivileged_parents=False, authority_parent=None):
+    parts = PurePosixPath(path).parts[1:]
+    directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        traversed = []
+        for part in parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory)
+            parent = os.fstat(child)
+            traversed.append(part)
+            current = "/" + "/".join(traversed)
+            if not allow_unprivileged_parents:
+                if authority_parent is not None and (
+                    current == authority_parent[0]
+                    or current.startswith(authority_parent[0] + "/")
+                ):
+                    if (
+                        parent.st_uid != authority_parent[1]
+                        or parent.st_gid != authority_parent[2]
+                        or stat.S_IMODE(parent.st_mode) != 0o700
+                    ):
+                        os.close(child)
+                        raise RuntimeError("observer wrapper authority evidence parent differs")
+                elif parent.st_uid != 0 or stat.S_IMODE(parent.st_mode) & 0o022:
+                    os.close(child)
+                    raise RuntimeError("observer wrapper parent trust differs")
+            os.close(directory)
+            directory = child
+        descriptor = os.open(parts[-1], os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory)
+        try:
+            before = os.fstat(descriptor)
+            raw = os.read(descriptor, maximum + 1)
+            after = os.fstat(descriptor)
+            physical = lambda item: (item.st_dev, item.st_ino, item.st_mode, item.st_nlink, item.st_size, item.st_uid, item.st_gid, item.st_mtime_ns, item.st_ctime_ns)
+            if len(raw) > maximum or physical(before) != physical(after) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise RuntimeError("observer wrapper file identity differs")
+            return raw, before
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(directory)
+
+
+def _record(path, schema, mode, uid, gid, allow_unprivileged_parents=False):
+    raw, info = _read(path, 1_048_576, allow_unprivileged_parents)
+    value = json.loads(raw.decode("utf-8", "strict"))
+    if type(value) is not dict or value.get("schema_version") != schema or _canonical(value) != raw:
+        raise RuntimeError("observer wrapper record differs")
+    if (
+        info.st_uid != uid or info.st_gid != gid
+        or stat.S_IMODE(info.st_mode) != mode or info.st_nlink != 1
+    ):
+        raise RuntimeError("observer wrapper ownership or mode differs")
+    return value, info, raw
+
+
+def _authority_record(path, schema, mode, bootstrap):
+    raw, info = _read(
+        path, 1_048_576,
+        authority_parent=(
+            AUTHORITY_STATE_ROOT, bootstrap["authority_uid"], bootstrap["authority_gid"],
+        ),
+    )
+    value = json.loads(raw.decode("utf-8", "strict"))
+    if type(value) is not dict or value.get("schema_version") != schema or _canonical(value) != raw:
+        raise RuntimeError("observer wrapper authority evidence record differs")
+    if (
+        info.st_uid != bootstrap["authority_uid"]
+        or info.st_gid != bootstrap["authority_gid"]
+        or stat.S_IMODE(info.st_mode) != mode or info.st_nlink != 1
+    ):
+        raise RuntimeError("observer wrapper authority evidence identity differs")
+    return value, info, raw
+
+
+def _file_record(path, expected, maximum=4 * 1024 * 1024, allow_unprivileged_parents=False):
+    if type(expected) is not dict or set(expected) != {
+        "device", "inode", "link_count", "mode", "owner_gid", "owner_uid",
+        "path", "sha256", "size", "type",
+    } or expected["path"] != path or expected["type"] != "regular":
+        raise RuntimeError("observer wrapper trust member schema differs")
+    raw, info = _read(path, maximum, allow_unprivileged_parents)
+    observed = {
+        "device": info.st_dev, "inode": info.st_ino, "link_count": info.st_nlink,
+        "mode": stat.S_IMODE(info.st_mode), "owner_gid": info.st_gid,
+        "owner_uid": info.st_uid, "path": path, "sha256": hashlib.sha256(raw).hexdigest(),
+        "size": info.st_size, "type": "regular",
+    }
+    if expected != observed or (
+        not allow_unprivileged_parents and (info.st_uid != 0 or info.st_gid != 0)
+    ) or observed["mode"] & 0o222:
+        raise RuntimeError("observer wrapper root trust member differs")
+    return info
+
+
+def _final_barrier(path, expected, allow_unprivileged_parents=False):
+    raw, info = _read(path, 4 * 1024 * 1024, allow_unprivileged_parents)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_dev != expected["device"] or info.st_ino != expected["inode"]
+        or info.st_size != expected["size"] or info.st_nlink != expected["link_count"]
+        or stat.S_IMODE(info.st_mode) != expected["mode"]
+        or info.st_uid != expected["owner_uid"] or info.st_gid != expected["owner_gid"]
+        or hashlib.sha256(raw).hexdigest() != expected["sha256"]
+    ):
+        raise RuntimeError("observer wrapper final pathname identity differs")
+
+
+def _authenticate_root_bootstrap(path=BOOTSTRAP, _test=False):
+    if not _test and path != BOOTSTRAP:
+        raise RuntimeError("observer wrapper bootstrap path override")
+    bootstrap, bootstrap_info, bootstrap_raw = _record(
+        path, BOOTSTRAP_SCHEMA, 0o444,
+        0 if not _test else os.geteuid(), 0 if not _test else os.getegid(), _test,
+    )
+    required = {
+        "authority_uid", "authority_gid", "campaign_uid", "runtime_gid", "observer_uid",
+        "observer_gid", "recovery_uid", "recovery_gid", "authority_account",
+        "campaign_account", "runtime_group", "observer_account", "recovery_account",
+        "bootstrap_path", "authority_service_path", "authority_state_root",
+        "authority_socket_path", "installed_runtime_parent", "cleanup_service_path",
+        "cleanup_state_root", "cleanup_socket_path", "recovery_socket_path",
+        "observer_service_path", "observer_socket_path", "service_executables",
+        "privileged_code", "record_paths", "schemas", "protocol_limits", "systemd_units",
+        "schema_version",
+    }
+    if set(bootstrap) != required or bootstrap["bootstrap_path"] != BOOTSTRAP:
+        raise RuntimeError("observer wrapper bootstrap schema differs")
+    if (
+        bootstrap["record_paths"] != RECORD_PATHS
+        or bootstrap["schemas"] != SCHEMAS
+        or bootstrap["protocol_limits"] != PROTOCOL_LIMITS
+        or bootstrap["systemd_units"] != SYSTEMD_UNITS
+        or any(type(value) is not int for value in bootstrap["protocol_limits"].values())
+    ):
+        raise RuntimeError("observer wrapper nested bootstrap contract differs")
+    services = bootstrap["service_executables"]
+    if type(services) is not list or [item.get("path") for item in services if type(item) is dict] != list(SERVICE_EXECUTABLES):
+        raise RuntimeError("observer wrapper service executable inventory differs")
+    for item in services:
+        _file_record(item["path"], item, allow_unprivileged_parents=_test)
+    code = bootstrap["privileged_code"]
+    if type(code) is not dict or set(code) != {"installed_root", "members", "observer_contract"}:
+        raise RuntimeError("observer wrapper privileged code schema differs")
+    root = code["installed_root"]
+    if type(root) is not str or (
+        not _test and PurePosixPath(root).parent.as_posix() != "/opt/ctr-mppi/slice-7g"
+    ):
+        raise RuntimeError("observer wrapper privileged code root differs")
+    members = code["members"]
+    if type(members) is not list or [item.get("path") for item in members if type(item) is dict] != list(MEMBERS):
+        raise RuntimeError("observer wrapper privileged code inventory differs")
+    for item in members:
+        _file_record(root + "/" + item["path"], {**item, "path": root + "/" + item["path"]}, allow_unprivileged_parents=_test)
+    contract = code["observer_contract"]
+    if type(contract) is not dict or set(contract) != {"argv", "environment", "executable", "interpreter", "working_directory"}:
+        raise RuntimeError("observer wrapper observer contract differs")
+    _file_record(contract["executable"]["path"], contract["executable"], allow_unprivileged_parents=_test)
+    _file_record(contract["interpreter"]["path"], contract["interpreter"], allow_unprivileged_parents=_test)
+    if contract["argv"] != ["/opt/ros/humble/bin/ros2", "node", "list", "--no-daemon"] or contract["working_directory"] != root:
+        raise RuntimeError("observer wrapper fixed command differs")
+    environment_contract = contract["environment"]
+    if (
+        type(environment_contract) is not dict
+        or set(environment_contract) != {"dynamic_key", "dynamic_minimum", "dynamic_maximum", "fixed_values"}
+        or environment_contract["dynamic_key"] != "ROS_DOMAIN_ID"
+        or type(environment_contract["dynamic_minimum"]) is not int
+        or type(environment_contract["dynamic_maximum"]) is not int
+        or environment_contract["dynamic_minimum"] != 100
+        or environment_contract["dynamic_maximum"] != 199
+        or type(environment_contract["fixed_values"]) is not dict
+        or set(environment_contract["fixed_values"]) != OBSERVER_ENVIRONMENT_KEYS
+        or any(type(key) is not str or type(value) is not str for key, value in environment_contract["fixed_values"].items())
+    ):
+        raise RuntimeError("observer wrapper environment contract differs")
+    for item in services:
+        _final_barrier(item["path"], item, _test)
+    for item in members:
+        _final_barrier(root + "/" + item["path"], {**item, "path": root + "/" + item["path"]}, _test)
+    _final_barrier(contract["executable"]["path"], contract["executable"], _test)
+    _final_barrier(contract["interpreter"]["path"], contract["interpreter"], _test)
+    current_raw, current_info = _read(path, 1_048_576, _test)
+    if (
+        current_raw != bootstrap_raw
+        or current_info.st_dev != bootstrap_info.st_dev
+        or current_info.st_ino != bootstrap_info.st_ino
+        or not stat.S_ISREG(current_info.st_mode)
+        or current_info.st_uid != bootstrap_info.st_uid
+        or current_info.st_gid != bootstrap_info.st_gid
+        or stat.S_IMODE(current_info.st_mode) != stat.S_IMODE(bootstrap_info.st_mode)
+        or current_info.st_nlink != bootstrap_info.st_nlink
+        or current_info.st_size != bootstrap_info.st_size
+    ):
+        raise RuntimeError("observer wrapper bootstrap record was replaced")
+    return bootstrap
+
+
+def _select_privileged_root(bootstrap, installed_evidence):
+    root = bootstrap["privileged_code"]["installed_root"]
+    if installed_evidence["root_path"] != root:
+        raise RuntimeError("observer wrapper installed-runtime evidence differs")
+    return root
+
+
+def _identity(schema, value):
+    return hashlib.sha256((schema + ":canonical-1").encode() + b"\0" + _canonical(value)).hexdigest()
+
+
+def main():
+    if sys.argv[1:]:
+        return 2
+    sys.dont_write_bytecode = True
+    os.chdir("/")
+    bootstrap = _authenticate_root_bootstrap()
+    if bootstrap["observer_uid"] is None or bootstrap["observer_gid"] is None:
+        raise RuntimeError("observer numeric principal is unprovisioned")
+    manifest, _, _ = _authority_record(
+        bootstrap["record_paths"]["installed_runtime_manifest"],
+        MANIFEST_SCHEMA, 0o440, bootstrap,
+    )
+    root = _select_privileged_root(bootstrap, manifest)
+    paths = sysconfig.get_paths()
+    sys.path[:] = [paths["stdlib"], paths["platstdlib"], root + "/lib/python3.10/site-packages"]
+    from ctr_evaluation.slice_7g_privileged_protocol import validate_record
+    validate_record(manifest, expected_schema=MANIFEST_SCHEMA)
+    process, _, _ = _authority_record(
+        bootstrap["record_paths"]["process_manifest"], PROCESS_SCHEMA, 0o440,
+        bootstrap,
+    )
+    environment, _, _ = _authority_record(
+        bootstrap["record_paths"]["environment_manifest"], ENVIRONMENT_SCHEMA, 0o440,
+        bootstrap,
+    )
+    privileged, _, _ = _authority_record(
+        bootstrap["record_paths"]["privileged_service_manifest"],
+        PRIVILEGED_SERVICE_SCHEMA, 0o440, bootstrap,
+    )
+    budget, _, _ = _authority_record(
+        bootstrap["record_paths"]["global_budget"], BUDGET_SCHEMA, 0o600,
+        bootstrap,
+    )
+    validate_record(process, expected_schema=PROCESS_SCHEMA)
+    validate_record(privileged, expected_schema=PRIVILEGED_SERVICE_SCHEMA)
+    validate_record(budget, expected_schema=BUDGET_SCHEMA)
+    if set(environment) != {
+        "schema_version", "identity_algorithm", "fixed_values", "transaction_values",
+        "required_absent_keys", "path_keys",
+    }:
+        raise RuntimeError("observer environment manifest schema differs")
+    ros2 = [item for item in process["executables"] if item["path"] == "/opt/ros/humble/bin/ros2"]
+    if len(ros2) != 1 or privileged["numeric_ids_provisioned"] is not True:
+        raise RuntimeError("observer service manifest is unprovisioned or ambiguous")
+    trusted_contract = bootstrap["privileged_code"]["observer_contract"]
+    trusted_environment = trusted_contract["environment"]
+    if type(trusted_environment) is not dict or set(trusted_environment) != {"dynamic_key", "dynamic_minimum", "dynamic_maximum", "fixed_values"}:
+        raise RuntimeError("observer root-owned environment contract differs")
+    closed_environment = dict(trusted_environment["fixed_values"])
+    if trusted_environment["dynamic_key"] != "ROS_DOMAIN_ID" or trusted_environment["dynamic_minimum"] != 100 or trusted_environment["dynamic_maximum"] != 199:
+        raise RuntimeError("observer root-owned dynamic environment differs")
+    trusted_executable_projection = {
+        key: trusted_contract["executable"][key]
+        for key in ("path", "mode", "link_count", "device", "inode", "size", "sha256", "owner_uid", "owner_gid")
+    }
+    if ros2[0] != trusted_executable_projection:
+        raise RuntimeError("observer installed executable evidence differs from root trust")
+    if (
+        environment["fixed_values"] != trusted_environment["fixed_values"]
+        or environment["transaction_values"].get("ROS_DOMAIN_ID") != "domain_id"
+    ):
+        raise RuntimeError("observer installed environment evidence differs from root trust")
+    closed_environment["ROS_DOMAIN_ID"] = "100"
+    from ctr_evaluation.slice_7g_observer_supervisor import serve_observer_supervisor
+    serve_observer_supervisor(
+        authority_uid=bootstrap["authority_uid"],
+        authority_gid=bootstrap["authority_gid"],
+        observer_uid=bootstrap["observer_uid"],
+        observer_gid=bootstrap["observer_gid"],
+        runtime_authorization_identity=budget["authorization_identity"],
+        installed_runtime_identity=manifest["installed_runtime_identity"],
+        budget_identity=_identity(BUDGET_SCHEMA, budget),
+        observer_contract_identity=_identity(
+            "ctr-slice-7g-observer-contract-1", process["observer_contract"],
+        ),
+        executable_identity=_identity("ctr-slice-7g-file-identity-1", trusted_contract["executable"]),
+        interpreter_path=trusted_contract["interpreter"]["path"],
+        interpreter_identity=_identity("ctr-slice-7g-file-identity-1", trusted_contract["interpreter"]),
+        environment_identity=_identity(ENVIRONMENT_SCHEMA, environment),
+        closed_environment=closed_environment,
+        working_directory=trusted_contract["working_directory"],
+    )
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (RuntimeError, OSError, ValueError, KeyError, UnicodeError):
+        raise SystemExit(2)

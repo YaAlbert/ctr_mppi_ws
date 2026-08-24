@@ -179,34 +179,34 @@ class CurvedLumen:
 
     def backbone_clearance(self, backbone_points: Any) -> BackboneClearance:
         points = points_array(backbone_points, "backbone_points")
-        clearances = [self.point_clearance(point) for point in points]
-        physical_clearances = np.asarray([item.physical_clearance for item in clearances], dtype=float)
-        inlet_violation = np.asarray([item.inlet_violation for item in clearances], dtype=bool)
-        outlet_violation = np.asarray([item.outlet_violation for item in clearances], dtype=bool)
-        radial_collision = np.asarray([item.radial_collision for item in clearances], dtype=bool)
-        axial_clearance = np.asarray([item.axial_clearance for item in clearances], dtype=float)
+        (
+            closest_geometry_indices,
+            closest_geometry_parameters,
+            closest_geometry_points,
+            centerline_progress,
+            radial_distance,
+            local_radius,
+        ) = self._project_points(points)
+        inlet_signed = (points - self.centerline_points[0]) @ self.inlet_tangent
+        outlet_signed = (points - self.centerline_points[-1]) @ self.outlet_tangent
+        inlet_violation = inlet_signed < -BOUNDARY_TOLERANCE
+        outlet_violation = outlet_signed > BOUNDARY_TOLERANCE
+        physical_clearances = local_radius - self.ctr_outer_radius - radial_distance
+        radial_collision = physical_clearances < -BOUNDARY_TOLERANCE
+        axial_clearance = np.minimum(inlet_signed, -outlet_signed)
         radial_penetration = np.maximum(-physical_clearances, 0.0)
-        inlet_penetration = np.asarray(
-            [max(0.0, -float(np.dot(item.point - self.centerline_points[0], self.inlet_tangent))) for item in clearances],
-            dtype=float,
-        )
-        outlet_penetration = np.asarray(
-            [max(0.0, float(np.dot(item.point - self.centerline_points[-1], self.outlet_tangent))) for item in clearances],
-            dtype=float,
-        )
+        inlet_penetration = np.maximum(-inlet_signed, 0.0)
+        outlet_penetration = np.maximum(outlet_signed, 0.0)
         return make_backbone_clearance(
             points=points,
             physical_clearances=physical_clearances,
             safety_margin=self.safety_margin,
-            radial_distance=np.asarray([item.radial_distance for item in clearances], dtype=float),
-            local_radius=np.asarray([item.local_radius for item in clearances], dtype=float),
-            centerline_progress=np.asarray([item.centerline_progress for item in clearances], dtype=float),
-            closest_geometry_indices=np.asarray([item.closest_geometry_index for item in clearances], dtype=int),
-            closest_geometry_parameters=np.asarray(
-                [item.closest_geometry_parameter for item in clearances],
-                dtype=float,
-            ),
-            closest_geometry_points=np.asarray([item.closest_geometry_point for item in clearances], dtype=float),
+            radial_distance=radial_distance,
+            local_radius=local_radius,
+            centerline_progress=centerline_progress,
+            closest_geometry_indices=closest_geometry_indices,
+            closest_geometry_parameters=closest_geometry_parameters,
+            closest_geometry_points=closest_geometry_points,
             inlet_violation_mask=inlet_violation,
             outlet_violation_mask=outlet_violation,
             radial_collision_mask=radial_collision,
@@ -214,6 +214,60 @@ class CurvedLumen:
             radial_penetration=radial_penetration,
             inlet_penetration=inlet_penetration,
             outlet_penetration=outlet_penetration,
+        )
+
+    def _project_points(
+        self, points: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Project a backbone batch while preserving the scalar tie rule exactly."""
+
+        starts = self.centerline_points[:-1]
+        vectors = self.segment_vectors
+        squared_lengths = self.segment_lengths * self.segment_lengths
+        offsets = points[:, None, :] - starts[None, :, :]
+        raw_parameters = np.einsum("nsi,si->ns", offsets, vectors) / squared_lengths[None, :]
+        parameters = np.clip(raw_parameters, 0.0, 1.0)
+        closest_points = starts[None, :, :] + parameters[:, :, None] * vectors[None, :, :]
+        deltas = points[:, None, :] - closest_points
+        distance_squared = np.einsum("nsi,nsi->ns", deltas, deltas)
+
+        point_count = points.shape[0]
+        best_distance_squared = np.full(point_count, np.inf, dtype=float)
+        best_indices = np.zeros(point_count, dtype=int)
+        best_parameters = np.zeros(point_count, dtype=float)
+        # The tolerance relation is deliberately sequential and non-transitive.
+        # Loop only over centerline segments while evaluating every backbone
+        # point as one NumPy batch; this retains `_is_better_projection`.
+        for index in range(vectors.shape[0]):
+            distances = distance_squared[:, index]
+            segment_parameters = parameters[:, index]
+            better = distances < best_distance_squared - PROJECTION_TIE_TOLERANCE
+            tied = np.abs(distances - best_distance_squared) <= PROJECTION_TIE_TOLERANCE
+            better |= tied & (
+                (index < best_indices)
+                | ((index == best_indices) & (segment_parameters < best_parameters))
+            )
+            best_distance_squared[better] = distances[better]
+            best_indices[better] = index
+            best_parameters[better] = segment_parameters[better]
+
+        rows = np.arange(point_count)
+        selected_points = closest_points[rows, best_indices].copy()
+        progress = (
+            self.cumulative_arc_lengths[best_indices]
+            + best_parameters * self.segment_lengths[best_indices]
+        )
+        radii = (
+            (1.0 - best_parameters) * self.radius_profile[best_indices]
+            + best_parameters * self.radius_profile[best_indices + 1]
+        )
+        return (
+            best_indices,
+            best_parameters,
+            selected_points,
+            progress,
+            np.sqrt(best_distance_squared),
+            radii,
         )
 
     def validate_target(

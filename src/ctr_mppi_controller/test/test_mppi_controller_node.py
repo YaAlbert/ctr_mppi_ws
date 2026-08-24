@@ -34,9 +34,21 @@ except ImportError:
             self.valid = False
             self.diagnostic_status = ""
 
+    class CtrTactileState:
+        def __init__(self):
+            self.header = SimpleNamespace(stamp=SimpleNamespace(sec=0, nanosec=0), frame_id="")
+            self.source = ""
+            self.valid = False
+            self.contact = False
+            self.warning = False
+            self.stop = False
+            self.region = 0
+            self.force_magnitude = 0.0
+
     ctr_interfaces_msg_module.CtrControllerMetrics = CtrControllerMetrics
     ctr_interfaces_msg_module.CtrJointCommand = CtrJointCommand
     ctr_interfaces_msg_module.CtrState = type("CtrState", (), {})
+    ctr_interfaces_msg_module.CtrTactileState = CtrTactileState
     sys.modules["ctr_interfaces"] = ctr_interfaces_module
     sys.modules["ctr_interfaces.msg"] = ctr_interfaces_msg_module
 
@@ -164,6 +176,7 @@ def controller_shell(*, mode=EXTERNAL_TARGET, lumen_geometry=None):
     node.trajectory_metrics_pub = FakePublisher()
     node.frame_id = "base_link"
     node.config = {"mppi": {"control_frequency": 20.0}}
+    node.slice_7g_profile = False
     node.tracking_metrics_config = SimpleNamespace(enabled=False)
     node._warned_missing_horizon = False
     node._warned_missing_reference = False
@@ -213,6 +226,21 @@ def fixed_init_shell(*, position=(0.015, 0.005, 0.100), goal_frame="base_link", 
 
 
 class MPPIControllerNodeHelpersTest(unittest.TestCase):
+    def test_slice_7g_withholds_raw_command_until_tactile_cost_input_is_eligible(self):
+        node = controller_shell(mode=FIXED_TARGET)
+        node.slice_7g_profile = True
+        node.active_reference = accept_point_reference(
+            node.active_reference,
+            source="fixed_target",
+            point=[0.0, 0.0, 0.08],
+            frame="base_link",
+        )
+        node._tactile_for_solve = lambda **_kwargs: (None, "missing_snapshot")
+        node._on_timer()
+        self.assertEqual(0, node.core.solve_calls)
+        self.assertEqual([], node.command_pub.messages)
+        self.assertTrue(any("withheld" in warning for warning in node._fake_logger.warnings))
+
     def test_path_to_numpy_conversion(self):
         points = np.array([[0.0192, 0.0, 0.08], [0.0193, 0.0, 0.08], [0.0194, 0.0, 0.08]])
         sequence, stamp_s = target_sequence_from_path(

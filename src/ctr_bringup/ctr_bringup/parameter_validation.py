@@ -13,6 +13,12 @@ from typing import Any, Iterable
 import math
 import yaml
 
+from ctr_bringup.slice_7g_profile import (
+    apply_slice_7g_development_simulation_profile,
+    apply_slice_7g_simulation_profile,
+    validate_slice_7g_profile,
+)
+
 
 UNRESOLVED_TODO_IDS = {
     "CTR-001": "Tube lengths require CAD or measurement.",
@@ -143,6 +149,7 @@ def validate_project_config(config: dict[str, Any]) -> list[str]:
         errors.extend(_validate_model(config["model"]))
     if "mppi" in config:
         errors.extend(_validate_mppi(config["mppi"]))
+        errors.extend(_validate_mppi_tactile(config["mppi"], config.get("tactile", {})))
     if "mppi_profiles" in config:
         errors.extend(_validate_mppi_profiles(config["mppi_profiles"]))
     if "cylindrical_lumen" in config:
@@ -168,6 +175,11 @@ def validate_project_config(config: dict[str, Any]) -> list[str]:
         errors.extend(_validate_simulation(config["simulation"]))
     if "tactile" in config:
         errors.extend(_validate_tactile(config["tactile"]))
+    if "slice_7g_runtime" in config:
+        try:
+            validate_slice_7g_profile(config)
+        except ValueError as exc:
+            errors.append(str(exc))
 
     return errors
 
@@ -185,6 +197,8 @@ def project_config_with_overrides(
     cylinder_target_position: Any | None = None,
     mppi_profile: Any | None = None,
     mppi_random_seed: Any | None = None,
+    slice_7g_profile: Any | None = None,
+    development_simulation: Any | None = None,
 ) -> dict[str, Any]:
     """Return a copy of config with launch-mode overrides applied."""
 
@@ -230,6 +244,17 @@ def project_config_with_overrides(
         seed = _optional_seed(mppi_random_seed, "mppi_random_seed")
         if seed is not None:
             result.setdefault("mppi", {})["random_seed"] = seed
+    if slice_7g_profile is not None and slice_7g_profile != "":
+        result = apply_slice_7g_simulation_profile(
+            result,
+            enabled=parse_launch_bool(slice_7g_profile, "slice_7g_profile"),
+        )
+    if development_simulation is not None and development_simulation != "":
+        development_enabled = parse_launch_bool(
+            development_simulation, "development_simulation"
+        )
+        if development_enabled:
+            result = apply_slice_7g_development_simulation_profile(result, enabled=True)
     return result
 
 
@@ -416,6 +441,32 @@ def _validate_mppi(mppi: Any) -> list[str]:
     weights = mppi.get("weights", {})
     for key in ("tip", "shape", "control", "smoothness", "obstacle", "terminal", "force", "joint_limit", "stability"):
         errors.extend(_require_number(weights, key, "mppi.weights", nonnegative=True))
+    return errors
+
+
+def _validate_mppi_tactile(mppi: Any, tactile: Any) -> list[str]:
+    """Validate the disabled-by-default MPPI tactile integration contract."""
+
+    errors: list[str] = []
+    values = mppi.get("tactile", {}) if isinstance(mppi, dict) else {}
+    if not isinstance(values, dict):
+        return ["`mppi.tactile` must be a map."]
+    if not isinstance(values.get("enabled"), bool):
+        errors.append("`mppi.tactile.enabled` must be a boolean.")
+    for key in ("max_age_s", "force_saturation_n", "proximity_margin_m"):
+        errors.extend(_require_positive_number(values, key, "mppi.tactile"))
+    for key in ("no_contact_multiplier", "contact_multiplier", "warning_multiplier", "stop_multiplier"):
+        errors.extend(_require_number(values, key, "mppi.tactile", nonnegative=True))
+    if all(key in values for key in ("no_contact_multiplier", "contact_multiplier", "warning_multiplier", "stop_multiplier")):
+        multipliers = [values[key] for key in ("no_contact_multiplier", "contact_multiplier", "warning_multiplier", "stop_multiplier")]
+        if multipliers[0] != 0.0:
+            errors.append("`mppi.tactile.no_contact_multiplier` must equal zero.")
+        if any(left > right for left, right in zip(multipliers, multipliers[1:])):
+            errors.append("`mppi.tactile` multipliers must be nondecreasing.")
+    weights = mppi.get("weights", {}) if isinstance(mppi, dict) else {}
+    force_weight = _as_finite_number(weights.get("force")) if isinstance(weights, dict) else None
+    if values.get("enabled") is True and (force_weight is None or force_weight <= 0.0):
+        errors.append("enabled `mppi.tactile` requires a positive `mppi.weights.force`.")
     return errors
 
 
@@ -880,8 +931,20 @@ def _validate_safety(safety: Any) -> list[str]:
     errors: list[str] = []
     if not isinstance(safety, dict):
         return ["`safety` must be a map."]
+    for key in ("enabled", "tactile_enabled", "stop_on_state_timeout", "stop_on_tactile_timeout", "stop_on_invalid_value"):
+        if not isinstance(safety.get(key), bool):
+            errors.append(f"`safety.{key}` must be a boolean.")
     for key in ("state_timeout", "command_timeout", "tactile_timeout"):
         errors.extend(_require_positive_number(safety, key, "safety"))
+    errors.extend(_require_number(safety, "tactile_startup_grace_s", "safety", nonnegative=True))
+    errors.extend(_require_number(safety, "tactile_future_skew_s", "safety", nonnegative=True))
+    errors.extend(_require_positive_number(safety, "watchdog_period_s", "safety"))
+    watchdog = _as_finite_number(safety.get("watchdog_period_s"))
+    command_timeout = _as_finite_number(safety.get("command_timeout"))
+    if watchdog is not None and command_timeout is not None and watchdog > command_timeout:
+        errors.append("`safety.watchdog_period_s` must be <= `safety.command_timeout`.")
+    if safety.get("tactile_enabled") is True and safety.get("stop_on_tactile_timeout") is not True:
+        errors.append("`safety.stop_on_tactile_timeout` must be true when tactile safety is enabled.")
     soft = safety.get("soft_contact", {})
     errors.extend(_require_positive_number(soft, "velocity_scale", "safety.soft_contact"))
     errors.extend(_require_positive_number(soft, "force_weight_scale", "safety.soft_contact"))
@@ -953,23 +1016,48 @@ def _validate_tactile(tactile: Any) -> list[str]:
     errors: list[str] = []
     if not isinstance(tactile, dict):
         return ["`tactile` must be a map."]
+    if not isinstance(tactile.get("enabled"), bool):
+        errors.append("`tactile.enabled` must be a boolean.")
+    if tactile.get("mode") != "simulated":
+        errors.append("`tactile.mode` must be `simulated` for the current runtime.")
     sensor = tactile.get("sensor", {})
     errors.extend(_require_positive_number(sensor, "input_dimension", "tactile.sensor", integer=True))
     errors.extend(_require_positive_number(sensor, "output_dimension", "tactile.sensor", integer=True))
     errors.extend(_require_positive_number(sensor, "sample_frequency", "tactile.sensor"))
     calibration = tactile.get("calibration", {})
     errors.extend(_require_number(calibration, "zero_offset", "tactile.calibration"))
-    errors.extend(_require_number(calibration, "scale", "tactile.calibration"))
+    errors.extend(_require_positive_number(calibration, "scale", "tactile.calibration"))
     errors.extend(_require_number(calibration, "bias", "tactile.calibration"))
+    filtering = tactile.get("filter", {})
+    errors.extend(_require_number(filtering, "alpha", "tactile.filter"))
+    if isinstance(filtering, dict) and "alpha" in filtering:
+        alpha = _as_finite_number(filtering["alpha"])
+        if alpha is not None and not 0.0 < alpha <= 1.0:
+            errors.append("`tactile.filter.alpha` must satisfy 0 < alpha <= 1.")
     thresholds = tactile.get("thresholds", {})
     for key in ("contact", "warning", "stop", "release"):
+        errors.extend(_require_number(thresholds, key, "tactile.thresholds", nonnegative=True))
+    for key in ("contact_off", "warning_off", "stop_off"):
         errors.extend(_require_number(thresholds, key, "tactile.thresholds", nonnegative=True))
     if all(key in thresholds for key in ("release", "contact", "warning", "stop")):
         if not thresholds["release"] <= thresholds["contact"] <= thresholds["warning"] <= thresholds["stop"]:
             errors.append("`tactile.thresholds` must satisfy release <= contact <= warning <= stop.")
+    if all(key in thresholds for key in ("contact", "contact_off", "warning", "warning_off", "stop", "stop_off")):
+        if not thresholds["contact_off"] < thresholds["contact"]:
+            errors.append("`contact_off` must be below `contact`.")
+        if not thresholds["contact"] <= thresholds["warning_off"] < thresholds["warning"]:
+            errors.append("contact <= warning_off < warning is required.")
+        if not thresholds["warning"] <= thresholds["stop_off"] < thresholds["stop"]:
+            errors.append("warning <= stop_off < stop is required.")
     simulation = tactile.get("simulation", {})
     errors.extend(_require_number(simulation, "contact_stiffness", "tactile.simulation", nonnegative=True))
     errors.extend(_require_number(simulation, "contact_damping", "tactile.simulation", nonnegative=True))
+    errors.extend(_require_positive_number(simulation, "force_saturation_n", "tactile.simulation"))
+    if all(key in thresholds for key in ("stop",)) and "force_saturation_n" in simulation:
+        saturation = _as_finite_number(simulation["force_saturation_n"])
+        stop = _as_finite_number(thresholds["stop"])
+        if saturation is not None and stop is not None and stop > saturation:
+            errors.append("`tactile.thresholds.stop` must not exceed `force_saturation_n`.")
     errors.extend(_require_number(simulation, "latency", "tactile.simulation", nonnegative=True))
     errors.extend(_require_number(simulation, "noise_std", "tactile.simulation", nonnegative=True))
     return errors

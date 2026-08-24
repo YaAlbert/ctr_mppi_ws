@@ -26,6 +26,7 @@ evaluation:
   near_zero_baseline_epsilon: 1.0e-12
   plot_generation: true
   report_generation: true
+  enable_finalization_profiling: false
   physical_validation: false
   hardware_validation: false
   orchestration:

@@ -5,7 +5,6 @@ from ctr_bringup.parameter_validation import validate_config_paths
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
-from launch.substitutions import PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -19,6 +18,7 @@ CONFIG_NAMES = (
     "safety_params.yaml",
     "tactile_params.yaml",
     "hardware_params.yaml",
+    "slice_7g_runtime_params.yaml",
 )
 
 
@@ -40,8 +40,14 @@ def generate_launch_description():
     cylinder_target_y = LaunchConfiguration("cylinder_target_y")
     cylinder_target_z = LaunchConfiguration("cylinder_target_z")
     mppi_random_seed = LaunchConfiguration("mppi_random_seed")
+    slice_7g_profile = LaunchConfiguration("slice_7g_profile")
+    development_simulation = LaunchConfiguration("development_simulation")
     cylinder_target_position = ParameterValue(
-        PythonExpression(["[", cylinder_target_x, ", ", cylinder_target_y, ", ", cylinder_target_z, "]"]),
+        [
+            [cylinder_target_x],
+            [cylinder_target_y],
+            [cylinder_target_z],
+        ],
         value_type=list[float],
     )
 
@@ -107,6 +113,16 @@ def generate_launch_description():
                 default_value="-1",
                 description="Optional MPPI random seed override.",
             ),
+            DeclareLaunchArgument(
+                "slice_7g_profile",
+                default_value="false",
+                description="Apply the authenticated simulation-only Slice 7G effective configuration.",
+            ),
+            DeclareLaunchArgument(
+                "development_simulation",
+                default_value="false",
+                description="Explicit non-production user-level Slice 7G workflow.",
+            ),
             Node(
                 package="ctr_mppi_controller",
                 executable="mppi_controller_node",
@@ -126,6 +142,10 @@ def generate_launch_description():
                         "cylinder_profile": cylinder_profile,
                         "cylinder_target_position": cylinder_target_position,
                         "mppi_random_seed": mppi_random_seed,
+                        "slice_7g_profile": ParameterValue(slice_7g_profile, value_type=bool),
+                        "development_simulation": ParameterValue(
+                            development_simulation, value_type=bool
+                        ),
                     }
                 ],
             ),

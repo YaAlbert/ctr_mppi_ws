@@ -14,7 +14,7 @@ setup(
     zip_safe=True,
     maintainer="TODO-OWNER-001",
     maintainer_email="todo@example.com",
-    description="Milestone 1 placeholder package for tactile processing.",
+    description="Simulation-only deterministic tactile signal model.",
     license="TODO-LICENSE-001",
     entry_points={"console_scripts": ["tactile_placeholder_node = ctr_tactile.nodes.tactile_placeholder_node:main"]},
 )

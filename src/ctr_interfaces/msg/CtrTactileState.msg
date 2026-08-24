@@ -8,3 +8,11 @@ bool warning
 bool stop
 bool valid
 string diagnostic_status
+float64 clearance_m
+string source
+
+uint8 REGION_NO_CONTACT=0
+uint8 REGION_CONTACT=1
+uint8 REGION_WARNING=2
+uint8 REGION_STOP=3
+uint8 region

@@ -1,6 +1,6 @@
 # Current Project Status
 
-Last updated: 2026-07-29
+Last updated: 2026-08-23
 
 Status source: current Ubuntu 22.04 repository audit, focused test results,
 clean isolated build results, Milestone 4 foreground ROS2 runtime smoke test,
@@ -8,11 +8,179 @@ Milestone 5 bounded simulation-only trajectory smoke tests, committed
 Milestone 5D quantitative evaluation framework, committed Milestone 5D.1
 deterministic matched-run orchestration, Milestone 6A straight cylindrical
 lumen navigation verification, and Milestone 6A.1 exact-target repeatability
-verification. Documentation only was updated for this status refresh.
+verification. This status also records the Slice 7G source-only monitor,
+descriptor-ownership, and test corrections, plus the explicitly selected
+non-production Slice 7G development-simulation workflow described below.
 
 The current Ubuntu repository and runtime environment are the operational
 source of truth. Earlier Windows-created work is treated as historical project
 assets unless it has been verified in the current Ubuntu environment.
+
+Slice 7G now has a coordinated simulation-promotion source implementation for
+the approved charter-v7 profile: supervised command routing, simulated tactile
+input and MPPI cost, tactile-aware safety/readiness, one-domain 15-cell
+coordination, exactly-once ledger commits, sealed evidence production and
+governance reconciliation. The repository-owned production entrypoint now
+assembles four fail-closed domain observers, atomic lease/release accounting,
+the real runner-artifact adapter, and unified manual-reset safety fault
+latching; callers cannot supply authority callbacks through the console path.
+Charter v7 additionally defines the separately provisioned
+`ctr7g-authority`/`ctr7g-campaign` OS-principal boundary, fixed AF_UNIX
+authority service, closed canonical authority/install/process/environment
+records, one global campaign-independent 0/1 budget, precommit rollback,
+mandatory postcommit fixed-systemd-unit revocation, and the authority-mediated
+output-parent ACL contract. Only source candidates and synthetic tests exist:
+no OS accounts, installed tree, authority state, revision-zero budget, service,
+authorization, domain, output root, or campaign attempt has been created.
+Charter v7 adds two separate fixed root-owned source candidates: a monotonic
+cleanup-authority ledger service and an exclusive observer supervisor. The
+unprivileged authority daemon has query/request access only; it cannot write
+the root ledger, manipulate cgroups, or select an executable. The supervisor
+places a blocked stub into one exclusive non-child-delegated cgroup-v2 leaf
+before executing the fixed observer and returns only authenticated containment
+receipts plus bounded sealed stdout/stderr memfds over closed AF_UNIX
+SOCK_SEQPACKET messages. Cleanup revision/anchor/head triples and quarantine
+are durable but non-consuming. Production recovery remains unavailable until
+the separate recovery OS principal and numeric identities are provisioned.
+The root helpers now bootstrap only from the fixed root-owned
+`ctr-slice-7g-authority-bootstrap-3` record: it physically binds the complete
+privileged module, service-wrapper, interpreter and ROS CLI inventory, while
+the authority-owned installed-runtime record is evidence only and cannot
+select the imported code root. Nested charter-v7 records are recursively
+closed; installed-runtime-manifest v3 binds every member's root owner/group,
+while v2 remains historical-only. Helper responses are bound to their exact request, connection, peer
+and service generation with bounded completed-operation replay memory. The
+root helper units use distinct private runtime directories and only the narrow
+`CAP_DAC_READ_SEARCH` access needed to authenticate fixed authority-owned
+evidence plus `CAP_CHOWN` to assign their socket group; `CAP_DAC_OVERRIDE`
+remains prohibited.
+
+The narrow precommit ROS-graph exception is now represented as an authenticated
+`PRECOMMIT_ROS_GRAPH_OBSERVER` only: exact `/opt/ros/humble/bin/ros2 node list
+--no-daemon`, a closed installed environment/cwd/cgroup, strict bounded output,
+and a process/PGID/DDS residual-cleanup barrier. A non-consuming 1,800-second
+observation session permits at most 100 ordered precommit observations; only a
+completed four-source observation may receive the nonrenewable 300-second
+prepare token. The durable commit binds that observation, and exactly one
+postcommit recheck brings the transaction maximum to 101 before any campaign
+child. Observation evidence is now constructed only by daemon-owned providers;
+each receipt binds an acyclic session identity, service nonce, phase and
+ordinals. Caller-created receipts and four-source records are rejected,
+ordinary failures invalidate the session immediately, cleanup uncertainty
+is recorded in the root-owned non-consuming durable cleanup ledger that blocks
+further work across daemon/helper reconstruction. Cleanup enumerates the
+exclusive leaf rather than trusting PGID/SID ancestry, so `setsid()`, PGID
+changes and double forks do not escape the source contract. The four-source clearance now
+uses a descriptor-authenticated read of the shared global lease registry rather
+than a derived lease identity. These are source contracts
+exercised only with synthetic providers;
+the real cgroup, cleanup ledger, lease registry, ROS/DDS observer and recovery
+path remain unexecuted and unavailable until privileged provisioning and
+installed-runtime proof.
+The corrected production flow validates the charter-fixed output parent before
+durable effects, uses one global lease registry across all valid campaign
+descendants, rechecks domain occupancy after consuming 1/1 and before process
+creation, derives semantics from descriptor-authenticated cached result bytes,
+and retains exact stdout/stderr bytes. Cell-output authentication is iterative
+and source-bounded to depth 16, 2,048 descendants, 64 MiB per file, 8 MiB per
+semantic file, 256 MiB aggregate bytes and 32 MiB cached semantic bytes;
+non-semantic artifacts are stream-hashed without full-byte retention and the
+final barrier builds no second byte tree. The coordinator also preserves a
+primary campaign failure when release or cleanup accounting fails.
+The post-implementation snapshot source contract now has an authoritative
+mode-binding v2 producer: one retained descriptor authority independently
+discovers the complete member set, captures every normalized integer mode from
+the same descriptor used for streamed size/digest authentication, retains
+initial member/directory/root/parent metadata, and rejects change-and-restore or
+path/inode replacement at its final barrier. Before accepting its first
+authoritative baseline it captures and hashes a complete private provisional
+tree, installs a watch for every provisional source directory, drains setup
+events, and requires a second complete metadata/digest inventory to match.
+Nested changes occurring after root setup but before a child watch are thus
+detected from provisional facts rather than being reclassified as harmless.
+Strict 16-byte inotify framing rejects truncation, invalid name
+padding, trailing bytes, EOF, overflow, invalidation, unknown watches, and
+bounded-drain exhaustion. Cleanup attempts every owned resource in deterministic
+order even after a cleanup `BaseException`; descriptors are registered before
+metadata access, and an ambiguous one-shot close is terminally quarantined
+without inode-based numeric retry. This preserves independently reopened
+same-inode descriptors and validation failures, while immutable cleanup
+accounting explicitly reports residual uncertainty. Runtime tests restore all
+governance evidence-parent mutations in `finally`. Ancestor authority binds
+device/inode/type/mode and each exact descriptor-relative next component while
+ignoring unrelated sibling-driven ancestor size, link-count, and timestamp
+changes; repository-root and source-tree metadata continuity remains strict.
+Canonical pytest accounting fixes the applicable paths, deterministic pre-build
+interface shim, historical deselections, repository-relative normalization, and
+LF-only serialization. The complete prebaseline-watch correction adds 22
+stage-reaching nodes; the final source-only applicable suite contains 917
+passing nodes, with two historical authoring checks deselected, zero
+skips/xfails, and canonical node-ID SHA-256
+`ce8395e8a91806753e26da5cfaa049e001dc01ceb302129b7200a93987711da6`.
+Structural inspection and caller subsets remain
+non-authoritative; the build verifier rediscovers and requires exact complete
+membership. The immutable v1 artifact remains a historical
+predecessor only and is explicitly rejected by the v2-only build verifier; it
+is not silently upgraded from current filesystem modes. No durable v2 artifact
+has been created.
+This is source and unit/static-test status only.
+No production authority installation, governed ROS observer execution, domain
+lease, campaign attempt, acceptance result, or promotion has been authorized
+or completed. The separate non-production development build and simulator run
+are recorded below.
+
+## Slice 7G development-simulation result
+
+The production authority path remains fail closed and unchanged by default.
+An explicit `--development-simulation` entry point now reuses the existing
+curved-lumen simulator, MPPI controller, simulated tactile publisher, safety
+supervisor, evaluation recorder, metrics, and plotting pipeline without root
+services or the production budget. The mode validates that runtime mode is
+`simulation`, uses a user-level interprocess ROS-domain lock, limits output to
+safe user-owned roots, and labels every result as non-production evidence.
+
+On 2026-08-23 the eight requested packages built successfully in an isolated,
+non-symlink install. After the profile-guided optimization described below, a
+practical package/launch/runtime test selection passed 882 tests. One 5-second
+seed-11 smoke
+pair and 25-second pairs for seeds 11, 22, and 33 all reached readiness,
+published commands and changing state, completed valid baseline/candidate
+comparisons, recorded zero collision/safety/tactile events, and left no owned
+processes. The example final tip errors were 0.004279 m, 0.002409 m, and
+0.003140 m respectively; all three example runs reported navigation success.
+The batch used independently selected ROS domains 186, 197, 194, and 126.
+Results are under
+`evaluation_results/slice_7g_development_20260823T005500Z/`.
+
+The unchanged 36-sample, seven-step `cylinder_fast` profile was then optimized
+without changing its horizon, sample count, weights, or production defaults.
+NumPy batch projection replaced the per-backbone-point curved-lumen loop,
+immutable model limits/scales are cached, and the deterministic final rollout
+result is reused for terminal costs. Eight-solve profiling reduced mean MPPI
+solve time from 1.4669 s to 0.3702 s. Repeated 25-second simulator runs raised
+mean effective solve frequency from 0.3373 Hz to 1.2969 Hz across seeds 11, 22,
+and 33, while mean trajectory RMSE improved from 0.004058 m to 0.002462 m,
+mean minimum wall clearance increased from 0.025437 m to 0.026922 m, and all
+three runs retained zero collisions and clean orchestration cleanup. The
+controller is still not claimed to be real time. Results and four RViz captures
+are under
+`evaluation_results/slice_7g_performance_optimized_20260823T014418Z/`.
+
+RViz was also launched successfully with the curved-lumen markers, CTR
+visualization, reference path, tip display, and OK global status. One first-run
+Ctrl-C produced a transient safety-node SIGSEGV, but two immediate repeat
+launches shut down every node cleanly. A later bounded reliability run did not
+reproduce the SIGSEGV, but did expose one shutdown-only ROS 2 Humble message
+conversion `RuntimeError` in the safety-node entry point. The entry point now
+normalizes that race only after the ROS context is inactive and preserves the
+same exception while the context is active. The installed correction passed
+884 functional tests and a fresh 10/10 controlled RViz shutdown run on domains
+181--190: every required process exited zero after one SIGINT, no escalation or
+crash marker occurred, and no child survived. EVAL-005 remains a historical,
+non-reproduced low-priority observation. The detailed result is
+`evaluation_results/slice_7g_performance_optimized_20260823T014418Z/visual_shutdown_reliability.md`.
+This development run created no production authority, budget, evidence seal,
+or attempt and is not a Slice 7G promotion result.
 
 ## Ubuntu environment and build-readiness summary
 
@@ -111,8 +279,9 @@ assets unless it has been verified in the current Ubuntu environment.
     target, and comparison compatibility validates target identity.
   - Milestone 5 trajectory tracking is not performance verified, not real-time
     capable, not physically validated, and not hardware validated.
-  - MPPI shape, obstacle, tactile-force, and stability behavior is not
-    complete.
+  - MPPI shape, obstacle, and stability costs remain disabled and unfinished.
+    Slice 7G simulated tactile-force cost is source-integrated but has not been
+    build- or runtime-verified.
   - Package-local unit tests pass when run directly, but top-level
     `unittest discover -s src` discovers zero tests.
 

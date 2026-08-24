@@ -31,6 +31,8 @@ from ctr_evaluation.curved_lumen_scenarios import (  # noqa: E402
     CENTERLINE_TARGET,
     LATERAL_OFFSET_TARGET,
     NEAR_SAFETY_BOUNDARY_TARGET,
+    S_CURVE_MIDDLE_TARGET,
+    S_CURVE_NEAR_OUTLET_TARGET,
 )
 
 
@@ -200,6 +202,28 @@ class CurvedLumenRunnerTest(unittest.TestCase):
         self.assertTrue(overridden.curved_scenario.override_used)
         np.testing.assert_allclose(overridden._target_position_for_launch(), nominal.curved_scenario.validated_target, atol=1.0e-12, rtol=0.0)
 
+    def test_s_curve_target_identity_is_resolved_once_and_seed_independent(self):
+        for scenario_id in (S_CURVE_MIDDLE_TARGET, S_CURVE_NEAR_OUTLET_TARGET):
+            resolved = []
+            for seed in (11, 22, 33):
+                orch = orchestrator(
+                    "--curved-lumen-type", "s_curve", "--scenario", scenario_id, "--seed", str(seed)
+                )
+                identity = orch._curved_scenario_identity_metadata()
+                resolved.append(identity)
+                self.assertEqual(scenario_id, identity["scenario_id"])
+                self.assertEqual("s_curve", identity["curved_lumen_type"])
+                self.assertEqual("fixed_target", identity["target_mode"])
+                self.assertEqual(0.003, identity["target_tolerance"])
+                self.assertEqual(0.5, identity["required_hold_duration"])
+                self.assertEqual(0.50 if scenario_id == S_CURVE_MIDDLE_TARGET else 0.90, identity["centerline_fraction"])
+                self.assertEqual(0.0, identity["radial_offset"])
+                self.assertEqual(identity["requested_target"], identity["executed_target"])
+                self.assertEqual(identity["geometry_fingerprint"], orch.curved_scenario.geometry_fingerprint)
+                json.dumps(sanitize_for_json(identity), allow_nan=False)
+            self.assertEqual(resolved[0], resolved[1])
+            self.assertEqual(resolved[1], resolved[2])
+
     def test_invalid_curved_target_fails_before_process_start(self):
         calls = []
         original_start = run_module.ProcessManager.start
@@ -245,9 +269,9 @@ class CurvedLumenRunnerTest(unittest.TestCase):
         self.assertIn("enable_curved_lumen:=true", baseline)
         self.assertIn("curved_lumen_type:=s_curve", baseline)
         self.assertIn("reference_mode:=fixed_target", baseline)
-        self.assertIn("cylinder_target_x:=0.012345679", baseline)
-        self.assertIn("cylinder_target_y:=-0.004000000", baseline)
-        self.assertIn("cylinder_target_z:=0.101000000", baseline)
+        self.assertIn("cylinder_target_x:=0.0123456789", baseline)
+        self.assertIn("cylinder_target_y:=-0.0040000000000000001", baseline)
+        self.assertIn("cylinder_target_z:=0.10100000000000001", baseline)
         self.assertIn("cylinder_profile:=cylinder_fast", baseline)
         self.assertIn("mppi_random_seed:=11", baseline)
         self.assertIn("run_role:=baseline", baseline)
@@ -275,7 +299,7 @@ class CurvedLumenRunnerTest(unittest.TestCase):
             self.assertIn("cylinder_profile:=cylinder_fast", command)
             self.assertIn("mppi_random_seed:=7", command)
             for index, axis in enumerate(("x", "y", "z")):
-                expected = f"cylinder_target_{axis}:={orch.curved_scenario.validated_target[index]:.9f}"
+                expected = f"cylinder_target_{axis}:={orch.curved_scenario.validated_target[index]:.17g}"
                 self.assertIn(expected, command)
         self.assertEqual("evaluation_reference.launch.py", reference[3])
         self.assertNotIn("trajectory_start_policy:=scheduled_time", reference)

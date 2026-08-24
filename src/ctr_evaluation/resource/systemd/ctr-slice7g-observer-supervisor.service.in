@@ -1,0 +1,45 @@
+[Unit]
+Description=CTR Slice 7G exclusive ROS graph observer supervisor
+Wants=ctr-slice7g-cleanup-authority.service
+After=ctr-slice7g-cleanup-authority.service local-fs.target
+Before=ctr-slice7g-authority.service ctr-slice7g-campaign.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/libexec/ctr-mppi/ctr-slice7g-observerd
+WorkingDirectory=/
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_READ_SEARCH CAP_SETUID CAP_SETGID CAP_KILL
+AmbientCapabilities=
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectControlGroups=no
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+InaccessiblePaths=/run/systemd/private /run/dbus/system_bus_socket
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+ReadOnlyPaths=/etc/ctr-mppi/slice-7g-authority /opt/ctr-mppi/slice-7g /usr/libexec/ctr-mppi /var/lib/ctr-mppi/slice-7g-cleanup-authority
+ReadWritePaths=/run/ctr-mppi/slice-7g-observer-supervisor /run/ctr-slice7g-observer
+RuntimeDirectory=ctr-mppi/slice-7g-observer-supervisor ctr-slice7g-observer
+RuntimeDirectoryMode=0755
+Delegate=yes
+KillMode=control-group
+KillSignal=SIGINT
+FinalKillSignal=SIGKILL
+SendSIGKILL=yes
+TimeoutStopSec=5s
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

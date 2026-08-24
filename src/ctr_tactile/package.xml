@@ -3,7 +3,7 @@
 <package format="3">
   <name>ctr_tactile</name>
   <version>0.0.1</version>
-  <description>Milestone 1 placeholder package for tactile processing.</description>
+  <description>Simulation-only deterministic tactile signal model.</description>
   <maintainer email="todo@example.com">TODO-OWNER-001</maintainer>
   <license>TODO-LICENSE-001</license>
   <buildtool_depend>ament_python</buildtool_depend>

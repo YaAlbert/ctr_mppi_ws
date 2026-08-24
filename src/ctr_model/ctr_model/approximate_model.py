@@ -38,6 +38,12 @@ class ApproximateCTRModel:
         self._precurved_length = _array3(tube["precurved_length"], "robot.tube.precurved_length")
         self._curvature_scale = _array3(approximate.get("curvature_scale", [1.0, 1.0, 1.0]), "model.approximate.curvature_scale")
         self._limits = self._robot["limits"]
+        self._insertion_min = _array3(self._limits["insertion_min"], "robot.limits.insertion_min")
+        self._insertion_max = _array3(self._limits["insertion_max"], "robot.limits.insertion_max")
+        self._rotation_min = _array3(self._limits["rotation_min"], "robot.limits.rotation_min")
+        self._rotation_max = _array3(self._limits["rotation_max"], "robot.limits.rotation_max")
+        self._maximum_tube_length = float(np.max(self._tube_lengths))
+        self._inverse_insertion_scale = 1.0 / np.maximum(self._insertion_max, 1e-9)
 
     def forward_kinematics(self, q: np.ndarray | list[float] | tuple[float, ...]) -> CTRModelResult:
         q_array = np.asarray(q, dtype=float)
@@ -46,19 +52,16 @@ class ApproximateCTRModel:
         if not np.all(np.isfinite(q_array)):
             raise ValueError("q must contain only finite values")
 
-        insertion_min = _array3(self._limits["insertion_min"], "robot.limits.insertion_min")
-        insertion_max = _array3(self._limits["insertion_max"], "robot.limits.insertion_max")
-        rotation_min = _array3(self._limits["rotation_min"], "robot.limits.rotation_min")
-        rotation_max = _array3(self._limits["rotation_max"], "robot.limits.rotation_max")
+        rho = np.clip(q_array[:3], self._insertion_min, self._insertion_max)
+        theta = np.clip(q_array[3:], self._rotation_min, self._rotation_max)
 
-        rho = np.clip(q_array[:3], insertion_min, insertion_max)
-        theta = np.clip(q_array[3:], rotation_min, rotation_max)
-
-        exposed_length = float(np.clip(np.max(self._precurved_length + rho), 0.01, np.max(self._tube_lengths)))
+        exposed_length = float(
+            np.clip(np.max(self._precurved_length + rho), 0.01, self._maximum_tube_length)
+        )
         s = np.linspace(0.0, exposed_length, self._num_points)
 
         curvature_components = self._precurvature * self._curvature_scale
-        insertion_weight = 1.0 + rho / np.maximum(insertion_max, 1e-9)
+        insertion_weight = 1.0 + rho * self._inverse_insertion_scale
         weighted = curvature_components * insertion_weight
         normalizer = max(float(np.sum(insertion_weight)), 1e-9)
 

@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch immutable CTR Slice 7G post-commit revocation triggers
+
+[Path]
+DirectoryNotEmpty=/var/lib/ctr-mppi/slice-7g-authority/revocation/pending
+Unit=ctr-slice7g-revocation.service
+MakeDirectory=no
+
+[Install]
+WantedBy=multi-user.target

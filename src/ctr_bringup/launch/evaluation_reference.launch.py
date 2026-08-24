@@ -5,7 +5,6 @@ from ctr_bringup.parameter_validation import validate_config_paths
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
-from launch.substitutions import PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -19,6 +18,7 @@ CONFIG_NAMES = (
     "safety_params.yaml",
     "tactile_params.yaml",
     "hardware_params.yaml",
+    "slice_7g_runtime_params.yaml",
 )
 
 
@@ -42,7 +42,11 @@ def generate_launch_description():
     cylinder_target_z = LaunchConfiguration("cylinder_target_z")
     mppi_random_seed = LaunchConfiguration("mppi_random_seed")
     cylinder_target_position = ParameterValue(
-        PythonExpression(["[", cylinder_target_x, ", ", cylinder_target_y, ", ", cylinder_target_z, "]"]),
+        [
+            [cylinder_target_x],
+            [cylinder_target_y],
+            [cylinder_target_z],
+        ],
         value_type=list[float],
     )
 

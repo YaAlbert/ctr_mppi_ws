@@ -17,13 +17,13 @@ sys.path.insert(0, str(REPO_ROOT / "src" / "ctr_mppi_controller"))
 
 try:
     import ctr_interfaces.msg as ctr_interfaces_msg_module  # noqa: F401
-    for required_name in ("CtrBackbone", "CtrJointCommand", "CtrJointState", "CtrState"):
+    for required_name in ("CtrBackbone", "CtrJointCommand", "CtrJointState", "CtrState", "CtrTactileState"):
         if not hasattr(ctr_interfaces_msg_module, required_name):
             raise ImportError(required_name)
 except ImportError:
     ctr_interfaces_module = types.ModuleType("ctr_interfaces")
     ctr_interfaces_msg_module = types.ModuleType("ctr_interfaces.msg")
-    for name in ("CtrBackbone", "CtrJointCommand", "CtrJointState", "CtrState"):
+    for name in ("CtrBackbone", "CtrJointCommand", "CtrJointState", "CtrState", "CtrTactileState"):
         setattr(ctr_interfaces_msg_module, name, type(name, (), {}))
     sys.modules["ctr_interfaces"] = ctr_interfaces_module
     sys.modules["ctr_interfaces.msg"] = ctr_interfaces_msg_module

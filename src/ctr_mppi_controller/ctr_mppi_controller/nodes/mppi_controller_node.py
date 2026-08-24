@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import numpy as np
 import rclpy
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
@@ -16,7 +17,11 @@ from ctr_bringup.parameter_validation import (
     validate_or_raise,
 )
 from ctr_bringup.placeholder_node import run_node_until_shutdown
-from ctr_interfaces.msg import CtrControllerMetrics, CtrJointCommand, CtrState
+from ctr_bringup.slice_7g_profile import (
+    apply_slice_7g_development_simulation_profile,
+    apply_slice_7g_simulation_profile,
+)
+from ctr_interfaces.msg import CtrControllerMetrics, CtrJointCommand, CtrState, CtrTactileState
 from ctr_model.approximate_model import ApproximateCTRModel
 from ctr_mppi_controller.cylindrical_lumen import goal_position_from_config
 from ctr_mppi_controller.lumen_factory import (
@@ -27,6 +32,12 @@ from ctr_mppi_controller.lumen_factory import (
     lumen_mode_from_config,
 )
 from ctr_mppi_controller.mppi_core import MPPICore
+from ctr_mppi_controller.tactile_cost import (
+    TactileCostConfig,
+    TactileSnapshot,
+    snapshot_eligibility,
+    snapshot_from_values,
+)
 from ctr_mppi_controller.reference_validation import (
     EXTERNAL_TARGET,
     FIXED_TARGET,
@@ -69,6 +80,8 @@ class MPPIControllerNode(Node):
         self.declare_parameter("cylinder_profile", "")
         self.declare_parameter("cylinder_target_position", Parameter.Type.DOUBLE_ARRAY)
         self.declare_parameter("mppi_random_seed", -1)
+        self.declare_parameter("slice_7g_profile", False)
+        self.declare_parameter("development_simulation", False)
 
         config_paths = validate_config_paths(self.get_parameter("config_paths").value)
 
@@ -95,7 +108,23 @@ class MPPIControllerNode(Node):
             cylinder_profile=str(self.get_parameter("cylinder_profile").value or ""),
             random_seed=_optional_seed(self.get_parameter("mppi_random_seed").value),
         )
+        development_enabled = parse_launch_bool(
+            self.get_parameter("development_simulation").value,
+            "development_simulation",
+        )
+        self.config = (
+            apply_slice_7g_development_simulation_profile(self.config, enabled=True)
+            if development_enabled
+            else apply_slice_7g_simulation_profile(
+                self.config,
+                enabled=parse_launch_bool(
+                    self.get_parameter("slice_7g_profile").value,
+                    "slice_7g_profile",
+                ),
+            )
+        )
         validate_or_raise(self.config)
+        self.slice_7g_profile = self.config.get("runtime", {}).get("slice_7g_profile") is True
 
         self.model = ApproximateCTRModel(self.config)
         self.lumen_geometry = lumen_geometry_from_config(self.config)
@@ -105,6 +134,10 @@ class MPPIControllerNode(Node):
         self.frame_id = str(self.config["robot"]["frames"]["base"])
         self.reference_frame_id = str(self.config.get("reference", {}).get("frame_id", self.frame_id))
         self.reference_stale_timeout = float(self.config.get("reference", {}).get("stale_timeout", 0.20))
+        self.tactile_cost_config = TactileCostConfig.from_project_config(self.config)
+        self._tactile_lock = threading.Lock()
+        self.latest_tactile_snapshot: TactileSnapshot | None = None
+        self.latest_tactile_reason = "disabled"
         self.active_reference = initial_reference(self.reference_mode)
         self.active_trajectory_reference = initial_trajectory_reference()
         self.target_tip = np.zeros(3, dtype=float)
@@ -121,7 +154,14 @@ class MPPIControllerNode(Node):
         self._warned_missing_horizon = False
         self._warned_missing_reference = False
         self._last_invalid_reference_warning_s: float | None = None
-        self.publish_safe_for_sim = bool(self.get_parameter("publish_safe_command_for_simulation").value)
+        self.publish_safe_for_sim = parse_launch_bool(
+            self.get_parameter("publish_safe_command_for_simulation").value,
+            "publish_safe_command_for_simulation",
+        )
+        if self.config.get("runtime", {}).get("slice_7g_profile") is True and self.publish_safe_for_sim:
+            raise ValueError(
+                "slice_7g_controller_bypass: direct /ctr/safe_command publication is prohibited"
+            )
         self.tracking_metrics_config = TrajectoryMetricsConfig.from_project_config(self.config)
         self.trajectory_metrics = TrajectoryMetricsAccumulator(
             config=self.tracking_metrics_config,
@@ -131,6 +171,9 @@ class MPPIControllerNode(Node):
         self.last_trajectory_metrics_publish_s: float | None = None
 
         self.state_sub = self.create_subscription(CtrState, "/ctr/state", self._on_state, 10)
+        self.tactile_sub = None
+        if self.tactile_cost_config.enabled:
+            self.tactile_sub = self.create_subscription(CtrTactileState, "/ctr/tactile/state", self._on_tactile, 10)
         self.target_sub = self.create_subscription(PoseStamped, "/ctr/reference/tip", self._on_target, 10)
         self.horizon_sub = self.create_subscription(NavPath, "/ctr/reference/horizon", self._on_reference_horizon, 10)
         self.command_pub = self.create_publisher(CtrJointCommand, "/ctr/mppi_command", 10)
@@ -191,6 +234,43 @@ class MPPIControllerNode(Node):
             self.latest_state = msg
         else:
             self.get_logger().warn("Ignoring invalid /ctr/state message.")
+
+    def _on_tactile(self, msg: CtrTactileState) -> None:
+        try:
+            timestamp_s = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1.0e-9
+            snapshot = snapshot_from_values(
+                timestamp_s=timestamp_s,
+                frame_id=msg.header.frame_id,
+                source=msg.source,
+                valid=msg.valid,
+                contact=msg.contact,
+                warning=msg.warning,
+                stop=msg.stop,
+                region=msg.region,
+                force_magnitude_n=msg.force_magnitude,
+            )
+            with self._tactile_lock:
+                self.latest_tactile_snapshot = snapshot
+                self.latest_tactile_reason = "received"
+        except (TypeError, ValueError, AttributeError) as exc:
+            with self._tactile_lock:
+                self.latest_tactile_snapshot = None
+                self.latest_tactile_reason = f"invalid_message:{type(exc).__name__}"
+            self.get_logger().warn(f"Ignoring invalid /ctr/tactile/state message: {exc}")
+
+    def _tactile_for_solve(self, *, current_time_s: float) -> tuple[TactileSnapshot | None, str]:
+        tactile_config = getattr(self, "tactile_cost_config", None)
+        if tactile_config is None or not tactile_config.enabled:
+            return None, "disabled"
+        with self._tactile_lock:
+            snapshot = self.latest_tactile_snapshot
+        eligible, reason = snapshot_eligibility(
+            snapshot,
+            now_s=current_time_s,
+            max_age_s=tactile_config.max_age_s,
+            expected_frame=self.frame_id,
+        )
+        return (snapshot if eligible else None), reason
 
     def _on_target(self, msg: PoseStamped) -> None:
         point = [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z]
@@ -330,10 +410,19 @@ class MPPIControllerNode(Node):
                 self._warned_missing_horizon = True
             return
 
+        tactile_snapshot, tactile_reason = self._tactile_for_solve(current_time_s=current_time_s)
+        if self.slice_7g_profile and tactile_snapshot is None:
+            self.get_logger().warn(
+                f"Slice 7G MPPI command withheld until tactile input is eligible: {tactile_reason}"
+            )
+            return
+
         try:
             result = self.core.solve(
                 q=np.asarray(self.latest_state.q, dtype=float),
                 q_dot=np.asarray(self.latest_state.q_dot, dtype=float),
+                tactile_snapshot=tactile_snapshot,
+                tactile_snapshot_reason=tactile_reason,
                 **reference_kwargs,
             )
         except Exception as exc:

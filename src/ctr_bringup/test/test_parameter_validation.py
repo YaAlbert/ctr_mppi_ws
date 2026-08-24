@@ -1,5 +1,6 @@
 import importlib.util
 import copy
+import math
 import os
 import sys
 import tempfile
@@ -32,6 +33,7 @@ CONFIG_FILES = [
     REPO_ROOT / "config" / "safety_params.yaml",
     REPO_ROOT / "config" / "tactile_params.yaml",
     REPO_ROOT / "config" / "hardware_params.yaml",
+    REPO_ROOT / "config" / "slice_7g_runtime_params.yaml",
 ]
 
 
@@ -86,10 +88,83 @@ def launch_description_with_temp_share(module):
 
 
 class ParameterValidationTest(unittest.TestCase):
+    def test_safety_tactile_defaults_and_watchdog_constraints(self):
+        config = load_parameter_files(CONFIG_FILES)
+        safety = config["safety"]
+        self.assertFalse(safety["tactile_enabled"])
+        self.assertEqual([], [error for error in validate_project_config(config) if error.startswith("`safety")])
+        invalid_cases = (
+            ("tactile_startup_grace_s", -0.01),
+            ("tactile_future_skew_s", float("nan")),
+            ("watchdog_period_s", 0.0),
+            ("watchdog_period_s", 0.2),
+        )
+        for key, value in invalid_cases:
+            with self.subTest(key=key, value=value):
+                invalid = copy.deepcopy(config)
+                invalid["safety"][key] = value
+                self.assertTrue(any(f"safety.{key}" in error for error in validate_project_config(invalid)))
+
+    def test_enabled_tactile_safety_requires_timeout_stop(self):
+        config = load_parameter_files(CONFIG_FILES)
+        config["safety"]["tactile_enabled"] = True
+        config["safety"]["stop_on_tactile_timeout"] = False
+        errors = validate_project_config(config)
+        self.assertTrue(any("stop_on_tactile_timeout" in error for error in errors), errors)
+
     def test_current_project_config_validates(self):
         config = load_parameter_files(CONFIG_FILES)
         validate_or_raise(config)
         self.assertEqual([], validate_project_config(config))
+
+    def test_tactile_7b_defaults_and_runtime_constraints_validate(self):
+        config = load_parameter_files(CONFIG_FILES)
+        self.assertFalse(config["tactile"]["enabled"])
+        self.assertEqual("simulated", config["tactile"]["mode"])
+        self.assertEqual([], [error for error in validate_project_config(config) if "tactile" in error])
+
+        invalid_cases = (
+            ("mode", "hardware"),
+            ("enabled", "false"),
+        )
+        for key, value in invalid_cases:
+            with self.subTest(key=key, value=value):
+                invalid = copy.deepcopy(config)
+                invalid["tactile"][key] = value
+                self.assertTrue(any("tactile." + key in error for error in validate_project_config(invalid)))
+
+        for section, key, values in (
+            ("calibration", "scale", (0.0, -1.0, math.nan, math.inf)),
+            ("simulation", "force_saturation_n", (0.0, -1.0, math.nan, math.inf)),
+        ):
+            for value in values:
+                with self.subTest(section=section, key=key, value=value):
+                    invalid = copy.deepcopy(config)
+                    invalid["tactile"][section][key] = value
+                    self.assertTrue(
+                        any(f"tactile.{section}.{key}" in error for error in validate_project_config(invalid)),
+                        validate_project_config(invalid),
+                    )
+
+        for value in (0.0, -0.1, math.nan, math.inf):
+            invalid = copy.deepcopy(config)
+            invalid["tactile"]["filter"]["alpha"] = value
+            self.assertTrue(any("tactile.filter.alpha" in error for error in validate_project_config(invalid)))
+
+        for key in ("contact_off", "warning_off", "stop_off"):
+            invalid = copy.deepcopy(config)
+            invalid["tactile"]["thresholds"][key] = math.nan
+            self.assertTrue(any(f"tactile.thresholds.{key}" in error for error in validate_project_config(invalid)))
+
+        invalid = copy.deepcopy(config)
+        invalid["tactile"]["thresholds"]["stop_off"] = invalid["tactile"]["thresholds"]["stop"]
+        self.assertTrue(any("stop_off" in error for error in validate_project_config(invalid)))
+
+        valid_equalities = copy.deepcopy(config)
+        valid_equalities["tactile"]["thresholds"]["warning_off"] = valid_equalities["tactile"]["thresholds"]["contact"]
+        valid_equalities["tactile"]["thresholds"]["stop_off"] = valid_equalities["tactile"]["thresholds"]["warning"]
+        valid_equalities["tactile"]["simulation"]["force_saturation_n"] = valid_equalities["tactile"]["thresholds"]["stop"]
+        self.assertEqual([], [error for error in validate_project_config(valid_equalities) if "tactile" in error])
 
     def test_simulation_visualization_defaults_validate(self):
         config = load_parameter_files(CONFIG_FILES)
@@ -101,6 +176,19 @@ class ParameterValidationTest(unittest.TestCase):
         self.assertEqual(20, visualization["ring_segments"])
         self.assertEqual(5.0, visualization["marker_publish_rate"])
         self.assertEqual([], [error for error in validate_project_config(config) if "simulation.visualization" in error])
+
+    def test_mppi_tactile_defaults_and_cross_field_validation(self):
+        config = load_parameter_files(CONFIG_FILES)
+        self.assertEqual([], [error for error in validate_project_config(config) if "mppi.tactile" in error])
+        invalid = copy.deepcopy(config)
+        invalid["mppi"]["tactile"]["enabled"] = True
+        self.assertTrue(any("positive `mppi.weights.force`" in error for error in validate_project_config(invalid)))
+        invalid = copy.deepcopy(config)
+        invalid["mppi"]["tactile"]["warning_multiplier"] = -1.0
+        self.assertTrue(any("warning_multiplier" in error for error in validate_project_config(invalid)))
+        invalid = copy.deepcopy(config)
+        invalid["mppi"]["tactile"]["force_saturation_n"] = 0.0
+        self.assertTrue(any("force_saturation_n" in error for error in validate_project_config(invalid)))
 
     def test_simulation_visualization_publish_lumen_markers_requires_bool(self):
         for value in ("true", 1, 0, None):
@@ -235,8 +323,14 @@ class ParameterValidationTest(unittest.TestCase):
             with self.subTest(file_name=file_name):
                 module = load_launch_module(file_name, f"{file_name.replace('.', '_')}_config_paths_under_test")
                 paths = temporary_config_paths(module)
-                self.assertEqual([path.name for path in CONFIG_FILES], [Path(path).name for path in paths])
+                self.assertEqual(list(module.CONFIG_NAMES), [Path(path).name for path in paths])
                 self.assertIn("evaluation_params.yaml", [Path(path).name for path in paths])
+                if file_name in {
+                    "simulation.launch.py",
+                    "evaluation_reference.launch.py",
+                    "evaluation_mppi_controller.launch.py",
+                }:
+                    self.assertEqual("slice_7g_runtime_params.yaml", Path(paths[-1]).name)
                 self.assertTrue(all(isinstance(path, str) for path in paths))
 
     def test_simulation_launch_declares_reference_manager_arguments(self):
@@ -379,6 +473,72 @@ class ParameterValidationTest(unittest.TestCase):
                 source = path.read_text(encoding="utf-8")
                 self.assertIn("ParameterValue", source)
                 self.assertIn("value_type=list[float]", source)
+
+    def test_cylinder_target_launch_values_are_finite_float_arrays(self):
+        from launch import LaunchContext
+        from launch_ros.actions import Node
+        from launch_ros.parameter_descriptions import ParameterValue
+
+        launch_files = (
+            "simulation.launch.py",
+            "evaluation_reference.launch.py",
+            "evaluation_mppi_controller.launch.py",
+        )
+        cases = (
+            (
+                "s_curve_near_outlet_target",
+                ["-0.008145713438018419", "0", "0.10901925297449416"],
+                [-0.008145713438018419, 0.0, 0.10901925297449416],
+            ),
+            (
+                "s_curve_middle_target",
+                ["0.00000000000000002233456475320139", "0.0", "0.05999999999999997"],
+                [2.233456475320139e-17, 0.0, 0.05999999999999997],
+            ),
+            ("circular_arc", ["0.015", "0.005", "0.100"], [0.015, 0.005, 0.1]),
+            ("default", ["0.015", "0.005", "0.100"], [0.015, 0.005, 0.1]),
+            ("integer-looking", ["1", "0", "2"], [1.0, 0.0, 2.0]),
+            ("negative-zero", ["-1.0", "-0.0", "2.0"], [-1.0, -0.0, 2.0]),
+            (
+                "scientific",
+                ["-8.145713438018419e-3", "0.0", "1.0901925297449416e-1"],
+                [-0.008145713438018419, 0.0, 0.10901925297449416],
+            ),
+            ("nonnumeric", ["not-a-number", "0", "1"], None),
+        )
+
+        for launch_file in launch_files:
+            module = load_launch_module(launch_file, f"{launch_file.replace('.', '_')}_target_array_under_test")
+            for case_name, launch_values, expected in cases:
+                with self.subTest(launch_file=launch_file, case=case_name):
+                    launch_description = launch_description_with_temp_share(module)
+                    target_values = []
+                    for entity in launch_description.entities:
+                        if not isinstance(entity, Node):
+                            continue
+                        for parameter_dict in getattr(entity, "_Node__parameters", ()):
+                            for value in parameter_dict.values():
+                                if isinstance(value, ParameterValue) and value.value_type == list[float]:
+                                    target_values.append(value)
+                    self.assertTrue(target_values, launch_file)
+                    context = LaunchContext()
+                    context.launch_configurations.update(
+                        {
+                            "cylinder_target_x": launch_values[0],
+                            "cylinder_target_y": launch_values[1],
+                            "cylinder_target_z": launch_values[2],
+                        }
+                    )
+                    for parameter_value in target_values:
+                        if expected is None:
+                            with self.assertRaises(ValueError):
+                                parameter_value.evaluate(context)
+                            continue
+                        result = parameter_value.evaluate(context)
+                        self.assertEqual(3, len(result))
+                        self.assertTrue(all(isinstance(item, float) for item in result))
+                        self.assertTrue(all(math.isfinite(item) for item in result))
+                        self.assertEqual(expected, result)
 
     def test_curved_launch_arguments_are_forwarded_without_scalar_overrides(self):
         launch_files = (

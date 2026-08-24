@@ -26,6 +26,7 @@ def curved_summary(*, curved_type="circular_arc", scenario_id="centerline_target
     identity = {
         "task": CURVED_TASK,
         "reference_mode": "fixed_target",
+        "target_mode": "fixed_target",
         "curved_lumen_type": curved_type,
         "scenario_id": scenario_id,
         "scenario_policy_version": "curved_scenario_v1",
@@ -39,6 +40,9 @@ def curved_summary(*, curved_type="circular_arc", scenario_id="centerline_target
         "derived_target": [0.01, 0.0, 0.1],
         "requested_target": [0.01, 0.0, 0.1],
         "executed_target": [0.01, 0.0, 0.1],
+        "centerline_fraction": 0.7,
+        "centerline_arc_length": 0.1,
+        "radial_offset": 0.0,
         "override_used": False,
     }
     lumen = {
@@ -126,7 +130,7 @@ def curved_metadata(*, role="candidate", curved_type="circular_arc", seed=11, ta
             "software_mode": "simulation",
             "configured_control_period": 0.01,
             "reference_sample_period": 0.01,
-            "goal": {"tolerance": 0.001},
+            "goal": {"tolerance": 0.001, "required_hold_duration": 0.5},
         },
     }
 
@@ -195,6 +199,7 @@ class CurvedLumenCompatibilityTest(unittest.TestCase):
     def test_identity_mismatches_are_deterministic(self):
         fields = (
             ("reference_mode", "trajectory", "reference_mode_mismatch"),
+            ("target_mode", "trajectory", "target_mode_mismatch"),
             ("curved_lumen_type", "s_curve", "curved_lumen_type_mismatch"),
             ("scenario_id", "lateral_offset_target", "scenario_id_mismatch"),
             ("scenario_policy_version", "other_policy", "scenario_policy_version_mismatch"),
@@ -205,6 +210,9 @@ class CurvedLumenCompatibilityTest(unittest.TestCase):
             ("derived_target", [0.02, 0.0, 0.1], "derived_target_mismatch"),
             ("requested_target", [0.02, 0.0, 0.1], "requested_target_mismatch"),
             ("executed_target", [0.02, 0.0, 0.1], "executed_target_mismatch"),
+            ("centerline_fraction", 0.8, "centerline_fraction_mismatch"),
+            ("centerline_arc_length", 0.2, "centerline_arc_length_mismatch"),
+            ("radial_offset", 0.001, "radial_offset_mismatch"),
             ("override_used", True, "override_state_mismatch"),
         )
         for field_name, value, code in fields:
@@ -255,6 +263,20 @@ class CurvedLumenCompatibilityTest(unittest.TestCase):
         self.assertIn("geometry_fingerprint_not_valid", result.candidate_invalid_reasons)
         self.assertEqual([], result.metric_comparisons)
 
+    def test_missing_reference_identity_evidence_invalidates_pair(self):
+        candidate = curved_summary()
+        baseline = curved_summary()
+        candidate_metadata = curved_metadata()
+        baseline_metadata = curved_metadata(role="baseline", seed=None)
+        candidate_metadata.pop("reference_matches_requested_target")
+
+        result = compare(candidate, baseline, candidate_metadata, baseline_metadata)
+
+        self.assertTrue(result.candidate_run_valid)
+        self.assertFalse(result.pair_identity_compatible)
+        self.assertFalse(result.comparison_valid)
+        self.assertIn("candidate published reference target does not match requested_target", result.compatibility_reasons)
+
     def test_authoritative_geometry_fingerprint_is_consistent_and_compared(self):
         inconsistent = curved_summary()
         inconsistent["lumen_evaluation"]["geometry"]["fingerprint"] = "different"
@@ -279,6 +301,11 @@ class CurvedLumenCompatibilityTest(unittest.TestCase):
             ("geometry_fingerprint", lambda summary, metadata: summary["lumen_evaluation"]["identity"].pop("geometry_fingerprint")),
             ("shared_environment_hash", lambda summary, metadata: summary["lumen_evaluation"]["identity"].pop("shared_environment_hash")),
             ("target_tolerance", lambda summary, metadata: metadata["configuration"]["goal"].pop("tolerance")),
+            ("required_hold_duration", lambda summary, metadata: metadata["configuration"]["goal"].pop("required_hold_duration")),
+            ("target_mode", lambda summary, metadata: summary["lumen_evaluation"]["identity"].pop("target_mode")),
+            ("centerline_fraction", lambda summary, metadata: summary["lumen_evaluation"]["identity"].pop("centerline_fraction")),
+            ("centerline_arc_length", lambda summary, metadata: summary["lumen_evaluation"]["identity"].pop("centerline_arc_length")),
+            ("radial_offset", lambda summary, metadata: summary["lumen_evaluation"]["identity"].pop("radial_offset")),
             ("evaluation_window_duration_s", lambda summary, metadata: metadata.pop("evaluation_window_duration_s")),
             ("configuration.model_configuration_hash", lambda summary, metadata: metadata["configuration"].pop("model_configuration_hash")),
             ("geometry.ctr_outer_radius_m", lambda summary, metadata: summary["lumen_evaluation"]["geometry"].pop("ctr_outer_radius_m")),
@@ -330,6 +357,7 @@ class CurvedLumenCompatibilityTest(unittest.TestCase):
     def test_required_identity_numeric_and_string_types_are_validated(self):
         cases = (
             ("target_tolerance", lambda summary, metadata, value: metadata["configuration"]["goal"].__setitem__("tolerance", value)),
+            ("required_hold_duration", lambda summary, metadata, value: metadata["configuration"]["goal"].__setitem__("required_hold_duration", value)),
             ("ctr_outer_radius_m", lambda summary, metadata, value: summary["lumen_evaluation"]["geometry"].__setitem__("ctr_outer_radius_m", value)),
             ("shared_environment_hash", lambda summary, metadata, value: summary["lumen_evaluation"]["identity"].__setitem__("shared_environment_hash", value)),
         )
@@ -346,6 +374,18 @@ class CurvedLumenCompatibilityTest(unittest.TestCase):
                     self.assertFalse(result.candidate_run_valid)
                     self.assertFalse(result.comparison_valid)
                     self.assertFalse(result.improvement_evaluated)
+
+    def test_goal_tolerance_and_hold_duration_mismatches_are_incompatible(self):
+        for field, key in (("target_tolerance_mismatch", "tolerance"), ("required_hold_duration_mismatch", "required_hold_duration")):
+            with self.subTest(field=field):
+                candidate_metadata = curved_metadata()
+                baseline_metadata = curved_metadata(role="baseline", seed=None)
+                candidate_metadata["configuration"]["goal"][key] += 0.001
+                result = compare(curved_summary(), curved_summary(), candidate_metadata, baseline_metadata)
+                self.assertFalse(result.comparison_valid)
+                self.assertIn(field, result.compatibility_reasons)
+                self.assertFalse(result.improvement_evaluated)
+                self.assertEqual([], result.metric_comparisons)
 
     def test_required_metric_missing_or_nonfinite_invalidates_run(self):
         missing = curved_summary()
