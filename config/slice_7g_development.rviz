@@ -4,29 +4,116 @@ Panels:
 Visualization Manager:
   Class: ""
   Displays:
+    - Class: rviz_default_plugins/Axes
+      Enabled: true
+      Length: 0.025
+      Name: World origin
+      Radius: 0.001
+      Reference Frame: world
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
-      Name: CTR and curved lumen
+      Name: Curved lumen surface
       Topic:
-        Value: /ctr/visualization
-    - Class: rviz_default_plugins/Path
+        Depth: 10
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /ctr/development_visualization/lumen_surface
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Curved lumen wireframe
+      Topic:
+        Depth: 10
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /ctr/development_visualization/lumen_wireframe
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Lumen centerline
+      Topic:
+        Depth: 10
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /ctr/development_visualization/lumen_centerline
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: CTR backbone
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /ctr/development_visualization/ctr_backbone
+    - Class: rviz_default_plugins/MarkerArray
       Enabled: true
       Name: Reference path
       Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /ctr/development_visualization/reference_path
+    - Class: rviz_default_plugins/Path
+      Enabled: false
+      Name: Reference path source poses
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
         Value: /ctr/reference/path
       Line Style: Lines
-      Line Width: 0.003
-      Color: 239; 41; 41
+      Line Width: 0.004
+      Color: 255; 0; 255
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Actual tip trajectory
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /ctr/development_visualization/actual_tip_path
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Tip marker
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /ctr/development_visualization/tip_marker
     - Class: rviz_default_plugins/Pose
       Enabled: true
       Name: Tip pose
       Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
         Value: /ctr/tip
       Shape: Arrow
+      Alpha: 1.0
+      Color: 255; 0; 0
+      Head Length: 0.015
+      Head Radius: 0.006
+      Shaft Length: 0.05
+      Shaft Radius: 0.0025
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Target
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /ctr/development_visualization/target_marker
   Enabled: true
   Global Options:
-    Background Color: 48; 48; 48
-    Fixed Frame: base_link
+    Background Color: 35; 38; 42
+    Fixed Frame: world
     Frame Rate: 30
   Name: root
   Tools:
@@ -36,13 +123,13 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 0.28
+      Distance: 0.30
       Focal Point:
-        X: 0.0
+        X: 0.021
         Y: 0.0
-        Z: 0.08
-      Pitch: 0.55
-      Yaw: 0.8
+        Z: 0.06
+      Pitch: 0.48
+      Yaw: 0.78
 Window Geometry:
-  Height: 800
-  Width: 1200
+  Height: 850
+  Width: 1280

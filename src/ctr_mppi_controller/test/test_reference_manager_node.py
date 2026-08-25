@@ -19,10 +19,12 @@ from ctr_mppi_controller.nodes.reference_manager_node import (  # noqa: E402
     build_reference_trajectory,
     path_from_points,
     pose_from_point,
+    reference_path_qos_profile,
     reference_settings_from_config,
     trajectory_start_time_from_policy,
 )
 from ctr_mppi_controller.reference_validation import EXTERNAL_TARGET  # noqa: E402
+from rclpy.qos import DurabilityPolicy, ReliabilityPolicy  # noqa: E402
 
 
 CONFIG_FILES = [
@@ -43,6 +45,12 @@ def make_config():
 
 
 class ReferenceManagerNodeHelpersTest(unittest.TestCase):
+    def test_reference_path_qos_is_reliable_and_transient_local_for_late_joiners(self):
+        profile = reference_path_qos_profile()
+        self.assertEqual(1, profile.depth)
+        self.assertEqual(ReliabilityPolicy.RELIABLE, profile.reliability)
+        self.assertEqual(DurabilityPolicy.TRANSIENT_LOCAL, profile.durability)
+
     def test_reference_settings_default_to_fixed_target(self):
         config = make_config()
         settings = reference_settings_from_config(config)

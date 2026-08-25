@@ -171,10 +171,14 @@ class ParameterValidationTest(unittest.TestCase):
         visualization = config["simulation"]["visualization"]
         self.assertIs(True, visualization["publish_lumen_markers"])
         self.assertIs(True, visualization["publish_lumen_diagnostics"])
+        self.assertIs(False, visualization["publish_lumen_surface"])
         self.assertEqual(1, visualization["centerline_stride"])
         self.assertEqual(4, visualization["ring_stride"])
         self.assertEqual(20, visualization["ring_segments"])
         self.assertEqual(5.0, visualization["marker_publish_rate"])
+        self.assertEqual(0.20, visualization["surface_alpha"])
+        self.assertEqual(500, visualization["actual_tip_history_max_points"])
+        self.assertEqual(0.05, visualization["actual_tip_history_min_interval"])
         self.assertEqual([], [error for error in validate_project_config(config) if "simulation.visualization" in error])
 
     def test_mppi_tactile_defaults_and_cross_field_validation(self):
@@ -223,6 +227,28 @@ class ParameterValidationTest(unittest.TestCase):
                     any("simulation.visualization.publish_lumen_diagnostics" in error for error in errors),
                     errors,
                 )
+
+    def test_development_visualization_surface_and_history_values_are_strictly_bounded(self):
+        for value in (True, False):
+            config = load_parameter_files(CONFIG_FILES)
+            config["simulation"]["visualization"]["publish_lumen_surface"] = value
+            self.assertEqual([], validate_project_config(config))
+        for value in ("true", 1, 0, None):
+            config = load_parameter_files(CONFIG_FILES)
+            config["simulation"]["visualization"]["publish_lumen_surface"] = value
+            self.assertTrue(any("publish_lumen_surface" in error for error in validate_project_config(config)))
+
+        invalid_values = {
+            "surface_alpha": (-0.1, 1.1, True, float("nan")),
+            "actual_tip_history_max_points": (1, 5001, True, 5.0),
+            "actual_tip_history_min_interval": (0.0, -1.0, True, float("inf")),
+        }
+        for key, values in invalid_values.items():
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    config = load_parameter_files(CONFIG_FILES)
+                    config["simulation"]["visualization"][key] = value
+                    self.assertTrue(any(key in error for error in validate_project_config(config)))
 
     def test_simulation_visualization_stride_values_require_exact_positive_ints(self):
         cases = (

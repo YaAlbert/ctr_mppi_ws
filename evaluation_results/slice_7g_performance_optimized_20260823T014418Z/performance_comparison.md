@@ -80,6 +80,37 @@ The live seed-11 visualization showed the curved lumen, lumen centerline/referen
 
 No video was created because no screen-video encoder was installed. The local X11 RViz workflow itself ran successfully. The initial safety-node SIGSEGV did not reproduce in later controlled testing. After correcting a separately observed shutdown-only ROS 2 Humble message-conversion exception, a fresh 10/10 visual shutdown run completed with all required exit codes zero and no surviving process. See [the shutdown reliability report](visual_shutdown_reliability.md).
 
+### Curved-lumen visualization update
+
+The 2026-08-25 usability update changes the RViz fixed frame from the
+nonexistent `base_link` root to `world` and supplies the semantically correct
+fixed `world -> base_link` transform for the fixed-base simulator. The analytic
+`CurvedLumen` centerline and radius samples now produce a 7,560-point
+`TRIANGLE_LIST` wall at alpha 0.20. Its parallel-transport frames are the same
+continuous frames used by the established lumen marker construction; the
+surface does not replace collision geometry.
+
+Static surface, wireframe, and centerline topics are reliable/transient-local
+and publish once. Dynamic per-component topics publish at the configured 5 Hz,
+the exact controller-owned reference is magenta, and actual `/ctr/tip` history
+is bright green, time-decimated to 0.05 s, and capped at 500 points. These
+publishers require the explicit visual launch opt-in and are absent from normal
+headless development runs. A one-second visual-launch-only safety startup grace
+prevents the safety watchdog from latching before the simulator's first state;
+the default delay and every safety threshold remain unchanged.
+
+- [Updated RViz display panel and initial scene](visual/seed11_rviz_lumen_initial.png)
+- [Mid-run internal trajectory view](visual/seed11_rviz_lumen_mid_run.png)
+- [Final tip/target relationship](visual/seed11_rviz_lumen_final.png)
+- [Surface disabled to expose internal geometry](visual/seed11_rviz_lumen_surface_disabled.png)
+
+The final live domain-108 check reported RViz Global Status OK, `safety=ready`,
+changing tip positions, and clean zero-exit shutdown for all seven owned
+processes. A fresh headless smoke plus 25-second seed-11 example also passed;
+the example retained zero collisions and achieved 1.3676 effective solves/s,
+0.002138 m RMSE, and 0.027021 m minimum clearance. This is simulator-only
+development evidence, not a real-time or production claim.
+
 ## Reproduction
 
 Build:

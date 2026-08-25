@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import copy
 import math
@@ -26,19 +27,24 @@ from ctr_sim.lumen_diagnostics import (
 MIN_RING_SEGMENTS = 8
 MAX_RING_SEGMENTS = 128
 FRAME_TOLERANCE = 1.0e-12
-STATIC_LUMEN_STYLE_VERSION = 1
+STATIC_LUMEN_STYLE_VERSION = 2
 
 LUMEN_CENTERLINE_KEY = ("lumen_centerline", 0)
-LUMEN_PHYSICAL_BOUNDARY_KEY = ("lumen_physical_boundary", 0)
-LUMEN_SAFETY_BOUNDARY_KEY = ("lumen_safety_boundary", 0)
-LUMEN_INLET_KEY = ("lumen_inlet", 0)
-LUMEN_OUTLET_KEY = ("lumen_outlet", 0)
+LUMEN_SURFACE_KEY = ("lumen_surface", 0)
+LUMEN_PHYSICAL_BOUNDARY_KEY = ("lumen_wireframe", 0)
+LUMEN_SAFETY_BOUNDARY_KEY = ("lumen_wireframe", 1)
+LUMEN_INLET_KEY = ("lumen_wireframe", 2)
+LUMEN_OUTLET_KEY = ("lumen_wireframe", 3)
 CURVED_STATIC_LUMEN_MARKER_KEYS = (
     LUMEN_CENTERLINE_KEY,
     LUMEN_PHYSICAL_BOUNDARY_KEY,
     LUMEN_SAFETY_BOUNDARY_KEY,
     LUMEN_INLET_KEY,
     LUMEN_OUTLET_KEY,
+)
+CURVED_STATIC_LUMEN_MARKER_KEYS_WITH_SURFACE = (
+    LUMEN_SURFACE_KEY,
+    *CURVED_STATIC_LUMEN_MARKER_KEYS,
 )
 
 LUMEN_CLOSEST_LINE_KEY = ("lumen_closest_pair", 0)
@@ -61,6 +67,10 @@ class LumenMarkerConfig:
     ring_stride: int = 4
     ring_segments: int = 20
     marker_publish_rate: float = 5.0
+    publish_lumen_surface: bool = False
+    surface_alpha: float = 0.20
+    actual_tip_history_max_points: int = 500
+    actual_tip_history_min_interval: float = 0.05
 
     @classmethod
     def from_mapping(cls, values: Any) -> "LumenMarkerConfig":
@@ -97,6 +107,24 @@ class LumenMarkerConfig:
                 values.get("marker_publish_rate", cls.marker_publish_rate),
                 "simulation.visualization.marker_publish_rate",
             ),
+            publish_lumen_surface=_bool_value(
+                values.get("publish_lumen_surface", cls.publish_lumen_surface),
+                "simulation.visualization.publish_lumen_surface",
+            ),
+            surface_alpha=_unit_interval(
+                values.get("surface_alpha", cls.surface_alpha),
+                "simulation.visualization.surface_alpha",
+            ),
+            actual_tip_history_max_points=_int_value(
+                values.get("actual_tip_history_max_points", cls.actual_tip_history_max_points),
+                "simulation.visualization.actual_tip_history_max_points",
+                minimum=2,
+                maximum=5000,
+            ),
+            actual_tip_history_min_interval=_positive_number(
+                values.get("actual_tip_history_min_interval", cls.actual_tip_history_min_interval),
+                "simulation.visualization.actual_tip_history_min_interval",
+            ),
         )
 
 
@@ -105,6 +133,37 @@ class TransportFrames:
     tangents: np.ndarray
     normals: np.ndarray
     binormals: np.ndarray
+
+
+class BoundedTipTrajectory:
+    """Bounded, time-decimated development-only tip history."""
+
+    def __init__(self, *, max_points: int, minimum_interval: float) -> None:
+        self.max_points = _int_value(max_points, "max_points", minimum=2, maximum=5000)
+        self.minimum_interval = _positive_number(minimum_interval, "minimum_interval")
+        self._points: deque[np.ndarray] = deque(maxlen=self.max_points)
+        self._last_time: float | None = None
+
+    def append(self, point: Any, timestamp: Any) -> bool:
+        sample = _vector3(point, "tip trajectory point")
+        time_value = _finite_number(timestamp, "tip trajectory timestamp")
+        if self._last_time is not None and time_value >= self._last_time:
+            if time_value - self._last_time < self.minimum_interval:
+                return False
+        elif self._last_time is not None:
+            self.clear()
+        self._points.append(sample)
+        self._last_time = time_value
+        return True
+
+    def clear(self) -> None:
+        self._points.clear()
+        self._last_time = None
+
+    def points(self) -> np.ndarray:
+        if not self._points:
+            return np.empty((0, 3), dtype=np.float64)
+        return np.vstack(tuple(self._points)).astype(np.float64, copy=True)
 
 
 def compute_parallel_transport_frames(centerline_points: Any) -> TransportFrames:
@@ -196,6 +255,18 @@ def build_curved_static_lumen_markers(
     ring_indices = _stride_indices(centerline.shape[0], marker_config.ring_stride)
 
     markers = [
+        _triangle_surface_marker(
+            ns=LUMEN_SURFACE_KEY[0],
+            marker_id=LUMEN_SURFACE_KEY[1],
+            frame_id=frame,
+            stamp=stamp,
+            centerline=centerline,
+            normals=frames.normals,
+            binormals=frames.binormals,
+            radii=radius_profile,
+            segments=marker_config.ring_segments,
+            color=ColorRGBA(r=0.72, g=0.34, b=0.34, a=marker_config.surface_alpha),
+        ) if marker_config.publish_lumen_surface else None,
         _line_strip_marker(
             ns=LUMEN_CENTERLINE_KEY[0],
             marker_id=LUMEN_CENTERLINE_KEY[1],
@@ -203,7 +274,7 @@ def build_curved_static_lumen_markers(
             stamp=stamp,
             points=centerline[list(centerline_indices)],
             scale=0.0015,
-            color=ColorRGBA(r=0.95, g=0.95, b=0.95, a=1.0),
+            color=ColorRGBA(r=0.25, g=0.75, b=1.0, a=1.0),
         ),
         _ring_list_marker(
             ns=LUMEN_PHYSICAL_BOUNDARY_KEY[0],
@@ -217,7 +288,7 @@ def build_curved_static_lumen_markers(
             indices=ring_indices,
             segments=marker_config.ring_segments,
             scale=0.0010,
-            color=ColorRGBA(r=0.2, g=0.7, b=1.0, a=0.55),
+            color=ColorRGBA(r=0.0, g=0.9, b=1.0, a=0.70),
         ),
         _ring_list_marker(
             ns=LUMEN_SAFETY_BOUNDARY_KEY[0],
@@ -260,8 +331,66 @@ def build_curved_static_lumen_markers(
             color=ColorRGBA(r=1.0, g=0.25, b=0.15, a=1.0),
         ),
     ]
+    markers = [marker for marker in markers if marker is not None]
     _validate_markers(markers)
     return markers
+
+
+def build_reference_path_markers(
+    points: Any,
+    frame_id: str,
+    stamp: Any,
+) -> list[Marker]:
+    """Render only the points contained in the authoritative reference Path."""
+
+    path = _path_points_array(points, "reference path points")
+    frame = _non_empty_string(frame_id, "frame_id")
+    color = ColorRGBA(r=1.0, g=0.0, b=1.0, a=1.0)
+    markers: list[Marker] = []
+    if path.shape[0] >= 2:
+        markers.append(
+            _line_strip_marker(
+                ns="reference_path",
+                marker_id=0,
+                frame_id=frame,
+                stamp=stamp,
+                points=path,
+                scale=0.004,
+                color=color,
+            )
+        )
+    points_marker = _base_marker(
+        "reference_path", 1, frame, stamp, Marker.SPHERE_LIST, 0.005, color
+    )
+    points_marker.scale.y = points_marker.scale.x
+    points_marker.scale.z = points_marker.scale.x
+    points_marker.points = [_point_from_array(point) for point in path]
+    markers.append(points_marker)
+    _validate_markers(markers)
+    return markers
+
+
+def build_actual_tip_path_marker(
+    points: Any,
+    frame_id: str,
+    stamp: Any,
+) -> Marker | None:
+    """Build the bright-green executed path once two real samples exist."""
+
+    path = _path_points_array(points, "actual tip path points", allow_empty=True)
+    if path.shape[0] < 2:
+        return None
+    marker = _line_strip_marker(
+        ns="actual_tip_path",
+        marker_id=0,
+        frame_id=frame_id,
+        stamp=stamp,
+        points=path,
+        scale=0.0035,
+        color=ColorRGBA(r=0.15, g=1.0, b=0.15, a=1.0),
+    )
+    _validate_markers([marker])
+    return marker
 
 
 def build_static_lumen_delete_markers(
@@ -371,6 +500,8 @@ def static_lumen_cache_key(
         config.centerline_stride,
         config.ring_stride,
         config.ring_segments,
+        config.publish_lumen_surface,
+        config.surface_alpha,
     )
 
 
@@ -444,6 +575,58 @@ def _ring_list_marker(
     ]
     combined = np.vstack(ring_points) if ring_points else np.empty((0, 3), dtype=np.float64)
     marker.points = [_point_from_array(point) for point in combined]
+    return marker
+
+
+def _triangle_surface_marker(
+    *,
+    ns: str,
+    marker_id: int,
+    frame_id: str,
+    stamp: Any,
+    centerline: np.ndarray,
+    normals: np.ndarray,
+    binormals: np.ndarray,
+    radii: np.ndarray,
+    segments: int,
+    color: ColorRGBA,
+) -> Marker:
+    segment_count = _int_value(
+        segments, "ring_segments", minimum=MIN_RING_SEGMENTS, maximum=MAX_RING_SEGMENTS
+    )
+    angles = 2.0 * math.pi * np.arange(segment_count, dtype=np.float64) / float(segment_count)
+    rings = (
+        centerline[:, None, :]
+        + radii[:, None, None]
+        * (
+            np.cos(angles)[None, :, None] * normals[:, None, :]
+            + np.sin(angles)[None, :, None] * binormals[:, None, :]
+        )
+    )
+    triangles = np.empty(((rings.shape[0] - 1) * segment_count * 6, 3), dtype=np.float64)
+    cursor = 0
+    for ring_index in range(rings.shape[0] - 1):
+        for segment_index in range(segment_count):
+            next_segment = (segment_index + 1) % segment_count
+            current = rings[ring_index, segment_index]
+            current_next = rings[ring_index, next_segment]
+            following = rings[ring_index + 1, segment_index]
+            following_next = rings[ring_index + 1, next_segment]
+            triangles[cursor : cursor + 6] = (
+                current,
+                following_next,
+                following,
+                current,
+                current_next,
+                following_next,
+            )
+            cursor += 6
+    if not np.all(np.isfinite(triangles)):
+        raise ValueError("lumen surface points must be finite")
+    marker = _base_marker(ns, marker_id, frame_id, stamp, Marker.TRIANGLE_LIST, 1.0, color)
+    marker.scale.y = 1.0
+    marker.scale.z = 1.0
+    marker.points = [_point_from_array(point) for point in triangles]
     return marker
 
 
@@ -666,8 +849,16 @@ def _validate_markers(markers: Iterable[Marker]) -> None:
             numeric = float(value)
             if not math.isfinite(numeric) or numeric < 0.0 or numeric > 1.0:
                 raise ValueError(f"{marker.ns}.{label} must be finite and in [0, 1]")
-        if marker.type in {Marker.LINE_LIST, Marker.LINE_STRIP} and not marker.points:
+        point_marker_types = {
+            Marker.LINE_LIST,
+            Marker.LINE_STRIP,
+            Marker.TRIANGLE_LIST,
+            Marker.SPHERE_LIST,
+        }
+        if marker.type in point_marker_types and not marker.points:
             raise ValueError(f"{marker.ns} must contain marker points")
+        if marker.type == Marker.TRIANGLE_LIST and len(marker.points) % 3:
+            raise ValueError(f"{marker.ns} must contain complete triangles")
         for point_index, point in enumerate(marker.points):
             coordinates = (float(point.x), float(point.y), float(point.z))
             if not all(math.isfinite(value) for value in coordinates):
@@ -697,6 +888,20 @@ def _points_array(values: Any, label: str) -> np.ndarray:
         raise ValueError(f"{label} must contain at least two points")
     if array.shape[1] != 3:
         raise ValueError(f"{label} must have shape (N, 3)")
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{label} must contain finite values")
+    return array.astype(np.float64, copy=True)
+
+
+def _path_points_array(values: Any, label: str, *, allow_empty: bool = False) -> np.ndarray:
+    try:
+        array = np.asarray(values, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be numeric with shape (N, 3)") from exc
+    if allow_empty and array.size == 0:
+        return np.empty((0, 3), dtype=np.float64)
+    if array.ndim != 2 or array.shape[1:] != (3,) or array.shape[0] < 1:
+        raise ValueError(f"{label} must have shape (N, 3) with at least one point")
     if not np.all(np.isfinite(array)):
         raise ValueError(f"{label} must contain finite values")
     return array.astype(np.float64, copy=True)
@@ -759,6 +964,25 @@ def _positive_number(value: Any, label: str) -> float:
         raise ValueError(f"{label} must be finite and positive") from exc
     if not math.isfinite(numeric) or numeric <= 0.0:
         raise ValueError(f"{label} must be finite and positive")
+    return numeric
+
+
+def _finite_number(value: Any, label: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be numeric, not boolean")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be finite") from exc
+    if not math.isfinite(numeric):
+        raise ValueError(f"{label} must be finite")
+    return numeric
+
+
+def _unit_interval(value: Any, label: str) -> float:
+    numeric = _finite_number(value, label)
+    if numeric < 0.0 or numeric > 1.0:
+        raise ValueError(f"{label} must be in [0, 1]")
     return numeric
 
 

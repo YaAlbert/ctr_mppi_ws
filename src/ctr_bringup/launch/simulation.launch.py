@@ -3,7 +3,7 @@ from pathlib import Path
 from ament_index_python.packages import get_package_share_directory
 from ctr_bringup.parameter_validation import parse_launch_bool, validate_config_paths
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, OpaqueFunction, TimerAction
 from launch.conditions import IfCondition
 from launch.substitutions import PythonExpression
 from launch.substitutions import LaunchConfiguration
@@ -106,6 +106,7 @@ def generate_launch_description():
     start_manual_command_publisher = LaunchConfiguration("start_manual_command_publisher")
     start_mppi_controller = LaunchConfiguration("start_mppi_controller")
     start_safety_supervisor = LaunchConfiguration("start_safety_supervisor")
+    safety_supervisor_start_delay = LaunchConfiguration("safety_supervisor_start_delay")
     start_reference_manager = LaunchConfiguration("start_reference_manager")
     reference_mode = LaunchConfiguration("reference_mode")
     reference_type = LaunchConfiguration("reference_type")
@@ -128,6 +129,7 @@ def generate_launch_description():
     config_root = LaunchConfiguration("config_root")
     slice_7g_profile = LaunchConfiguration("slice_7g_profile")
     development_simulation = LaunchConfiguration("development_simulation")
+    enable_development_visualization = LaunchConfiguration("enable_development_visualization")
     cylinder_target_position = ParameterValue(
         [
             [cylinder_target_x],
@@ -178,6 +180,11 @@ def generate_launch_description():
                 "start_safety_supervisor",
                 default_value="false",
                 description="Start the independent CTR safety supervisor.",
+            ),
+            DeclareLaunchArgument(
+                "safety_supervisor_start_delay",
+                default_value="0.0",
+                description="Optional simulator startup grace before the safety supervisor starts.",
             ),
             DeclareLaunchArgument(
                 "config_root",
@@ -289,6 +296,13 @@ def generate_launch_description():
                 default_value="false",
                 description="Explicit non-production user-level Slice 7G workflow.",
             ),
+            DeclareLaunchArgument(
+                "enable_development_visualization",
+                default_value="false",
+                description=(
+                    "Publish the development-only RViz surface, reference, and bounded tip-history topics."
+                ),
+            ),
             OpaqueFunction(function=_validate_reference_launch_arguments),
             Node(
                 package="ctr_bringup",
@@ -335,6 +349,9 @@ def generate_launch_description():
                         "development_simulation": ParameterValue(
                             development_simulation, value_type=bool
                         ),
+                        "enable_development_visualization": ParameterValue(
+                            enable_development_visualization, value_type=bool
+                        ),
                     }
                 ],
             ),
@@ -353,25 +370,30 @@ def generate_launch_description():
                     }
                 ],
             ),
-            Node(
-                package="ctr_safety",
-                executable="safety_supervisor_node",
-                name="safety_supervisor",
-                output="screen",
-                condition=IfCondition(start_safety_supervisor),
-                parameters=[
-                    {
-                        "config_paths": _config_path_parameter(config_root),
-                        "runtime_mode": runtime_mode,
-                        "enable_cylindrical_lumen": ParameterValue(enable_cylindrical_lumen, value_type=bool),
-                        "enable_curved_lumen": ParameterValue(enable_curved_lumen, value_type=bool),
-                        "curved_lumen_type": ParameterValue(curved_lumen_type, value_type=str),
-                        "cylinder_target_position": cylinder_target_position,
-                        "slice_7g_profile": ParameterValue(slice_7g_profile, value_type=bool),
-                        "development_simulation": ParameterValue(
-                            development_simulation, value_type=bool
-                        ),
-                    }
+            TimerAction(
+                period=safety_supervisor_start_delay,
+                actions=[
+                    Node(
+                        package="ctr_safety",
+                        executable="safety_supervisor_node",
+                        name="safety_supervisor",
+                        output="screen",
+                        condition=IfCondition(start_safety_supervisor),
+                        parameters=[
+                            {
+                                "config_paths": _config_path_parameter(config_root),
+                                "runtime_mode": runtime_mode,
+                                "enable_cylindrical_lumen": ParameterValue(enable_cylindrical_lumen, value_type=bool),
+                                "enable_curved_lumen": ParameterValue(enable_curved_lumen, value_type=bool),
+                                "curved_lumen_type": ParameterValue(curved_lumen_type, value_type=str),
+                                "cylinder_target_position": cylinder_target_position,
+                                "slice_7g_profile": ParameterValue(slice_7g_profile, value_type=bool),
+                                "development_simulation": ParameterValue(
+                                    development_simulation, value_type=bool
+                                ),
+                            }
+                        ],
+                    )
                 ],
             ),
             Node(

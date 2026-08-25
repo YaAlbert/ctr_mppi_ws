@@ -29,11 +29,23 @@ from ctr_mppi_controller.reference_trajectory import (
 )
 from rclpy.node import Node
 from rclpy.parameter import Parameter
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 
 TRAJECTORY_TYPES = ("circle", "ellipse", "helix")
 COMPLETION_BEHAVIORS = ("loop", "hold_final")
 TRAJECTORY_START_POLICIES = ("node_start", "scheduled_time")
+
+
+def reference_path_qos_profile() -> QoSProfile:
+    """Reliable late-joiner delivery for the controller's exact reference path."""
+
+    return QoSProfile(
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    )
 
 
 @dataclass(frozen=True)
@@ -110,7 +122,11 @@ class ReferenceManagerNode(Node):
             else None
         )
 
-        self.path_pub = self.create_publisher(NavPath, "/ctr/reference/path", 10)
+        self.path_pub = self.create_publisher(
+            NavPath,
+            "/ctr/reference/path",
+            reference_path_qos_profile(),
+        )
         self.horizon_pub = self.create_publisher(NavPath, "/ctr/reference/horizon", 10)
         self.tip_pub = self.create_publisher(PoseStamped, "/ctr/reference/tip", 10)
 

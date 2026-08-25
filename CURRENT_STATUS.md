@@ -182,6 +182,24 @@ non-reproduced low-priority observation. The detailed result is
 This development run created no production authority, budget, evidence seal,
 or attempt and is not a Slice 7G promotion result.
 
+On 2026-08-25 the Slice 7G RViz view was revised for a common `world` fixed
+frame with the physically fixed `world -> base_link` identity, a small red tip
+pose arrow, separately toggleable component topics, a magenta controller-owned
+reference, a bounded bright-green actual tip history, and a translucent wall
+triangulated directly from the analytic `CurvedLumen` samples and radii. Static
+geometry uses reliable/transient-local QoS and is published once; dynamic
+development markers are rate-limited and require the explicit visual opt-in,
+so the headless controller-critical path is unchanged. The visual launch also
+delays only the safety-supervisor startup by one second so simulator state is
+present before its fail-closed watchdog begins; the general launch default and
+all safety thresholds remain unchanged. The practical functional partitions
+passed 894 tests, the affected packages rebuilt, a fresh 5-second smoke plus
+25-second seed-11 example passed readiness with zero collisions, and the final
+visual run reported `safety=ready`, changing tip data, RViz Global Status OK,
+and clean zero-exit shutdown for every owned process. Four updated captures are
+under `evaluation_results/slice_7g_performance_optimized_20260823T014418Z/visual/`.
+No production behavior, production authority, or production attempt changed.
+
 ## Ubuntu environment and build-readiness summary
 
 - OS: Ubuntu 22.04.5 LTS.

@@ -21,12 +21,16 @@ from ctr_mppi_controller.curved_lumen import (  # noqa: E402
     s_curve_centerline,
 )
 from ctr_sim.lumen_markers import (  # noqa: E402
+    BoundedTipTrajectory,
     CURVED_STATIC_LUMEN_MARKER_KEYS,
+    CURVED_STATIC_LUMEN_MARKER_KEYS_WITH_SURFACE,
     DYNAMIC_LUMEN_MARKER_KEYS,
     LumenMarkerConfig,
+    build_actual_tip_path_marker,
     build_dynamic_lumen_delete_markers,
     build_dynamic_lumen_diagnostic_markers,
     build_curved_static_lumen_markers,
+    build_reference_path_markers,
     build_static_lumen_delete_markers,
     compute_parallel_transport_frames,
     marker_keys,
@@ -94,6 +98,13 @@ def marker_by_namespace(markers: list[Marker], namespace: str) -> Marker:
         if marker.ns == namespace:
             return marker
     raise AssertionError(f"missing marker namespace {namespace}")
+
+
+def marker_by_key(markers: list[Marker], key: tuple[str, int]) -> Marker:
+    for marker in markers:
+        if (marker.ns, marker.id) == key:
+            return marker
+    raise AssertionError(f"missing marker key {key}")
 
 
 def marker_points(marker: Marker) -> np.ndarray:
@@ -223,15 +234,15 @@ class CurvedMarkerConstructionTest(unittest.TestCase):
         markers = build_curved_static_lumen_markers(geometry, "abc123", "base_link", config, Time())
         self.assertEqual(CURVED_STATIC_LUMEN_MARKER_KEYS, marker_keys(markers))
         expected_types = {
-            "lumen_centerline": Marker.LINE_STRIP,
-            "lumen_physical_boundary": Marker.LINE_LIST,
-            "lumen_safety_boundary": Marker.LINE_LIST,
-            "lumen_inlet": Marker.LINE_LIST,
-            "lumen_outlet": Marker.LINE_LIST,
+            ("lumen_centerline", 0): Marker.LINE_STRIP,
+            ("lumen_wireframe", 0): Marker.LINE_LIST,
+            ("lumen_wireframe", 1): Marker.LINE_LIST,
+            ("lumen_wireframe", 2): Marker.LINE_LIST,
+            ("lumen_wireframe", 3): Marker.LINE_LIST,
         }
         for marker in markers:
             self.assertEqual("base_link", marker.header.frame_id)
-            self.assertEqual(expected_types[marker.ns], marker.type)
+            self.assertEqual(expected_types[(marker.ns, marker.id)], marker.type)
             self.assertEqual(Marker.ADD, marker.action)
             self.assertGreater(marker.scale.x, 0.0)
             self.assertTrue(np.all(np.isfinite(marker_points(marker))))
@@ -257,8 +268,8 @@ class CurvedMarkerConstructionTest(unittest.TestCase):
         expected_rings = 1 + len(range(5, geometry.centerline_points.shape[0], 5))
         if (geometry.centerline_points.shape[0] - 1) % 5 != 0:
             expected_rings += 1
-        physical = marker_points(marker_by_namespace(markers, "lumen_physical_boundary"))
-        safety = marker_points(marker_by_namespace(markers, "lumen_safety_boundary"))
+        physical = marker_points(marker_by_key(markers, ("lumen_wireframe", 0)))
+        safety = marker_points(marker_by_key(markers, ("lumen_wireframe", 1)))
         self.assertEqual(expected_rings, physical.shape[0] // (2 * config.ring_segments))
         self.assertEqual(expected_rings, safety.shape[0] // (2 * config.ring_segments))
         first_physical_radius = np.linalg.norm(physical[0] - geometry.centerline_points[0])
@@ -279,10 +290,71 @@ class CurvedMarkerConstructionTest(unittest.TestCase):
             LumenMarkerConfig(ring_segments=20),
             Time(),
         )
-        inlet = marker_points(marker_by_namespace(markers, "lumen_inlet"))[0::2]
-        outlet = marker_points(marker_by_namespace(markers, "lumen_outlet"))[0::2]
+        inlet = marker_points(marker_by_key(markers, ("lumen_wireframe", 2)))[0::2]
+        outlet = marker_points(marker_by_key(markers, ("lumen_wireframe", 3)))[0::2]
         np.testing.assert_allclose(inlet.mean(axis=0), geometry.centerline_points[0], atol=1.0e-12)
         np.testing.assert_allclose(outlet.mean(axis=0), geometry.centerline_points[-1], atol=1.0e-12)
+
+    def test_surface_is_finite_triangle_mesh_using_exact_curved_lumen_radius(self):
+        geometry = s_curve_geometry()
+        segments = 16
+        markers = build_curved_static_lumen_markers(
+            geometry,
+            "abc123",
+            "base_link",
+            LumenMarkerConfig(
+                ring_segments=segments,
+                publish_lumen_surface=True,
+                surface_alpha=0.20,
+            ),
+            Time(),
+        )
+        self.assertEqual(CURVED_STATIC_LUMEN_MARKER_KEYS_WITH_SURFACE, marker_keys(markers))
+        surface = marker_by_key(markers, ("lumen_surface", 0))
+        points = marker_points(surface)
+        self.assertEqual(Marker.TRIANGLE_LIST, surface.type)
+        self.assertEqual((geometry.centerline_points.shape[0] - 1) * segments * 6, len(points))
+        self.assertEqual(0, len(points) % 3)
+        self.assertTrue(np.all(np.isfinite(points)))
+        self.assertAlmostEqual(0.20, surface.color.a)
+        self.assertAlmostEqual(
+            float(geometry.radius_profile[0]),
+            float(np.linalg.norm(points[0] - geometry.centerline_points[0])),
+            places=12,
+        )
+
+    def test_reference_path_markers_render_exact_single_and_multi_pose_data(self):
+        singleton = np.array([[0.01, -0.02, 0.08]], dtype=float)
+        singleton_markers = build_reference_path_markers(singleton, "base_link", Time())
+        self.assertEqual((('reference_path', 1),), marker_keys(singleton_markers))
+        self.assertEqual(Marker.SPHERE_LIST, singleton_markers[0].type)
+        np.testing.assert_allclose(marker_points(singleton_markers[0]), singleton)
+        self.assertEqual((1.0, 0.0, 1.0, 1.0), (
+            singleton_markers[0].color.r,
+            singleton_markers[0].color.g,
+            singleton_markers[0].color.b,
+            singleton_markers[0].color.a,
+        ))
+
+        points = np.array([[0.0, 0.0, 0.0], [0.01, 0.0, 0.04]], dtype=float)
+        markers = build_reference_path_markers(points, "base_link", Time())
+        self.assertEqual((('reference_path', 0), ('reference_path', 1)), marker_keys(markers))
+        np.testing.assert_allclose(marker_points(markers[0]), points)
+        self.assertAlmostEqual(0.004, markers[0].scale.x)
+
+    def test_actual_tip_history_is_time_decimated_bounded_and_reset_on_time_rollback(self):
+        history = BoundedTipTrajectory(max_points=3, minimum_interval=0.05)
+        self.assertTrue(history.append([0.0, 0.0, 0.0], 1.0))
+        self.assertFalse(history.append([1.0, 0.0, 0.0], 1.01))
+        for index in range(1, 5):
+            self.assertTrue(history.append([float(index), 0.0, 0.0], 1.0 + 0.1 * index))
+        self.assertEqual((3, 3), history.points().shape)
+        np.testing.assert_allclose(history.points()[:, 0], [2.0, 3.0, 4.0])
+        marker = build_actual_tip_path_marker(history.points(), "base_link", Time())
+        self.assertIsNotNone(marker)
+        self.assertEqual("actual_tip_path", marker.ns)
+        self.assertTrue(history.append([9.0, 0.0, 0.0], 0.5))
+        np.testing.assert_allclose(history.points(), [[9.0, 0.0, 0.0]])
 
     def test_disabled_config_returns_no_markers(self):
         markers = build_curved_static_lumen_markers(

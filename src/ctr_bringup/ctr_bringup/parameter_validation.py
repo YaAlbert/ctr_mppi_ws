@@ -983,6 +983,8 @@ def _validate_simulation_visualization(visualization: Any) -> list[str]:
         errors.append("`simulation.visualization.publish_lumen_markers` must be a boolean.")
     if not isinstance(visualization.get("publish_lumen_diagnostics"), bool):
         errors.append("`simulation.visualization.publish_lumen_diagnostics` must be a boolean.")
+    if not isinstance(visualization.get("publish_lumen_surface"), bool):
+        errors.append("`simulation.visualization.publish_lumen_surface` must be a boolean.")
     errors.extend(
         _require_exact_int(
             visualization,
@@ -1009,6 +1011,23 @@ def _validate_simulation_visualization(visualization: Any) -> list[str]:
         )
     )
     errors.extend(_require_positive_number(visualization, "marker_publish_rate", "simulation.visualization"))
+    errors.extend(_require_probability(visualization, "surface_alpha", "simulation.visualization"))
+    errors.extend(
+        _require_exact_int(
+            visualization,
+            "actual_tip_history_max_points",
+            "simulation.visualization",
+            minimum=2,
+            maximum=5000,
+        )
+    )
+    errors.extend(
+        _require_positive_number(
+            visualization,
+            "actual_tip_history_min_interval",
+            "simulation.visualization",
+        )
+    )
     return errors
 
 

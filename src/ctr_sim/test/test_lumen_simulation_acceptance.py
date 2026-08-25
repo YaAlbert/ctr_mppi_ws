@@ -25,10 +25,10 @@ from visualization_msgs.msg import Marker  # noqa: E402
 
 C3_STATIC_KEYS = {
     ("lumen_centerline", 0),
-    ("lumen_physical_boundary", 0),
-    ("lumen_safety_boundary", 0),
-    ("lumen_inlet", 0),
-    ("lumen_outlet", 0),
+    ("lumen_wireframe", 0),
+    ("lumen_wireframe", 1),
+    ("lumen_wireframe", 2),
+    ("lumen_wireframe", 3),
 }
 
 C4_DYNAMIC_KEYS = {
@@ -40,8 +40,8 @@ C4_DYNAMIC_KEYS = {
 
 CTR_DYNAMIC_KEYS = {
     ("ctr_backbone", 0),
-    ("ctr_tip", 1),
-    ("ctr_target", 2),
+    ("tip_marker", 1),
+    ("target_marker", 2),
 }
 
 CYLINDER_KEYS = {

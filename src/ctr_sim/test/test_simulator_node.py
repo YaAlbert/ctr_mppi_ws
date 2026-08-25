@@ -30,6 +30,8 @@ except ImportError:
 
 
 from builtin_interfaces.msg import Time  # noqa: E402
+from geometry_msgs.msg import PoseStamped  # noqa: E402
+from nav_msgs.msg import Path as NavPath  # noqa: E402
 from ctr_bringup.parameter_validation import load_parameter_files  # noqa: E402
 from ctr_mppi_controller.curved_lumen import CurvedLumen  # noqa: E402
 from ctr_mppi_controller.cylindrical_lumen import CylindricalLumen  # noqa: E402
@@ -39,13 +41,19 @@ from ctr_mppi_controller.lumen_factory import (  # noqa: E402
     lumen_mode_from_config,
 )
 from ctr_sim.lumen_markers import (  # noqa: E402
+    BoundedTipTrajectory,
     CURVED_STATIC_LUMEN_MARKER_KEYS,
     DYNAMIC_LUMEN_MARKER_KEYS,
     LumenMarkerConfig,
 )
 from ctr_sim.lumen_diagnostics import STATUS_COLLISION, STATUS_MARGIN  # noqa: E402
 import ctr_sim.nodes.simulator_node as simulator_node_module  # noqa: E402
-from ctr_sim.nodes.simulator_node import CTRSimulatorNode, _point_from_array  # noqa: E402
+from ctr_sim.nodes.simulator_node import (  # noqa: E402
+    CTRSimulatorNode,
+    _point_from_array,
+    development_marker_qos_profile,
+)
+from rclpy.qos import DurabilityPolicy, ReliabilityPolicy  # noqa: E402
 from visualization_msgs.msg import Marker  # noqa: E402
 
 
@@ -103,12 +111,19 @@ def simulator_shell(config):
     node._static_lumen_marker_keys = ()
     node._static_lumen_marker_frame_id = node.frame_id
     node._last_static_lumen_publish_time_s = None
+    node._last_development_visualization_publish_time_s = None
     node._static_lumen_build_count = 0
     node._static_lumen_cache_hit_logged = False
     node._dynamic_lumen_marker_keys = ()
     node._dynamic_lumen_marker_frame_id = node.frame_id
     node._last_lumen_diagnostic_log_signature = None
     node._lumen_diagnostic_update_count = 0
+    node.development_simulation = False
+    node.development_visualization = False
+    node.development_marker_pubs = {}
+    node._reference_path_points = np.empty((0, 3), dtype=np.float64)
+    node._reference_path_frame_id = node.frame_id
+    node._tip_trajectory = None
     return node
 
 
@@ -148,14 +163,14 @@ class SimulatorNodeLumenRuntimeTest(unittest.TestCase):
         node = simulator_shell(no_lumen_config())
         backbone = sample_backbone()
         msg = node._marker_array_msg(Time(), [_point_from_array(point) for point in backbone], backbone)
-        self.assertEqual(["ctr_backbone", "ctr_tip", "ctr_target"], [marker.ns for marker in msg.markers])
+        self.assertEqual(["ctr_backbone", "tip_marker", "target_marker"], [marker.ns for marker in msg.markers])
 
     def test_curved_marker_array_publishes_static_and_dynamic_diagnostic_markers(self):
         node = simulator_shell(curved_config("circular_arc"))
         backbone = sample_backbone()
         msg = node._marker_array_msg(Time(), [_point_from_array(point) for point in backbone], backbone)
         namespaces = [marker.ns for marker in msg.markers]
-        self.assertEqual(["ctr_backbone", "ctr_tip", "ctr_target"], namespaces[:3])
+        self.assertEqual(["ctr_backbone", "tip_marker", "target_marker"], namespaces[:3])
         self.assertEqual(
             [key[0] for key in CURVED_STATIC_LUMEN_MARKER_KEYS],
             namespaces[3 : 3 + len(CURVED_STATIC_LUMEN_MARKER_KEYS)],
@@ -170,7 +185,7 @@ class SimulatorNodeLumenRuntimeTest(unittest.TestCase):
         backbone = sample_backbone()
         msg = node._marker_array_msg(Time(), [_point_from_array(point) for point in backbone], backbone)
         namespaces = [marker.ns for marker in msg.markers]
-        self.assertEqual(["ctr_backbone", "ctr_tip", "ctr_target"], namespaces[:3])
+        self.assertEqual(["ctr_backbone", "tip_marker", "target_marker"], namespaces[:3])
         self.assertGreater(namespaces.count("cylindrical_lumen"), 0)
         cylinder_markers = [marker for marker in msg.markers if marker.ns == "cylindrical_lumen"]
         self.assertEqual([10, 11, 12, 13], [marker.id for marker in cylinder_markers])
@@ -237,7 +252,80 @@ class SimulatorNodeLumenRuntimeTest(unittest.TestCase):
         node = simulator_shell(config)
         backbone = sample_backbone()
         msg = node._marker_array_msg(Time(), [_point_from_array(point) for point in backbone], backbone)
-        self.assertEqual(["ctr_backbone", "ctr_tip", "ctr_target"], [marker.ns for marker in msg.markers])
+        self.assertEqual(["ctr_backbone", "tip_marker", "target_marker"], [marker.ns for marker in msg.markers])
+
+    def test_development_marker_array_uses_real_reference_and_bounded_tip_history(self):
+        node = simulator_shell(curved_config("circular_arc"))
+        node.development_simulation = True
+        node.development_visualization = True
+        node.lumen_marker_config = node.lumen_marker_config.__class__(
+            **{
+                **node.lumen_marker_config.__dict__,
+                "publish_lumen_surface": True,
+                "actual_tip_history_max_points": 3,
+            }
+        )
+        node._reference_path_points = np.array([[0.01, 0.0, 0.08]], dtype=float)
+        node._tip_trajectory = BoundedTipTrajectory(max_points=3, minimum_interval=0.05)
+        node._tip_trajectory.append([0.0, 0.0, 0.04], 1.0)
+        node._tip_trajectory.append([0.001, 0.0, 0.05], 1.1)
+        backbone = sample_backbone()
+        msg = node._marker_array_msg(
+            _time_msg(1.1),
+            [_point_from_array(point) for point in backbone],
+            backbone,
+        )
+        keys = {(marker.ns, marker.id) for marker in msg.markers}
+        self.assertIn(("lumen_surface", 0), keys)
+        self.assertIn(("reference_path", 1), keys)
+        self.assertIn(("actual_tip_path", 0), keys)
+
+    def test_development_static_marker_qos_is_latched_and_dynamic_marker_qos_is_not(self):
+        static_qos = development_marker_qos_profile("lumen_surface")
+        dynamic_qos = development_marker_qos_profile("actual_tip_path")
+        self.assertEqual(ReliabilityPolicy.RELIABLE, static_qos.reliability)
+        self.assertEqual(DurabilityPolicy.TRANSIENT_LOCAL, static_qos.durability)
+        self.assertEqual(ReliabilityPolicy.RELIABLE, dynamic_qos.reliability)
+        self.assertEqual(DurabilityPolicy.VOLATILE, dynamic_qos.durability)
+
+    def test_development_simulation_without_visual_opt_in_keeps_heavy_markers_off_critical_path(self):
+        node = simulator_shell(curved_config("circular_arc"))
+        node.development_simulation = True
+        node.development_visualization = False
+        node.lumen_marker_config = node.lumen_marker_config.__class__(
+            **{
+                **node.lumen_marker_config.__dict__,
+                "publish_lumen_surface": False,
+            }
+        )
+        node._reference_path_points = np.array([[0.01, 0.0, 0.08]], dtype=float)
+        node._tip_trajectory = None
+        backbone = sample_backbone()
+        msg = node._marker_array_msg(
+            _time_msg(1.1),
+            [_point_from_array(point) for point in backbone],
+            backbone,
+        )
+        namespaces = {marker.ns for marker in msg.markers}
+        self.assertNotIn("lumen_surface", namespaces)
+        self.assertNotIn("reference_path", namespaces)
+        self.assertNotIn("actual_tip_path", namespaces)
+
+    def test_reference_path_callback_retains_exact_nonempty_path_and_common_frame(self):
+        node = simulator_shell(curved_config("circular_arc"))
+        message = NavPath()
+        message.header.frame_id = "base_link"
+        for coordinates in ((0.0, 0.0, 0.04), (0.01, 0.0, 0.08)):
+            pose = PoseStamped()
+            pose.header.frame_id = "base_link"
+            pose.pose.position = _point_from_array(np.asarray(coordinates, dtype=float))
+            message.poses.append(pose)
+        node._on_reference_path(message)
+        self.assertEqual("base_link", node._reference_path_frame_id)
+        np.testing.assert_allclose(
+            node._reference_path_points,
+            [[0.0, 0.0, 0.04], [0.01, 0.0, 0.08]],
+        )
 
     def test_lumen_diagnostics_disabled_keeps_static_markers_and_dynamic_markers_absent(self):
         config = curved_config("circular_arc")

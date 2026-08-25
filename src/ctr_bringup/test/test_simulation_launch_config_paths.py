@@ -22,6 +22,22 @@ def load_launch_module():
     return module
 
 
+def iter_launch_entities(entities):
+    """Walk nested launch actions such as the visual-mode safety startup timer."""
+
+    for entity in entities:
+        yield entity
+        get_children = getattr(entity, "get_sub_entities", None)
+        if get_children is not None:
+            children = tuple(get_children())
+            if children:
+                yield from iter_launch_entities(children)
+                continue
+        timer_children = getattr(entity, "_TimerAction__actions", ())
+        if timer_children:
+            yield from iter_launch_entities(timer_children)
+
+
 class SimulationLaunchConfigPathsTest(unittest.TestCase):
     def test_config_paths_are_independent_string_array_elements_for_all_consumers(self):
         module = load_launch_module()
@@ -38,7 +54,7 @@ class SimulationLaunchConfigPathsTest(unittest.TestCase):
                 context.launch_configurations["config_root"] = str(root)
                 expected = [str((root / name).resolve()) for name in module.CONFIG_NAMES]
                 values = []
-                for entity in description.entities:
+                for entity in iter_launch_entities(description.entities):
                     if not isinstance(entity, Node):
                         continue
                     for parameter_map in entity._Node__parameters:
@@ -82,7 +98,7 @@ class SimulationLaunchConfigPathsTest(unittest.TestCase):
                 )
                 safety_nodes = [
                     entity
-                    for entity in description.entities
+                    for entity in iter_launch_entities(description.entities)
                     if isinstance(entity, Node) and entity._Node__node_name == "safety_supervisor"
                 ]
                 self.assertEqual(1, len(safety_nodes))

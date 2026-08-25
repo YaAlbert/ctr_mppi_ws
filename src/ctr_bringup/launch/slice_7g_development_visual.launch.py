@@ -32,8 +32,10 @@ def generate_launch_description():
             "runtime_mode": "simulation",
             "slice_7g_profile": "true",
             "development_simulation": "true",
+            "enable_development_visualization": "true",
             "tactile_enabled": "true",
             "start_safety_supervisor": "true",
+            "safety_supervisor_start_delay": "1.0",
             "start_mppi_controller": "true",
             "start_reference_manager": "true",
             "reference_mode": "fixed_target",
@@ -51,6 +53,17 @@ def generate_launch_description():
         output="screen",
         arguments=["-d", str(share / "config" / "slice_7g_development.rviz")],
     )
+    world_to_base = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="slice_7g_world_to_fixed_base",
+        output="screen",
+        arguments=[
+            "--x", "0", "--y", "0", "--z", "0",
+            "--roll", "0", "--pitch", "0", "--yaw", "0",
+            "--frame-id", "world", "--child-frame-id", "base_link",
+        ],
+    )
     return LaunchDescription(
         [
             DeclareLaunchArgument(
@@ -60,6 +73,7 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument("seed", default_value="11"),
             OpaqueFunction(function=_require_development_opt_in),
+            world_to_base,
             simulation,
             rviz,
         ]

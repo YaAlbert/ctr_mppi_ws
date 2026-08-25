@@ -80,6 +80,37 @@ The simulation shall display:
 - contact marker;
 - coordinate frames.
 
+### Slice 7G development visualization legend
+
+The explicit `slice_7g_development_visual.launch.py` view uses `world` as its
+RViz fixed frame and publishes the physically fixed identity transform to the
+model's `base_link` frame. All simulation geometry remains expressed in
+metres. The displays are independently toggleable and use this legend:
+
+- translucent gray-blue: the curved lumen wall, triangulated from the same
+  `CurvedLumen` centerline samples and radius profile used by collision and
+  clearance calculations;
+- cyan rings: lumen wireframe (physical boundary, safety boundary, inlet, and
+  outlet);
+- light blue: analytic lumen centerline;
+- magenta: the exact MPPI reference path received on
+  `/ctr/reference/path` (a point glyph is used when fixed-target mode supplies
+  one pose rather than a drawable line);
+- blue: the current CTR backbone;
+- bright green: bounded, time-decimated history of real `/ctr/tip` positions;
+- yellow ring: target position;
+- red sphere and small red arrow: current tip position and the orientation
+  reported by `/ctr/tip`.
+
+The default tip arrow is 0.05 m at the shaft plus a 0.015 m head, with shaft
+radius 0.0025 m and head radius 0.006 m. Those dimensions can be changed under
+the RViz **Tip pose → Shape** properties. Wall transparency defaults to 0.20
+and is controlled by `simulation.visualization.surface_alpha`; the wall itself
+is enabled only by the explicit development visual launch through
+`enable_development_visualization`. Static geometry is reliable/transient-local
+and dynamic development markers are rate-limited. Actual tip history is capped
+by `actual_tip_history_max_points` and never enters headless or production mode.
+
 ## Simulation scenarios
 
 1. Fixed target reaching

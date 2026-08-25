@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 from typing import Iterable
 
@@ -10,6 +11,7 @@ import numpy as np
 import rclpy
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from geometry_msgs.msg import Point, PoseStamped
+from nav_msgs.msg import Path as NavPath
 from sensor_msgs.msg import JointState
 from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
@@ -36,11 +38,15 @@ from ctr_mppi_controller.lumen_factory import (
     lumen_geometry_from_config,
     lumen_mode_from_config,
 )
+from ctr_mppi_controller.nodes.reference_manager_node import reference_path_qos_profile
 from ctr_sim.lumen_markers import (
+    BoundedTipTrajectory,
+    build_actual_tip_path_marker,
     build_dynamic_lumen_delete_markers,
     build_dynamic_lumen_diagnostic_markers,
     LumenMarkerConfig,
     build_curved_static_lumen_markers,
+    build_reference_path_markers,
     build_static_lumen_delete_markers,
     marker_keys,
     markers_with_stamp,
@@ -52,6 +58,25 @@ from ctr_tactile.simulated_tactile import SimulatedTactileParameters, simulate_t
 from ctr_tactile.tactile_processing import TactileProcessor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+
+
+_STATIC_DEVELOPMENT_MARKER_NAMESPACES = frozenset(
+    {"lumen_surface", "lumen_wireframe", "lumen_centerline"}
+)
+
+
+def development_marker_qos_profile(namespace: str) -> QoSProfile:
+    """Keep static visual geometry available to RViz without periodic large republishes."""
+
+    static = namespace in _STATIC_DEVELOPMENT_MARKER_NAMESPACES
+    return QoSProfile(
+        depth=1 if static else 10,
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=(
+            DurabilityPolicy.TRANSIENT_LOCAL if static else DurabilityPolicy.VOLATILE
+        ),
+    )
 
 
 class CTRSimulatorNode(Node):
@@ -70,6 +95,7 @@ class CTRSimulatorNode(Node):
         self.declare_parameter("tactile_enabled", False)
         self.declare_parameter("slice_7g_profile", False)
         self.declare_parameter("development_simulation", False)
+        self.declare_parameter("enable_development_visualization", False)
 
         config_paths = validate_config_paths(self.get_parameter("config_paths").value)
 
@@ -100,6 +126,16 @@ class CTRSimulatorNode(Node):
             self.get_parameter("development_simulation").value,
             "development_simulation",
         )
+        development_visualization_enabled = parse_launch_bool(
+            self.get_parameter("enable_development_visualization").value,
+            "enable_development_visualization",
+        )
+        if development_visualization_enabled and not development_enabled:
+            raise ValueError(
+                "enable_development_visualization requires development_simulation=true"
+            )
+        self.development_simulation = development_enabled
+        self.development_visualization = development_visualization_enabled
         self.config = (
             apply_slice_7g_development_simulation_profile(self.config, enabled=True)
             if development_enabled
@@ -114,7 +150,14 @@ class CTRSimulatorNode(Node):
         simulation = self.config["simulation"]
         self.update_frequency = float(simulation["update_frequency"])
         self.dt = 1.0 / self.update_frequency
-        self.lumen_marker_config = LumenMarkerConfig.from_mapping(simulation.get("visualization", {}))
+        self.lumen_marker_config = LumenMarkerConfig.from_mapping(
+            simulation.get("visualization", {})
+        )
+        if self.development_visualization:
+            self.lumen_marker_config = replace(
+                self.lumen_marker_config,
+                publish_lumen_surface=True,
+            )
         self.command_timeout = float(self.get_parameter("command_timeout").value)
         self.frame_id = self.config["robot"]["frames"]["base"]
         self.world_frame_id = self.config["robot"]["frames"]["world"]
@@ -141,12 +184,23 @@ class CTRSimulatorNode(Node):
         self._static_lumen_marker_keys: tuple[tuple[str, int], ...] = ()
         self._static_lumen_marker_frame_id = self.frame_id
         self._last_static_lumen_publish_time_s: float | None = None
+        self._last_development_visualization_publish_time_s: float | None = None
         self._static_lumen_build_count = 0
         self._static_lumen_cache_hit_logged = False
         self._dynamic_lumen_marker_keys: tuple[tuple[str, int], ...] = ()
         self._dynamic_lumen_marker_frame_id = self.frame_id
         self._last_lumen_diagnostic_log_signature: tuple[str, ...] | None = None
         self._lumen_diagnostic_update_count = 0
+        self._reference_path_points = np.empty((0, 3), dtype=np.float64)
+        self._reference_path_frame_id = self.frame_id
+        self._tip_trajectory = (
+            BoundedTipTrajectory(
+                max_points=self.lumen_marker_config.actual_tip_history_max_points,
+                minimum_interval=self.lumen_marker_config.actual_tip_history_min_interval,
+            )
+            if self.development_visualization
+            else None
+        )
 
         self.latest_command = np.zeros(6, dtype=float)
         self.command_valid = False
@@ -166,6 +220,16 @@ class CTRSimulatorNode(Node):
             self._on_target,
             10,
         )
+        self.reference_path_sub = (
+            self.create_subscription(
+                NavPath,
+                "/ctr/reference/path",
+                self._on_reference_path,
+                reference_path_qos_profile(),
+            )
+            if self.development_visualization
+            else None
+        )
 
         self.joint_pub = self.create_publisher(CtrJointState, "/ctr/joint_state", 10)
         self.standard_joint_pub = self.create_publisher(JointState, "/joint_states", 10)
@@ -179,6 +243,27 @@ class CTRSimulatorNode(Node):
         )
         self.diagnostics_pub = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
         self.marker_pub = self.create_publisher(MarkerArray, "/ctr/visualization", 10)
+        self.development_marker_pubs = (
+            {
+                namespace: self.create_publisher(
+                    MarkerArray,
+                    f"/ctr/development_visualization/{namespace}",
+                    development_marker_qos_profile(namespace),
+                )
+                for namespace in (
+                    "lumen_surface",
+                    "lumen_wireframe",
+                    "lumen_centerline",
+                    "ctr_backbone",
+                    "reference_path",
+                    "actual_tip_path",
+                    "tip_marker",
+                    "target_marker",
+                )
+            }
+            if self.development_visualization
+            else {}
+        )
 
         self.timer = self.create_timer(self.dt, self._on_timer)
         self.get_logger().info(
@@ -211,6 +296,34 @@ class CTRSimulatorNode(Node):
             dtype=float,
         )
 
+    def _on_reference_path(self, msg: NavPath) -> None:
+        """Retain only the exact finite reference data published by the controller path owner."""
+
+        try:
+            frame_id = str(msg.header.frame_id)
+            if not frame_id:
+                raise ValueError("reference path frame is empty")
+            points = np.asarray(
+                [
+                    (pose.pose.position.x, pose.pose.position.y, pose.pose.position.z)
+                    for pose in msg.poses
+                ],
+                dtype=np.float64,
+            )
+            if points.ndim != 2 or points.shape[1:] != (3,) or points.shape[0] < 1:
+                raise ValueError("reference path must contain at least one 3D pose")
+            if not np.all(np.isfinite(points)):
+                raise ValueError("reference path contains non-finite coordinates")
+            pose_frames = {pose.header.frame_id for pose in msg.poses if pose.header.frame_id}
+            if pose_frames and pose_frames != {frame_id}:
+                raise ValueError("reference path pose frames do not match its header")
+        except (TypeError, ValueError) as exc:
+            self._reference_path_points = np.empty((0, 3), dtype=np.float64)
+            self.get_logger().warn(f"Reference path visualization rejected: {exc}")
+            return
+        self._reference_path_points = points.copy()
+        self._reference_path_frame_id = frame_id
+
     def _on_timer(self) -> None:
         now = self.get_clock().now()
         command_age = (now - self.last_command_time).nanoseconds * 1e-9
@@ -225,6 +338,8 @@ class CTRSimulatorNode(Node):
         stamp = now.to_msg()
         backbone_points = [_point_from_array(point) for point in model_result.backbone_points]
         tip_pose = self._tip_pose(stamp, model_result.tip_position)
+        if self._tip_trajectory is not None:
+            self._tip_trajectory.append(model_result.tip_position, _stamp_seconds(stamp))
 
         self.joint_pub.publish(self._joint_state_msg(stamp, step.q, step.q_dot))
         self.standard_joint_pub.publish(self._standard_joint_state_msg(stamp, step.q, step.q_dot))
@@ -234,7 +349,20 @@ class CTRSimulatorNode(Node):
         if self.tactile_pub is not None:
             self.tactile_pub.publish(self._tactile_msg(stamp, model_result.tip_position))
         self.diagnostics_pub.publish(self._diagnostics_msg(stamp, command_age, model_result.diagnostic_status))
-        self.marker_pub.publish(self._marker_array_msg(stamp, backbone_points, model_result.backbone_points))
+        publish_development_visualization = self._development_visualization_publish_due(stamp)
+        marker_array = self._marker_array_msg(
+            stamp,
+            backbone_points,
+            model_result.backbone_points,
+            include_development=publish_development_visualization,
+        )
+        self.marker_pub.publish(
+            MarkerArray(
+                markers=[marker for marker in marker_array.markers if marker.ns != "lumen_surface"]
+            )
+        )
+        if publish_development_visualization:
+            self._publish_development_marker_topics(marker_array)
 
     def _joint_state_msg(self, stamp, q: np.ndarray, q_dot: np.ndarray) -> CtrJointState:
         msg = CtrJointState()
@@ -352,7 +480,14 @@ class CTRSimulatorNode(Node):
         msg.status = [status]
         return msg
 
-    def _marker_array_msg(self, stamp, backbone_points: list[Point], backbone_array: np.ndarray) -> MarkerArray:
+    def _marker_array_msg(
+        self,
+        stamp,
+        backbone_points: list[Point],
+        backbone_array: np.ndarray,
+        *,
+        include_development: bool | None = None,
+    ) -> MarkerArray:
         backbone = Marker()
         backbone.header.stamp = stamp
         backbone.header.frame_id = self.frame_id
@@ -367,14 +502,14 @@ class CTRSimulatorNode(Node):
         tip = Marker()
         tip.header.stamp = stamp
         tip.header.frame_id = self.frame_id
-        tip.ns = "ctr_tip"
+        tip.ns = "tip_marker"
         tip.id = 1
         tip.type = Marker.SPHERE
         tip.action = Marker.ADD
         tip.scale.x = 0.008
         tip.scale.y = 0.008
         tip.scale.z = 0.008
-        tip.color = ColorRGBA(r=0.0, g=0.8, b=0.3, a=1.0)
+        tip.color = ColorRGBA(r=1.0, g=0.15, b=0.1, a=1.0)
         if backbone_points:
             tip.pose.position = backbone_points[-1]
         tip.pose.orientation.w = 1.0
@@ -382,23 +517,77 @@ class CTRSimulatorNode(Node):
         target = Marker()
         target.header.stamp = stamp
         target.header.frame_id = self.frame_id
-        target.ns = "ctr_target"
+        target.ns = "target_marker"
         target.id = 2
-        target.type = Marker.SPHERE
+        target.type = Marker.LINE_STRIP
         target.action = Marker.ADD
-        target.scale.x = 0.01
-        target.scale.y = 0.01
-        target.scale.z = 0.01
-        target.color = ColorRGBA(r=1.0, g=0.2, b=0.1, a=1.0)
-        target.pose.position = _point_from_array(self.target_position)
+        target.scale.x = 0.0015
+        target.color = ColorRGBA(r=1.0, g=0.9, b=0.0, a=1.0)
         target.pose.orientation.w = 1.0
+        target.points = [
+            _point_from_array(
+                self.target_position
+                + 0.006
+                * np.array(
+                    [
+                        math.cos(2.0 * math.pi * index / 32.0),
+                        math.sin(2.0 * math.pi * index / 32.0),
+                        0.0,
+                    ],
+                    dtype=float,
+                )
+            )
+            for index in range(33)
+        ]
 
         markers = [backbone, tip, target]
         markers.extend(self._static_lumen_markers_for_publish(stamp))
         markers.extend(self._dynamic_lumen_markers_for_publish(stamp, backbone_array))
         if self.lumen_mode == "cylindrical" and isinstance(self.lumen, CylindricalLumen):
             markers.extend(self._lumen_markers(stamp, backbone_array))
+        if include_development is None:
+            include_development = self.development_visualization
+        if include_development and self._reference_path_points.shape[0] > 0:
+            markers.extend(
+                build_reference_path_markers(
+                    self._reference_path_points,
+                    self._reference_path_frame_id,
+                    stamp,
+                )
+            )
+        if include_development and self._tip_trajectory is not None:
+            actual_path = build_actual_tip_path_marker(
+                self._tip_trajectory.points(),
+                self.frame_id,
+                stamp,
+            )
+            if actual_path is not None:
+                markers.append(actual_path)
         return MarkerArray(markers=markers)
+
+    def _development_visualization_publish_due(self, stamp) -> bool:
+        if not self.development_visualization:
+            return False
+        stamp_s = _stamp_seconds(stamp)
+        last_publish = self._last_development_visualization_publish_time_s
+        period = 1.0 / self.lumen_marker_config.marker_publish_rate
+        if last_publish is None or stamp_s < last_publish or stamp_s - last_publish >= period - 1.0e-12:
+            self._last_development_visualization_publish_time_s = stamp_s
+            return True
+        return False
+
+    def _publish_development_marker_topics(self, marker_array: MarkerArray) -> None:
+        if not self.development_marker_pubs:
+            return
+        by_namespace: dict[str, list[Marker]] = {
+            namespace: [] for namespace in self.development_marker_pubs
+        }
+        for marker in marker_array.markers:
+            if marker.ns in by_namespace:
+                by_namespace[marker.ns].append(marker)
+        for namespace, publisher in self.development_marker_pubs.items():
+            if by_namespace[namespace]:
+                publisher.publish(MarkerArray(markers=by_namespace[namespace]))
 
     def _static_lumen_markers_for_publish(self, stamp) -> list[Marker]:
         config = getattr(self, "lumen_marker_config", LumenMarkerConfig())
@@ -471,6 +660,10 @@ class CTRSimulatorNode(Node):
         return markers_with_stamp(self._static_lumen_markers, stamp)
 
     def _static_lumen_publish_due(self, stamp, config: LumenMarkerConfig) -> bool:
+        if self.development_visualization:
+            # Static development topics are transient-local, so one authenticated
+            # publication is sufficient even when RViz joins after the simulator.
+            return False
         stamp_s = _stamp_seconds(stamp)
         last_publish = self._last_static_lumen_publish_time_s
         period = 1.0 / config.marker_publish_rate
