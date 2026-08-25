@@ -24,6 +24,7 @@ CONFIG_NAMES = (
     "slice_7g_runtime_params.yaml",
 )
 REFERENCE_MODES = ("fixed_target", "trajectory", "external_target")
+TARGET_SOURCE_MODES = ("profile", "cli", "rviz")
 
 
 def _config_paths():
@@ -98,6 +99,17 @@ def _validate_reference_launch_arguments(context, *args, **kwargs):
         raise RuntimeError("development_simulation=true requires slice_7g_profile=true")
     if development and LaunchConfiguration("runtime_mode").perform(context) != "simulation":
         raise RuntimeError("development_simulation=true requires runtime_mode=simulation")
+    try:
+        target_source = LaunchConfiguration("target_source").perform(context)
+    except Exception:
+        target_source = "profile"
+    if target_source not in TARGET_SOURCE_MODES:
+        raise RuntimeError(f"target_source must be one of {TARGET_SOURCE_MODES}")
+    if target_source != "profile":
+        if not development:
+            raise RuntimeError("development target overrides require development_simulation=true")
+        if mode != "external_target":
+            raise RuntimeError("cli/rviz target selection requires reference_mode=external_target")
     return []
 
 
@@ -130,12 +142,23 @@ def generate_launch_description():
     slice_7g_profile = LaunchConfiguration("slice_7g_profile")
     development_simulation = LaunchConfiguration("development_simulation")
     enable_development_visualization = LaunchConfiguration("enable_development_visualization")
+    target_source = LaunchConfiguration("target_source")
+    target_x = LaunchConfiguration("target_x")
+    target_y = LaunchConfiguration("target_y")
+    target_z = LaunchConfiguration("target_z")
+    wait_for_target = LaunchConfiguration("wait_for_target")
+    target_selection_timeout = LaunchConfiguration("target_selection_timeout")
+    target_projection_limit = LaunchConfiguration("target_projection_limit")
     cylinder_target_position = ParameterValue(
         [
             [cylinder_target_x],
             [cylinder_target_y],
             [cylinder_target_z],
         ],
+        value_type=list[float],
+    )
+    development_target_position = ParameterValue(
+        [[target_x], [target_y], [target_z]],
         value_type=list[float],
     )
     reference_manager_condition = IfCondition(
@@ -303,6 +326,41 @@ def generate_launch_description():
                     "Publish the development-only RViz surface, reference, and bounded tip-history topics."
                 ),
             ),
+            DeclareLaunchArgument(
+                "target_source",
+                default_value="profile",
+                description="Development-only target source: profile, cli, or rviz.",
+            ),
+            DeclareLaunchArgument(
+                "target_x",
+                default_value="0.015",
+                description="Development CLI target X in base_link, metres.",
+            ),
+            DeclareLaunchArgument(
+                "target_y",
+                default_value="0.005",
+                description="Development CLI target Y in base_link, metres.",
+            ),
+            DeclareLaunchArgument(
+                "target_z",
+                default_value="0.100",
+                description="Development CLI target Z in base_link, metres.",
+            ),
+            DeclareLaunchArgument(
+                "wait_for_target",
+                default_value="true",
+                description="Wait without motion for an RViz target candidate.",
+            ),
+            DeclareLaunchArgument(
+                "target_selection_timeout",
+                default_value="0.0",
+                description="Optional RViz selection timeout in seconds; zero disables it.",
+            ),
+            DeclareLaunchArgument(
+                "target_projection_limit",
+                default_value="-1.0",
+                description="Optional positive RViz projection limit override; negative uses YAML.",
+            ),
             OpaqueFunction(function=_validate_reference_launch_arguments),
             Node(
                 package="ctr_bringup",
@@ -419,6 +477,33 @@ def generate_launch_description():
                         "slice_7g_profile": ParameterValue(slice_7g_profile, value_type=bool),
                         "development_simulation": ParameterValue(
                             development_simulation, value_type=bool
+                        ),
+                    }
+                ],
+            ),
+            Node(
+                package="ctr_sim",
+                executable="development_target_selector_node",
+                name="development_target_selector",
+                output="screen",
+                condition=IfCondition(
+                    PythonExpression(["'", target_source, "' != 'profile'"])
+                ),
+                parameters=[
+                    {
+                        "config_paths": _config_path_parameter(config_root),
+                        "development_simulation": ParameterValue(
+                            development_simulation, value_type=bool
+                        ),
+                        "target_source": ParameterValue(target_source, value_type=str),
+                        "target_position": development_target_position,
+                        "seed": ParameterValue(mppi_random_seed, value_type=int),
+                        "wait_for_target": ParameterValue(wait_for_target, value_type=bool),
+                        "target_selection_timeout": ParameterValue(
+                            target_selection_timeout, value_type=float
+                        ),
+                        "projection_limit": ParameterValue(
+                            target_projection_limit, value_type=float
                         ),
                     }
                 ],

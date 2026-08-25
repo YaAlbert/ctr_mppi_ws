@@ -117,6 +117,38 @@ class SimulationLaunchConfigPathsTest(unittest.TestCase):
                 else:
                     os.environ["ROS_LOG_DIR"] = previous_log_dir
 
+    def test_development_target_selector_is_wired_only_for_explicit_nonprofile_source(self):
+        source = LAUNCH_PATH.read_text(encoding="utf-8")
+        selector = source.split('executable="development_target_selector_node"', 1)[1].split(
+            'executable="reference_manager_node"', 1
+        )[0]
+        assert "target_source" in selector
+        assert "development_simulation" in selector
+        assert "target_position" in selector
+        assert "wait_for_target" in selector
+        assert "target_selection_timeout" in selector
+        assert "target_projection_limit" in selector
+        assert "' != 'profile'" in selector
+
+    def test_production_mode_rejects_development_target_override(self):
+        module = load_launch_module()
+        context = LaunchContext()
+        context.launch_configurations.update(
+            {
+                "reference_mode": "external_target",
+                "start_reference_manager": "false",
+                "start_safety_supervisor": "false",
+                "mppi_publish_safe_for_simulation": "false",
+                "start_manual_command_publisher": "false",
+                "slice_7g_profile": "false",
+                "development_simulation": "false",
+                "runtime_mode": "simulation",
+                "target_source": "cli",
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "development_simulation=true"):
+            module._validate_reference_launch_arguments(context)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -327,6 +327,22 @@ class SimulatorNodeLumenRuntimeTest(unittest.TestCase):
             [[0.0, 0.0, 0.04], [0.01, 0.0, 0.08]],
         )
 
+    def test_accepted_reference_tip_moves_active_target_marker_to_controller_target(self):
+        node = simulator_shell(curved_config("circular_arc"))
+        message = PoseStamped()
+        message.header.frame_id = "base_link"
+        message.pose.position = _point_from_array(np.array([0.015, 0.005, 0.100]))
+        node._on_target(message)
+        backbone = sample_backbone()
+        marker_array = node._marker_array_msg(
+            Time(), [_point_from_array(point) for point in backbone], backbone
+        )
+        target = next(marker for marker in marker_array.markers if marker.ns == "target_marker")
+        center = np.mean(
+            [[point.x, point.y, point.z] for point in target.points[:-1]], axis=0
+        )
+        np.testing.assert_allclose(center, [0.015, 0.005, 0.100], atol=1.0e-12)
+
     def test_lumen_diagnostics_disabled_keeps_static_markers_and_dynamic_markers_absent(self):
         config = curved_config("circular_arc")
         config["simulation"]["visualization"]["publish_lumen_diagnostics"] = False

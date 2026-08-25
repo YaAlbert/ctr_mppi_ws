@@ -972,6 +972,11 @@ def _validate_simulation(simulation: Any) -> list[str]:
     for key in ("command_dropout_probability", "state_dropout_probability"):
         errors.extend(_require_probability(comms, key, "simulation.communication"))
     errors.extend(_validate_simulation_visualization(simulation.get("visualization", {})))
+    errors.extend(
+        _validate_development_target_selection(
+            simulation.get("development_target_selection", {})
+        )
+    )
     return errors
 
 
@@ -1026,6 +1031,24 @@ def _validate_simulation_visualization(visualization: Any) -> list[str]:
             visualization,
             "actual_tip_history_min_interval",
             "simulation.visualization",
+        )
+    )
+    return errors
+
+
+def _validate_development_target_selection(selection: Any) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(selection, dict):
+        return ["`simulation.development_target_selection` must be a map."]
+    prefix = "simulation.development_target_selection"
+    errors.extend(_require_positive_number(selection, "projection_limit", prefix))
+    errors.extend(_require_positive_number(selection, "candidate_max_age", prefix))
+    errors.extend(
+        _require_number(
+            selection,
+            "candidate_future_tolerance",
+            prefix,
+            nonnegative=True,
         )
     )
     return errors

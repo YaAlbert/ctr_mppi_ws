@@ -110,6 +110,33 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /ctr/development_visualization/target_marker
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Target candidate
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /ctr/development_visualization/target_candidate
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Invalid target candidate
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /ctr/development_visualization/target_candidate_invalid
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Target selection status
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /ctr/development_visualization/target_status
   Enabled: true
   Global Options:
     Background Color: 35; 38; 42
@@ -120,6 +147,9 @@ Visualization Manager:
     - Class: rviz_default_plugins/Interact
     - Class: rviz_default_plugins/MoveCamera
     - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/PublishPoint
+      Single click: true
+      Topic: /ctr/target_point_candidate
   Views:
     Current:
       Class: rviz_default_plugins/Orbit

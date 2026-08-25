@@ -20,6 +20,7 @@ setup(
         "console_scripts": [
             "simulator_node = ctr_sim.nodes.simulator_node:main",
             "manual_command_publisher = ctr_sim.nodes.manual_command_publisher:main",
+            "development_target_selector_node = ctr_sim.nodes.development_target_selector_node:main",
         ]
     },
 )

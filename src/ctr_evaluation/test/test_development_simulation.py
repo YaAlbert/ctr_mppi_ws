@@ -95,6 +95,18 @@ def test_run_one_pair_selects_existing_curved_lumen_pipeline(monkeypatch, tmp_pa
             captured["args"] = args
 
         def run_pair(self):
+            candidate = tmp_path / "candidate"
+            candidate.mkdir(exist_ok=True)
+            (candidate / "orchestration.json").write_text(
+                json.dumps(
+                    {
+                        "orchestration_success": True,
+                        "requested_target": [0.015, 0.005, 0.100],
+                        "validated_target": [0.015, 0.005, 0.100],
+                    }
+                ),
+                encoding="utf-8",
+            )
             return {
                 "orchestration_success": True,
                 "comparison_valid": True,
@@ -112,6 +124,110 @@ def test_run_one_pair_selects_existing_curved_lumen_pipeline(monkeypatch, tmp_pa
     assert captured["args"].task == "curved_lumen_navigation"
     assert captured["args"].seed == 22
     assert captured["args"].mppi_profile == "cylinder_fast"
+
+
+def test_development_cli_target_arguments_reach_existing_target_override(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeOrchestrator:
+        def __init__(self, args):
+            captured["args"] = args
+
+        def run_pair(self):
+            candidate = tmp_path / "candidate_cli"
+            candidate.mkdir(exist_ok=True)
+            (candidate / "orchestration.json").write_text(
+                json.dumps(
+                    {
+                        "orchestration_success": True,
+                        "requested_target": [0.015, 0.005, 0.100],
+                        "validated_target": [0.015, 0.005, 0.100],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return {
+                "orchestration_success": True,
+                "comparison_valid": True,
+                "ros_domain_id": 155,
+                "baseline_dir": str(tmp_path / "baseline_cli"),
+                "candidate_dir": str(candidate),
+            }
+
+    monkeypatch.setattr(development, "EvaluationOrchestrator", FakeOrchestrator)
+    monkeypatch.setattr(development, "collect_metrics", lambda _result: passing_metrics())
+    result = development.run_one_pair(
+        root=tmp_path,
+        seed=11,
+        duration=5.0,
+        smoke=True,
+        target_source="cli",
+        target=(0.015, 0.005, 0.100),
+    )
+    assert captured["args"].target == [0.015, 0.005, 0.1]
+    assert result["target_selection"] == {
+        "target_source": "cli",
+        "raw_input_point": [0.015, 0.005, 0.1],
+        "raw_input_frame": "base_link",
+        "validated_target": [0.015, 0.005, 0.1],
+        "controller_target_frame": "base_link",
+        "projection_distance": 0.0,
+        "acceptance_status": "target_accepted",
+        "orientation_used": False,
+        "accepted_target_timestamp": result["target_selection"]["accepted_target_timestamp"],
+        "reference_pose_count": 1,
+        "seed": 11,
+        "result_status": "passed",
+    }
+
+
+def test_cli_target_parser_requires_all_finite_coordinates():
+    args = development.parse_args(
+        [
+            "--development-simulation",
+            "--target-source",
+            "cli",
+            "--target-x",
+            "0.015",
+            "--target-y",
+            "0.005",
+            "--target-z",
+            "0.100",
+        ]
+    )
+    assert development.development_cli_target(args) == (0.015, 0.005, 0.1)
+    args.target_z = None
+    with pytest.raises(run_evaluation.OrchestrationError, match="requires"):
+        development.development_cli_target(args)
+    args.target_z = float("nan")
+    with pytest.raises(run_evaluation.OrchestrationError, match="finite"):
+        development.development_cli_target(args)
+
+
+def test_rviz_cli_mode_builds_exact_interactive_launch_command():
+    args = development.parse_args(
+        [
+            "--development-simulation",
+            "--target-source",
+            "rviz",
+            "--seeds",
+            "11",
+            "--target-selection-timeout",
+            "30",
+        ]
+    )
+    development.development_cli_target(args)
+    assert development.interactive_rviz_command(args) == [
+        "ros2",
+        "launch",
+        "ctr_bringup",
+        "slice_7g_development_visual.launch.py",
+        "development_simulation:=true",
+        "target_source:=rviz",
+        "wait_for_target:=true",
+        "target_selection_timeout:=30",
+        "seed:=11",
+    ]
 
 
 def test_development_base_command_binds_explicit_mode():
@@ -149,6 +265,20 @@ def test_result_report_is_explicitly_nonproduction(tmp_path):
             "ros_domain_id": 144,
             "candidate_dir": str(tmp_path / "seed11"),
             "metrics": passing_metrics(),
+            "target_selection": {
+                "target_source": "cli",
+                "raw_input_point": [0.015, 0.005, 0.100],
+                "raw_input_frame": "base_link",
+                "validated_target": [0.015, 0.005, 0.100],
+                "controller_target_frame": "base_link",
+                "projection_distance": 0.0,
+                "acceptance_status": "target_accepted",
+                "orientation_used": False,
+                "accepted_target_timestamp": "2026-08-25T00:00:00+00:00",
+                "reference_pose_count": 1,
+                "seed": 11,
+                "result_status": "passed",
+            },
         }
     ]
     (tmp_path / "seed11").mkdir()
@@ -158,4 +288,7 @@ def test_result_report_is_explicitly_nonproduction(tmp_path):
     assert "not production promotion evidence" in report
     assert payload["production_promotion_evidence"] is False
     assert payload["production_attempts_consumed"] == 0
+    assert payload["attempts"][0]["target_selection"]["target_source"] == "cli"
+    assert payload["attempts"][0]["target_selection"]["reference_pose_count"] == 1
+    assert "source=`cli`" in report
     assert Path(paths["comparison_plot"]).is_file()

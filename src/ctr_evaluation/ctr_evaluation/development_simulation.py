@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import json
 import math
 from pathlib import Path
+import subprocess
 import sys
 from typing import Any
 
@@ -23,6 +24,7 @@ from ctr_evaluation.run_evaluation import (
 DEFAULT_SEEDS = (11, 22, 33)
 DEFAULT_DURATION_SECONDS = 25.0
 DEFAULT_SMOKE_DURATION_SECONDS = 5.0
+TARGET_SOURCE_MODES = ("profile", "cli", "rviz")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -39,6 +41,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seeds", nargs="+", type=int, default=list(DEFAULT_SEEDS))
     parser.add_argument("--output-root", default="")
     parser.add_argument("--skip-smoke", action="store_true")
+    parser.add_argument(
+        "--target-source",
+        choices=TARGET_SOURCE_MODES,
+        default="profile",
+        help="Development target source: profile (default), cli, or interactive rviz.",
+    )
+    parser.add_argument("--target-x", type=float, default=None, help="CLI target X in base_link, metres.")
+    parser.add_argument("--target-y", type=float, default=None, help="CLI target Y in base_link, metres.")
+    parser.add_argument("--target-z", type=float, default=None, help="CLI target Z in base_link, metres.")
+    parser.add_argument(
+        "--target-selection-timeout",
+        type=float,
+        default=0.0,
+        help="Interactive RViz selection timeout in seconds; zero disables it.",
+    )
     return parser.parse_args(argv)
 
 
@@ -53,6 +70,11 @@ def main(argv: list[str] | None = None) -> int:
             raise OrchestrationError("development seeds must be nonnegative integers")
         if len(set(args.seeds)) != len(args.seeds):
             raise OrchestrationError("development seeds must not contain duplicates")
+        target = development_cli_target(args)
+        if args.target_source == "rviz":
+            if len(args.seeds) != 1:
+                raise OrchestrationError("interactive RViz target selection requires exactly one seed")
+            return run_interactive_rviz(args)
         root = _result_root(args.output_root)
         root.mkdir(mode=0o700, parents=True, exist_ok=False)
         print(f"WARNING: {DEVELOPMENT_SIMULATION_DISCLAIMER}", file=sys.stderr)
@@ -60,7 +82,14 @@ def main(argv: list[str] | None = None) -> int:
 
         attempts: list[dict[str, Any]] = []
         if not args.skip_smoke:
-            smoke = run_one_pair(root=root, seed=11, duration=args.smoke_duration, smoke=True)
+            smoke = run_one_pair(
+                root=root,
+                seed=11,
+                duration=args.smoke_duration,
+                smoke=True,
+                target_source=args.target_source,
+                target=target,
+            )
             attempts.append(smoke)
             if smoke["status"] != "passed":
                 paths = write_development_results(root, attempts)
@@ -69,7 +98,16 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
 
         for seed in args.seeds:
-            attempts.append(run_one_pair(root=root, seed=seed, duration=args.duration, smoke=False))
+            attempts.append(
+                run_one_pair(
+                    root=root,
+                    seed=seed,
+                    duration=args.duration,
+                    smoke=False,
+                    target_source=args.target_source,
+                    target=target,
+                )
+            )
 
         paths = write_development_results(root, attempts)
         passed = all(item["status"] == "passed" for item in attempts)
@@ -80,13 +118,21 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
-def run_one_pair(*, root: Path, seed: int, duration: float, smoke: bool) -> dict[str, Any]:
+def run_one_pair(
+    *,
+    root: Path,
+    seed: int,
+    duration: float,
+    smoke: bool,
+    target_source: str = "profile",
+    target: tuple[float, float, float] | None = None,
+) -> dict[str, Any]:
     label = "smoke" if smoke else "example"
     group = f"slice_7g_development_{label}_seed_{seed}"
     result: dict[str, Any] | None = None
+    target_accepted_at = datetime.now(timezone.utc).isoformat()
     try:
-        evaluation_args = parse_evaluation_args(
-            [
+        argv = [
                 "--development-simulation",
                 "--experiment-group",
                 group,
@@ -107,10 +153,22 @@ def run_one_pair(*, root: Path, seed: int, duration: float, smoke: bool) -> dict
                 "--output-root",
                 str(root),
             ]
-        )
+        if target_source == "cli":
+            if target is None:
+                raise OrchestrationError("CLI target source requires target coordinates")
+            argv.extend(["--target", *(format(value, ".17g") for value in target)])
+        evaluation_args = parse_evaluation_args(argv)
         result = EvaluationOrchestrator(evaluation_args).run_pair()
         metrics = collect_metrics(result)
         failure_reason = validate_functional_result(result, metrics)
+        orchestration = _read_json(Path(result["candidate_dir"]) / "orchestration.json")
+        target_selection = target_selection_result(
+            target_source=target_source,
+            supplied_target=target,
+            orchestration=orchestration,
+            seed=seed,
+            accepted_target_timestamp=target_accepted_at,
+        )
         return {
             "kind": label,
             "seed": seed,
@@ -121,6 +179,7 @@ def run_one_pair(*, root: Path, seed: int, duration: float, smoke: bool) -> dict
             "baseline_dir": result["baseline_dir"],
             "candidate_dir": result["candidate_dir"],
             "metrics": metrics,
+            "target_selection": target_selection,
         }
     except Exception as exc:
         return {
@@ -133,7 +192,95 @@ def run_one_pair(*, root: Path, seed: int, duration: float, smoke: bool) -> dict
             "baseline_dir": None if result is None else result.get("baseline_dir"),
             "candidate_dir": None if result is None else result.get("candidate_dir"),
             "metrics": {},
+            "target_selection": {
+                "target_source": target_source,
+                "raw_input_point": None if target is None else list(target),
+                "raw_input_frame": "base_link",
+                "validated_target": None,
+                "controller_target_frame": "base_link",
+                "projection_distance": 0.0,
+                "acceptance_status": "failed",
+                "orientation_used": False,
+                "accepted_target_timestamp": None,
+                "reference_pose_count": 0,
+                "seed": seed,
+                "result_status": "failed",
+            },
         }
+
+
+def development_cli_target(args: argparse.Namespace) -> tuple[float, float, float] | None:
+    values = (args.target_x, args.target_y, args.target_z)
+    supplied = tuple(value is not None for value in values)
+    if args.target_source == "cli":
+        if supplied != (True, True, True):
+            raise OrchestrationError("target_source=cli requires --target-x, --target-y, and --target-z")
+        target = tuple(float(value) for value in values)
+        if not all(math.isfinite(value) for value in target):
+            raise OrchestrationError("CLI target coordinates must be finite")
+        return target
+    if any(supplied):
+        raise OrchestrationError("target coordinates are accepted only with --target-source cli")
+    if not _finite_number(args.target_selection_timeout) or args.target_selection_timeout < 0.0:
+        raise OrchestrationError("target selection timeout must be finite and nonnegative")
+    return None
+
+
+def interactive_rviz_command(args: argparse.Namespace) -> list[str]:
+    return [
+        "ros2",
+        "launch",
+        "ctr_bringup",
+        "slice_7g_development_visual.launch.py",
+        "development_simulation:=true",
+        "target_source:=rviz",
+        "wait_for_target:=true",
+        f"target_selection_timeout:={float(args.target_selection_timeout):.17g}",
+        f"seed:={int(args.seeds[0])}",
+    ]
+
+
+def run_interactive_rviz(args: argparse.Namespace) -> int:
+    command = interactive_rviz_command(args)
+    print("Starting interactive RViz target selection:")
+    print(" ".join(command))
+    try:
+        return int(subprocess.run(command, check=False).returncode)
+    except OSError as exc:
+        raise OrchestrationError(f"could not start interactive RViz launch: {exc}") from exc
+
+
+def target_selection_result(
+    *,
+    target_source: str,
+    supplied_target: tuple[float, float, float] | None,
+    orchestration: dict[str, Any],
+    seed: int,
+    accepted_target_timestamp: str | None = None,
+) -> dict[str, Any]:
+    validated = orchestration.get("validated_target")
+    requested = orchestration.get("requested_target")
+    accepted = (
+        isinstance(validated, list)
+        and len(validated) == 3
+        and all(_finite_number(value) for value in validated)
+    )
+    return {
+        "target_source": target_source,
+        "raw_input_point": list(supplied_target) if supplied_target is not None else requested,
+        "raw_input_frame": "base_link",
+        "validated_target": validated if accepted else None,
+        "controller_target_frame": "base_link",
+        "projection_distance": 0.0,
+        "acceptance_status": "target_accepted" if accepted else "target_unreachable",
+        "orientation_used": False,
+        "accepted_target_timestamp": (
+            accepted_target_timestamp or datetime.now(timezone.utc).isoformat()
+        ) if accepted else None,
+        "reference_pose_count": 1 if accepted else 0,
+        "seed": seed,
+        "result_status": "passed" if orchestration.get("orchestration_success") is True else "failed",
+    }
 
 
 def collect_metrics(result: dict[str, Any]) -> dict[str, Any]:
@@ -283,6 +430,26 @@ def development_report(root: Path, attempts: list[dict[str, Any]], plot_path: Pa
             )
         )
     lines.extend(["", "## Plots", "", f"![Per-seed comparison]({plot_path.name})", ""])
+    lines.extend(["", "## Target selection", ""])
+    for item in attempts:
+        target = item.get("target_selection", {})
+        lines.append(
+            "- {kind} seed {seed}: source=`{source}`, raw=`{raw}` in `{raw_frame}`, "
+            "accepted=`{validated}` in `{controller_frame}`, projection=`{projection:.6g} m`, "
+            "orientation_used=`{orientation}`, reference_pose_count=`{poses}`, status=`{status}`.".format(
+                kind=item["kind"],
+                seed=item["seed"],
+                source=target.get("target_source", "unknown"),
+                raw=target.get("raw_input_point"),
+                raw_frame=target.get("raw_input_frame", "unknown"),
+                validated=target.get("validated_target"),
+                controller_frame=target.get("controller_target_frame", "unknown"),
+                projection=float(target.get("projection_distance", 0.0)),
+                orientation=target.get("orientation_used", False),
+                poses=target.get("reference_pose_count", 0),
+                status=target.get("acceptance_status", "unknown"),
+            )
+        )
     for item in attempts:
         candidate_dir = item.get("candidate_dir")
         if not candidate_dir:

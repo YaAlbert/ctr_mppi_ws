@@ -200,6 +200,25 @@ and clean zero-exit shutdown for every owned process. Four updated captures are
 under `evaluation_results/slice_7g_performance_optimized_20260823T014418Z/visual/`.
 No production behavior, production authority, or production attempt changed.
 
+On 2026-08-25 the explicit Slice 7G development visual workflow gained
+one-shot `profile`, `cli`, and `rviz` target sources. The default visual target
+remains `[0.015, 0.005, 0.100] m`; MPPI continues to consume one real terminal
+position and does not use target orientation. CLI coordinates are exact and
+unprojected. RViz `PointStamped` candidates use the established identity
+`world -> base_link`, the analytic `CurvedLumen` validation/clearance contract,
+a 0.035 m centerline-projection ceiling, fresh timestamp checks, and the
+existing deterministic approximate-model reachability sanity gate. MPPI emits
+no command while selection is pending, and later updates are rejected after
+motion begins. The installed profile and CLI seed-11 runs passed readiness and
+navigation with zero collisions, while a displayed RViz wall point was
+projected by 0.030 m, accepted, executed, and cleanly shut down after an invalid
+point had first been rejected without motion. The practical suite passed 918
+tests (the accepted 894-node baseline plus 24 target-selection nodes), all
+eight packages rebuilt, and RViz Global Status remained OK. Coordinates,
+metrics, reproduction commands, and the selected screenshot are in
+`evaluation_results/slice_7g_target_selection_20260825T103000Z/`. Production
+defaults, production authority, and the production attempt remain unchanged.
+
 ## Ubuntu environment and build-readiness summary
 
 - OS: Ubuntu 22.04.5 LTS.

@@ -181,6 +181,24 @@ class ParameterValidationTest(unittest.TestCase):
         self.assertEqual(0.05, visualization["actual_tip_history_min_interval"])
         self.assertEqual([], [error for error in validate_project_config(config) if "simulation.visualization" in error])
 
+    def test_development_target_selection_limits_are_configured_and_strict(self):
+        config = load_parameter_files(CONFIG_FILES)
+        selection = config["simulation"]["development_target_selection"]
+        self.assertEqual(0.035, selection["projection_limit"])
+        self.assertEqual(5.0, selection["candidate_max_age"])
+        self.assertEqual(0.5, selection["candidate_future_tolerance"])
+        self.assertEqual([], validate_project_config(config))
+        for key, invalid_values in {
+            "projection_limit": (0.0, -1.0, True, float("nan")),
+            "candidate_max_age": (0.0, -1.0, True, float("inf")),
+            "candidate_future_tolerance": (-1.0, True, float("nan")),
+        }.items():
+            for value in invalid_values:
+                with self.subTest(key=key, value=value):
+                    invalid = copy.deepcopy(config)
+                    invalid["simulation"]["development_target_selection"][key] = value
+                    self.assertTrue(any(key in error for error in validate_project_config(invalid)))
+
     def test_mppi_tactile_defaults_and_cross_field_validation(self):
         config = load_parameter_files(CONFIG_FILES)
         self.assertEqual([], [error for error in validate_project_config(config) if "mppi.tactile" in error])
@@ -553,6 +571,9 @@ class ParameterValidationTest(unittest.TestCase):
                             "cylinder_target_x": launch_values[0],
                             "cylinder_target_y": launch_values[1],
                             "cylinder_target_z": launch_values[2],
+                            "target_x": launch_values[0],
+                            "target_y": launch_values[1],
+                            "target_z": launch_values[2],
                         }
                     )
                     for parameter_value in target_values:

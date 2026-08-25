@@ -18,9 +18,12 @@ def load_launch_module():
     return module
 
 
-def context(value):
+def context(value, target_source="profile"):
     launch_context = SimpleNamespace(
-        launch_configurations={"development_simulation": value}
+        launch_configurations={
+            "development_simulation": value,
+            "target_source": target_source,
+        }
     )
     launch_context.perform_substitution = lambda substitution: substitution.perform(
         launch_context
@@ -35,6 +38,16 @@ def test_visual_launch_requires_explicit_development_opt_in():
     assert module._require_development_opt_in(context("true")) == []
 
 
+def test_visual_launch_target_source_defaults_to_profile_and_rejects_unknown_modes():
+    module = load_launch_module()
+    source = LAUNCH_PATH.read_text(encoding="utf-8")
+    assert '"target_source",\n                default_value="profile"' in source
+    assert module._require_development_opt_in(context("true", "cli")) == []
+    assert module._require_development_opt_in(context("true", "rviz")) == []
+    with pytest.raises(RuntimeError, match="profile, cli, or rviz"):
+        module._require_development_opt_in(context("true", "unknown"))
+
+
 def test_visual_launch_is_simulator_only_and_uses_fixed_profile_contract():
     source = LAUNCH_PATH.read_text(encoding="utf-8")
     assert '"runtime_mode": "simulation"' in source
@@ -44,6 +57,13 @@ def test_visual_launch_is_simulator_only_and_uses_fixed_profile_contract():
     assert '"enable_curved_lumen": "true"' in source
     assert '"start_safety_supervisor": "true"' in source
     assert '"safety_supervisor_start_delay": "1.0"' in source
+    assert '"target_source": target_source' in source
+    assert '"target_x": target_x' in source
+    assert '"target_y": target_y' in source
+    assert '"target_z": target_z' in source
+    assert "external_target" in source
+    assert '"start_reference_manager": start_reference_manager' in source
+    assert "'true' if '" in source
     assert "physical_hardware" not in source
     assert "mock_hardware" not in source
 
@@ -81,6 +101,9 @@ def test_rviz_configuration_displays_ctr_lumen_reference_and_tip():
         "Actual tip trajectory",
         "Tip pose",
         "Target",
+        "Target candidate",
+        "Invalid target candidate",
+        "Target selection status",
     }
     assert expected.issubset(displays)
     for name in ("Curved lumen surface", "Curved lumen wireframe", "Lumen centerline"):
@@ -113,6 +136,10 @@ def test_rviz_configuration_displays_ctr_lumen_reference_and_tip():
         "Shaft Length": 0.05,
         "Shaft Radius": 0.0025,
     }
+    tools = manager["Tools"]
+    publish_point = next(tool for tool in tools if tool["Class"] == "rviz_default_plugins/PublishPoint")
+    assert publish_point["Topic"] == "/ctr/target_point_candidate"
+    assert publish_point["Single click"] is True
 
 
 def test_visual_launch_defines_semantic_identity_transform_for_fixed_robot_base():
