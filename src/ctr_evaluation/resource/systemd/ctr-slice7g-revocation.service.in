@@ -1,0 +1,28 @@
+[Unit]
+Description=Enforce CTR Slice 7G campaign cgroup revocation
+ConditionPathIsDirectory=/var/lib/ctr-mppi/slice-7g-authority/revocation/pending
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/libexec/ctr-mppi/ctr-slice7g-authorityd --enforce-revocation
+WorkingDirectory=/
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+ReadOnlyPaths=/etc/ctr-mppi/slice-7g-authority /opt/ctr-mppi/slice-7g /usr/libexec/ctr-mppi
+ReadWritePaths=/var/lib/ctr-mppi/slice-7g-authority
+Restart=no

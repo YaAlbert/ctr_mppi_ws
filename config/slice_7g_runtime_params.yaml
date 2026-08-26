@@ -1,0 +1,50 @@
+slice_7g_runtime:
+  profile_id: simulation_promotion_v1
+  runtime_mode: simulation
+  task: curved_lumen_navigation
+  geometry_profile: circular_arc
+  tactile_force_weight: 10.0
+  tactile_enabled: true
+  tactile_cost_enabled: true
+  safety_supervisor_enabled: true
+  safety_tactile_enabled: true
+  controller_safe_command_bypass_enabled: false
+  unfinished_costs:
+    obstacle:
+      todo_id: TODO-COST-001
+      enabled: false
+      weight: 0.0
+    shape:
+      todo_id: TODO-COST-005
+      enabled: false
+      weight: 0.0
+    stability:
+      todo_id: TODO-COST-006
+      enabled: false
+      weight: 0.0
+  readiness:
+    timeout_seconds: 10.0
+    minimum_stable_samples: 10
+    minimum_stable_interval_seconds: 0.5
+    q_variation_tolerance: 0.00005
+    tip_variation_tolerance_m: 0.00005
+    tactile_max_age_seconds: 0.10
+    safety_max_age_seconds: 0.10
+  acceptance:
+    minimum_valid_aligned_samples: 20
+    maximum_invalid_sample_percentage: 10.0
+    maximum_saturation_percentage: 1.0
+    maximum_deadline_overrun_percentage: 5.0
+    steady_state_error_m: 0.003
+    final_goal_error_m: 0.003
+    goal_hold_duration_seconds: 0.5
+    minimum_physical_wall_clearance_m: 0.0
+    minimum_safety_margin_wall_clearance_m: 0.002
+
+# Explicit non-production tolerances for the user-level Python simulation.
+# They accommodate the measured multi-second MPPI solve while retaining a
+# bounded command watchdog and tactile freshness check. Production never
+# selects this section.
+slice_7g_development_simulation:
+  safety_command_timeout_seconds: 5.0
+  controller_tactile_max_age_seconds: 5.0

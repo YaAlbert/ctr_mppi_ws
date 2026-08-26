@@ -1,0 +1,39 @@
+[Unit]
+Description=CTR Slice 7G local runtime authority
+Requires=ctr-slice7g-cleanup-authority.service ctr-slice7g-observer-supervisor.service
+After=local-fs.target ctr-slice7g-cleanup-authority.service ctr-slice7g-observer-supervisor.service
+Before=ctr-slice7g-campaign.service
+
+[Service]
+Type=simple
+User=ctr7g-authority
+Group=ctr7g-authority
+SupplementaryGroups=ctr7g-runtime
+ExecStart=/usr/libexec/ctr-mppi/ctr-slice7g-authorityd
+WorkingDirectory=/
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectControlGroups=yes
+Delegate=no
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+ReadOnlyPaths=/etc/ctr-mppi/slice-7g-authority /opt/ctr-mppi/slice-7g /usr/libexec/ctr-mppi
+ReadWritePaths=/var/lib/ctr-mppi/slice-7g-authority /run/ctr-mppi/slice-7g-authority /home/ankid/ctr_mppi_evidence/slice_7g
+RuntimeDirectory=ctr-mppi/slice-7g-authority
+RuntimeDirectoryMode=0755
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

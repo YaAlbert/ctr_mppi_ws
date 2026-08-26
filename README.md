@@ -58,3 +58,24 @@ u = q_dot
 7. Add safety supervision.
 8. Add mock hardware.
 9. Replace mock hardware with physical drivers.
+
+## Slice 7G development target selection
+
+After sourcing ROS 2 Humble and `install_slice7g_development/setup.bash`, the
+curved-lumen RViz workflow defaults to the unchanged deterministic profile
+target:
+
+```bash
+ros2 launch ctr_bringup slice_7g_development_visual.launch.py \
+  development_simulation:=true target_source:=profile seed:=11
+```
+
+Development-only alternatives are `target_source:=cli` with metre-valued
+`target_x`, `target_y`, and `target_z`, or `target_source:=rviz` with RViz's
+**Publish Point** tool. The latter publishes to `/ctr/target_point_candidate`
+and holds the controller stationary until a valid point is accepted. See
+`docs/09_simulation_requirements.md` for validation, projection, status, and
+reproduction details, and
+`evaluation_results/slice_7g_target_selection_20260825T103000Z/target_selection_report.md`
+for tested profile/CLI/RViz results. These options do not change production
+defaults.

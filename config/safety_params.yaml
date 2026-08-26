@@ -1,9 +1,13 @@
 safety:
   enabled: true
+  tactile_enabled: false
 
   state_timeout: 0.10
   command_timeout: 0.10
   tactile_timeout: 0.10
+  tactile_startup_grace_s: 0.10
+  tactile_future_skew_s: 0.02
+  watchdog_period_s: 0.02
 
   stop_on_state_timeout: true
   stop_on_tactile_timeout: true

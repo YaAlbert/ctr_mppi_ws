@@ -27,10 +27,97 @@ mppi:
     joint_limit: 100000.0
     stability: 0.0
 
+  tactile:
+    enabled: false
+    max_age_s: 0.10
+    force_saturation_n: 10.0
+    proximity_margin_m: 0.0020
+    no_contact_multiplier: 0.0
+    contact_multiplier: 1.0
+    warning_multiplier: 2.0
+    stop_multiplier: 4.0
+
   convergence:
     tip_tolerance: 0.002
     shape_tolerance: 0.003
     stable_cycles: 10
+
+mppi_profiles:
+  cylinder_fast:
+    samples: 36
+    horizon: 7
+    dt: 0.55
+    control_period: 0.10
+    noise_std:
+      insertion: [0.0030, 0.0030, 0.0030]
+      rotation: [0.100, 0.100, 0.100]
+    weights:
+      tip: 15000.0
+      terminal: 15000.0
+      control: 0.005
+      smoothness: 0.01
+    simulation_default: true
+    note: provisional bounded software-test profile tuned for functional cylinder navigation, not real-time certification
+  reference_quality:
+    samples: 500
+    horizon: 10
+    dt: 0.05
+    control_period: 0.05
+    simulation_default: true
+    note: existing Milestone 5 reference-quality software-test profile
+
+cylindrical_lumen:
+  enabled: true
+  simulation_default: true
+  frame_id: base_link
+  axis_origin: [0.0, 0.0, 0.0]
+  axis_direction: [0.0, 0.0, 1.0]
+  radius: 0.030
+  length: 0.120
+  ctr_outer_radius: 0.0015
+  safety_margin: 0.0020
+  note: provisional straight-cylinder software-simulation defaults only
+
+curved_lumen:
+  enabled: false
+  simulation_default: true
+  type: circular_arc
+  frame_id: base_link
+  lumen_radius: 0.030
+  ctr_outer_radius: 0.0015
+  safety_margin: 0.0020
+  centerline_sample_spacing: 0.002
+  circular_arc:
+    inlet_position: [0.0, 0.0, 0.0]
+    initial_tangent: [0.0, 0.0, 1.0]
+    bend_normal: [1.0, 0.0, 0.0]
+    curvature_radius: 0.180
+    arc_angle: 0.70
+  s_curve:
+    inlet_position: [0.0, 0.0, 0.0]
+    initial_tangent: [0.0, 0.0, 1.0]
+    bend_plane_normal: [1.0, 0.0, 0.0]
+    total_length: 0.120
+    lateral_amplitude: 0.015
+  note: provisional curved-lumen software-simulation defaults only
+
+cylindrical_lumen_cost:
+  simulation_default: true
+  safety_margin_weight: 100.0
+  radial_collision_weight: 100000.0
+  end_cap_weight: 100000.0
+  terminal_collision_weight: 200000.0
+  note: provisional dimensionless software-simulation weights
+
+goal:
+  simulation_default: true
+  frame_id: base_link
+  position: [0.015, 0.005, 0.100]
+  tolerance: 0.003
+  required_hold_duration: 0.5
+  reachability_samples: 2048
+  reachability_seed: 4
+  note: provisional software-simulation point goal, not measured hardware target
 
 # Milestone 5 software-test references are centered near the approximate
 # model's zero-configuration tip [0.0192, 0.0, 0.08] m. They are not physical

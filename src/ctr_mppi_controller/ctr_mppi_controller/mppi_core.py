@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from time import perf_counter
 from typing import Any
 
@@ -18,6 +19,8 @@ from .cost_functions import (
     terminal_tip_cost,
     tip_tracking_cost,
 )
+from .lumen_geometry import LumenCostWeights, LumenGeometry, compute_lumen_cost
+from .tactile_cost import TactileCostConfig, TactileSnapshot, tactile_cost_value
 
 
 REQUIRED_WEIGHT_KEYS = (
@@ -129,6 +132,12 @@ class MPPIResult:
     command_magnitude: float
     command_saturated: bool
     diagnostic_status: str
+    tactile_snapshot_eligible: bool = False
+    tactile_snapshot_reason: str = "disabled"
+    tactile_region: int = 0
+    tactile_force_magnitude_n: float = 0.0
+    tactile_minimum_predicted_clearance_m: float = float("nan")
+    tactile_cost: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -137,12 +146,21 @@ class MPPIRollout:
     final_q: np.ndarray
     final_tip: np.ndarray
     command_saturated: bool
+    tactile_cost: float = 0.0
+    minimum_predicted_clearance_m: float = float("nan")
 
 
 class MPPICore:
     """A small MPPI optimizer independent of ROS2."""
 
-    def __init__(self, config: dict[str, Any], model: Any):
+    def __init__(
+        self,
+        config: dict[str, Any],
+        model: Any,
+        *,
+        lumen_geometry: LumenGeometry | None = None,
+        lumen_cost_weights: LumenCostWeights | None = None,
+    ):
         self._config = config
         self._model = model
 
@@ -166,6 +184,15 @@ class MPPICore:
         self.last_costs = np.zeros(0, dtype=float)
         self.last_normalized_weights = np.zeros(0, dtype=float)
         self.last_rollout_final_q = np.zeros((0, self.control_dimension), dtype=float)
+        self.lumen = lumen_geometry
+        self.lumen_cost_weights = None
+        if self.lumen is not None:
+            self.lumen_cost_weights = lumen_cost_weights or LumenCostWeights.from_config(config)
+        self.tactile_cost_config = TactileCostConfig.from_project_config(config)
+        self.last_tactile_snapshot_eligible = False
+        self.last_tactile_snapshot_reason = "disabled"
+        self.last_tactile_cost = 0.0
+        self.last_tactile_minimum_predicted_clearance_m = float("nan")
         self._validate_disabled_costs()
 
     def reset(self) -> None:
@@ -205,6 +232,7 @@ class MPPICore:
         previous_command: np.ndarray | list[float] | tuple[float, ...],
         target_tip: np.ndarray | list[float] | tuple[float, ...] | None = None,
         target_tip_sequence: np.ndarray | list[list[float]] | tuple[tuple[float, ...], ...] | None = None,
+        tactile_snapshot: TactileSnapshot | None = None,
     ) -> MPPIRollout:
         q = _array_shape(q0, "q0", (self.control_dimension,)).copy()
         sequence_array = _array_shape(sequence, "sequence", (self.horizon, self.control_dimension))
@@ -212,8 +240,10 @@ class MPPICore:
         reference_sequence = self._reference_sequence(target_tip=target_tip, target_tip_sequence=target_tip_sequence)
 
         total = 0.0
+        tactile_total = 0.0
+        minimum_predicted_clearance_m = float("inf")
         command_saturated = False
-        final_tip = None
+        final_model_result = None
 
         for step_index, command in enumerate(sequence_array):
             clipped_command = np.clip(command, -self.velocity_max, self.velocity_max)
@@ -223,20 +253,36 @@ class MPPICore:
             command_saturated = command_saturated or not np.allclose(next_q_unclipped, q)
 
             model_result = self._validated_model_result(q)
-            final_tip = model_result.tip_position
-            total += self._weight("tip") * tip_tracking_cost(final_tip, reference_sequence[step_index])
+            final_model_result = model_result
+            total += self._weight("tip") * tip_tracking_cost(model_result.tip_position, reference_sequence[step_index])
             total += self._weight("control") * control_magnitude_cost(clipped_command)
             total += self._weight("smoothness") * control_smoothness_cost(clipped_command, previous)
+            total += self._lumen_cost(model_result.backbone_points, terminal=False)
             total += shape_tracking_cost(enabled=self._weight("shape") > 0.0)
             total += obstacle_cost(enabled=self._weight("obstacle") > 0.0)
-            total += tactile_cost(enabled=self._weight("force") > 0.0)
+            predicted_clearance_m = None
+            if tactile_snapshot is not None and self.lumen is not None:
+                predicted_clearance_m = float(self.lumen.point_clearance(model_result.tip_position).physical_clearance)
+                minimum_predicted_clearance_m = min(minimum_predicted_clearance_m, predicted_clearance_m)
+            tactile_value = tactile_cost_value(
+                enabled=tactile_snapshot is not None and self.tactile_cost_config.enabled,
+                snapshot=tactile_snapshot,
+                predicted_clearance_m=predicted_clearance_m,
+                config=self.tactile_cost_config,
+            )
+            tactile_total += tactile_value
+            total += tactile_value
             total += stability_cost(enabled=self._weight("stability") > 0.0)
             previous = clipped_command
 
-        if final_tip is None:
+        if final_model_result is None:
             raise ValueError("rollout sequence is empty")
-        terminal = self._validated_model_result(q).tip_position
+        # The last rollout step already evaluated this exact deterministic
+        # state. Reuse it for terminal costs instead of repeating kinematics.
+        terminal_result = final_model_result
+        terminal = terminal_result.tip_position
         total += self._weight("terminal") * terminal_tip_cost(terminal, reference_sequence[-1])
+        total += self._lumen_cost(terminal_result.backbone_points, terminal=True)
         if not np.isfinite(total):
             raise ValueError("rollout cost is not finite")
         return MPPIRollout(
@@ -244,6 +290,12 @@ class MPPICore:
             final_q=q.copy(),
             final_tip=terminal.copy(),
             command_saturated=bool(command_saturated),
+            tactile_cost=float(tactile_total),
+            minimum_predicted_clearance_m=(
+                float(minimum_predicted_clearance_m)
+                if math.isfinite(minimum_predicted_clearance_m)
+                else float("nan")
+            ),
         )
 
     def normalized_importance_weights(self, costs: np.ndarray) -> np.ndarray:
@@ -268,6 +320,8 @@ class MPPICore:
         q_dot: np.ndarray | list[float] | tuple[float, ...],
         target_tip: np.ndarray | list[float] | tuple[float, ...] | None = None,
         target_tip_sequence: np.ndarray | list[list[float]] | tuple[tuple[float, ...], ...] | None = None,
+        tactile_snapshot: TactileSnapshot | None = None,
+        tactile_snapshot_reason: str | None = None,
     ) -> MPPIResult:
         start = perf_counter()
         q0 = _array_shape(q, "q", (self.control_dimension,))
@@ -284,6 +338,8 @@ class MPPICore:
         candidate_sequences = self.candidate_sequences(perturbations)
 
         costs = np.zeros(self.num_samples, dtype=float)
+        tactile_costs = np.zeros(self.num_samples, dtype=float)
+        minimum_clearances = np.full(self.num_samples, np.nan, dtype=float)
         final_q = np.zeros((self.num_samples, self.control_dimension), dtype=float)
         for sample_index in range(self.num_samples):
             rollout = self.rollout_candidate(
@@ -291,8 +347,11 @@ class MPPICore:
                 sequence=candidate_sequences[sample_index],
                 previous_command=previous_command,
                 target_tip_sequence=reference_sequence,
+                tactile_snapshot=tactile_snapshot,
             )
             costs[sample_index] = rollout.cost
+            tactile_costs[sample_index] = rollout.tactile_cost
+            minimum_clearances[sample_index] = rollout.minimum_predicted_clearance_m
             final_q[sample_index] = rollout.final_q
 
         normalized = self.normalized_importance_weights(costs)
@@ -312,6 +371,19 @@ class MPPICore:
 
         effective_sample_weight = 1.0 / max(float(np.sum(normalized**2)), 1e-12)
         solve_time = perf_counter() - start
+        self.last_tactile_snapshot_eligible = tactile_snapshot is not None and self.tactile_cost_config.enabled
+        self.last_tactile_snapshot_reason = (
+            "eligible"
+            if self.last_tactile_snapshot_eligible
+            else (tactile_snapshot_reason or ("disabled" if not self.tactile_cost_config.enabled else "missing_snapshot"))
+        )
+        self.last_tactile_cost = float(np.mean(tactile_costs))
+        finite_clearances = minimum_clearances[np.isfinite(minimum_clearances)]
+        self.last_tactile_minimum_predicted_clearance_m = (
+            float(np.min(finite_clearances)) if finite_clearances.size else float("nan")
+        )
+        tactile_region = int(tactile_snapshot.region) if tactile_snapshot is not None else 0
+        tactile_force = float(tactile_snapshot.force_magnitude_n) if tactile_snapshot is not None else 0.0
         return MPPIResult(
             command=command,
             nominal_sequence=self.nominal_sequence.copy(),
@@ -321,7 +393,13 @@ class MPPICore:
             effective_sample_weight=effective_sample_weight,
             command_magnitude=float(np.linalg.norm(command)),
             command_saturated=bool(command_saturated),
-            diagnostic_status="MPPI controller: tip/control/smoothness/terminal costs enabled; advanced costs disabled.",
+            diagnostic_status=self._diagnostic_status(),
+            tactile_snapshot_eligible=self.last_tactile_snapshot_eligible,
+            tactile_snapshot_reason=self.last_tactile_snapshot_reason,
+            tactile_region=tactile_region,
+            tactile_force_magnitude_n=tactile_force,
+            tactile_minimum_predicted_clearance_m=self.last_tactile_minimum_predicted_clearance_m,
+            tactile_cost=self.last_tactile_cost,
         )
 
     def _rollout_cost(
@@ -332,6 +410,7 @@ class MPPICore:
         previous_command: np.ndarray,
         target_tip: np.ndarray | None = None,
         target_tip_sequence: np.ndarray | None = None,
+        tactile_snapshot: TactileSnapshot | None = None,
     ) -> float:
         return self.rollout_candidate(
             q0=q0,
@@ -339,6 +418,7 @@ class MPPICore:
             previous_command=previous_command,
             target_tip=target_tip,
             target_tip_sequence=target_tip_sequence,
+            tactile_snapshot=tactile_snapshot,
         ).cost
 
     def _reference_sequence(
@@ -353,14 +433,16 @@ class MPPICore:
             raise ValueError("exactly one of target_tip or target_tip_sequence must be provided")
         if target_tip is not None:
             target = _array_shape(target_tip, "target_tip", (3,))
-            return np.tile(target, (self.horizon, 1))
-        return _array_shape(target_tip_sequence, "target_tip_sequence", (self.horizon, 3)).copy()
+            sequence = np.tile(target, (self.horizon, 1))
+        else:
+            sequence = _array_shape(target_tip_sequence, "target_tip_sequence", (self.horizon, 3)).copy()
+        self._validate_reference_inside_lumen(sequence)
+        return sequence
 
     def _validate_disabled_costs(self) -> None:
         disabled = {
             "shape": "TODO-COST-005",
             "obstacle": "TODO-COST-001",
-            "force": "TODO-SNS-001",
             "stability": "TODO-COST-006",
         }
         for key, todo_id in disabled.items():
@@ -378,6 +460,38 @@ class MPPICore:
         if not np.all(np.isfinite(backbone)) or not np.all(np.isfinite(tip)):
             raise ValueError("model output contains non-finite values")
         return result
+
+    def _validate_reference_inside_lumen(self, reference_sequence: np.ndarray) -> None:
+        if self.lumen is None:
+            return
+        for index, point in enumerate(reference_sequence):
+            validation = self.lumen.validate_target(point, frame_id=self._config.get("goal", {}).get("frame_id"), require_safety_margin=True)
+            if not validation.valid:
+                raise ValueError(f"target_tip_sequence[{index}] is outside selected lumen geometry: {validation.reasons}")
+
+    def _lumen_cost(self, backbone_points: np.ndarray, *, terminal: bool) -> float:
+        if self.lumen is None or self.lumen_cost_weights is None:
+            return 0.0
+        if all(value == 0.0 for value in vars(self.lumen_cost_weights).values()):
+            return 0.0
+        return compute_lumen_cost(
+            lumen=self.lumen,
+            weights=self.lumen_cost_weights,
+            backbone_points=backbone_points,
+            terminal=terminal,
+        )
+
+    def _diagnostic_status(self) -> str:
+        costs = "tip/control/smoothness/terminal"
+        if self.lumen is not None:
+            costs += "/lumen"
+        if self.tactile_cost_config.enabled and self._weight("force") > 0.0:
+            costs += "/tactile"
+        return (
+            f"MPPI controller: {costs} costs enabled; tactile="
+            f"{self.last_tactile_snapshot_eligible}:{self.last_tactile_snapshot_reason}; "
+            f"tactile_cost_mean={self.last_tactile_cost:.9g}; unsupported advanced costs disabled."
+        )
 
     def _weight(self, name: str) -> float:
         return float(self.weights.get(name, 0.0))

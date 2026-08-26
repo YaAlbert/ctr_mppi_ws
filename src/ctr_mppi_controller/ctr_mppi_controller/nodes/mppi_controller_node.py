@@ -2,23 +2,65 @@
 
 from __future__ import annotations
 
+import threading
 import numpy as np
 import rclpy
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path as NavPath
 
-from ctr_bringup.parameter_validation import load_parameter_files, validate_config_paths, validate_or_raise
+from ctr_bringup.parameter_validation import (
+    load_parameter_files,
+    parse_launch_bool,
+    project_config_with_overrides,
+    validate_config_paths,
+    validate_or_raise,
+)
 from ctr_bringup.placeholder_node import run_node_until_shutdown
-from ctr_interfaces.msg import CtrControllerMetrics, CtrJointCommand, CtrState
+from ctr_bringup.slice_7g_profile import (
+    apply_slice_7g_development_simulation_profile,
+    apply_slice_7g_simulation_profile,
+)
+from ctr_interfaces.msg import CtrControllerMetrics, CtrJointCommand, CtrState, CtrTactileState
 from ctr_model.approximate_model import ApproximateCTRModel
+from ctr_mppi_controller.cylindrical_lumen import goal_position_from_config
+from ctr_mppi_controller.lumen_factory import (
+    config_with_lumen_overrides,
+    lumen_geometry_log_line,
+    lumen_cost_weights_from_config,
+    lumen_geometry_from_config,
+    lumen_mode_from_config,
+)
 from ctr_mppi_controller.mppi_core import MPPICore
+from ctr_mppi_controller.tactile_cost import (
+    TactileCostConfig,
+    TactileSnapshot,
+    snapshot_eligibility,
+    snapshot_from_values,
+)
+from ctr_mppi_controller.reference_validation import (
+    EXTERNAL_TARGET,
+    FIXED_TARGET,
+    REFERENCE_MODES,
+    TRAJECTORY,
+    VALID_REFERENCE,
+    accept_trajectory_reference,
+    accept_point_reference,
+    initial_reference,
+    initial_trajectory_reference,
+    reference_kwargs_from_active,
+    reference_state_log_line,
+    reject_reference_update,
+    reject_trajectory_update,
+    trajectory_kwargs_from_active,
+    trajectory_state_log_line,
+    validate_reference_mode,
+    validate_reference_point,
+    validate_reference_sequence,
+)
 from ctr_mppi_controller.trajectory_metrics import TrajectoryMetricsAccumulator, TrajectoryMetricsConfig
 from rclpy.node import Node
 from rclpy.parameter import Parameter
-
-
-REFERENCE_MODES = ("fixed_target", "trajectory")
 
 
 class MPPIControllerNode(Node):
@@ -32,25 +74,94 @@ class MPPIControllerNode(Node):
         self.declare_parameter("reference_mode", "")
         self.declare_parameter("reference_type", "")
         self.declare_parameter("publish_safe_command_for_simulation", False)
+        self.declare_parameter("enable_cylindrical_lumen", False)
+        self.declare_parameter("enable_curved_lumen", False)
+        self.declare_parameter("curved_lumen_type", "")
+        self.declare_parameter("cylinder_profile", "")
+        self.declare_parameter("cylinder_target_position", Parameter.Type.DOUBLE_ARRAY)
+        self.declare_parameter("mppi_random_seed", -1)
+        self.declare_parameter("slice_7g_profile", False)
+        self.declare_parameter("development_simulation", False)
 
         config_paths = validate_config_paths(self.get_parameter("config_paths").value)
 
-        self.config = load_parameter_files(config_paths)
+        raw_config = load_parameter_files(config_paths)
+        enable_lumen = parse_launch_bool(
+            self.get_parameter("enable_cylindrical_lumen").value,
+            "enable_cylindrical_lumen",
+        )
+        enable_curved_lumen = parse_launch_bool(
+            self.get_parameter("enable_curved_lumen").value,
+            "enable_curved_lumen",
+        )
+        reference_config = project_config_with_overrides(
+            raw_config,
+            reference_mode=self.get_parameter("reference_mode").value,
+            reference_type=self.get_parameter("reference_type").value,
+            cylinder_target_position=self.get_parameter("cylinder_target_position").value,
+        )
+        self.config = config_with_lumen_overrides(
+            reference_config,
+            enable_cylindrical_lumen=enable_lumen,
+            enable_curved_lumen=enable_curved_lumen,
+            curved_lumen_type=str(self.get_parameter("curved_lumen_type").value or ""),
+            cylinder_profile=str(self.get_parameter("cylinder_profile").value or ""),
+            random_seed=_optional_seed(self.get_parameter("mppi_random_seed").value),
+        )
+        development_enabled = parse_launch_bool(
+            self.get_parameter("development_simulation").value,
+            "development_simulation",
+        )
+        self.config = (
+            apply_slice_7g_development_simulation_profile(self.config, enabled=True)
+            if development_enabled
+            else apply_slice_7g_simulation_profile(
+                self.config,
+                enabled=parse_launch_bool(
+                    self.get_parameter("slice_7g_profile").value,
+                    "slice_7g_profile",
+                ),
+            )
+        )
         validate_or_raise(self.config)
+        self.slice_7g_profile = self.config.get("runtime", {}).get("slice_7g_profile") is True
 
         self.model = ApproximateCTRModel(self.config)
-        self.core = MPPICore(self.config, self.model)
-        self.target_tip = _vector3(self.get_parameter("target_position").value, "target_position")
-        self.reference_mode = reference_mode_from_config(self.config, self.get_parameter("reference_mode").value)
-        self.trajectory_type = reference_type_from_config(self.config, self.get_parameter("reference_type").value)
-        self.latest_state: CtrState | None = None
+        self.lumen_geometry = lumen_geometry_from_config(self.config)
+        self.lumen_mode = lumen_mode_from_config(self.config)
+        self.reference_mode = reference_mode_from_config(self.config, "")
+        self.trajectory_type = reference_type_from_config(self.config, "")
         self.frame_id = str(self.config["robot"]["frames"]["base"])
         self.reference_frame_id = str(self.config.get("reference", {}).get("frame_id", self.frame_id))
         self.reference_stale_timeout = float(self.config.get("reference", {}).get("stale_timeout", 0.20))
+        self.tactile_cost_config = TactileCostConfig.from_project_config(self.config)
+        self._tactile_lock = threading.Lock()
+        self.latest_tactile_snapshot: TactileSnapshot | None = None
+        self.latest_tactile_reason = "disabled"
+        self.active_reference = initial_reference(self.reference_mode)
+        self.active_trajectory_reference = initial_trajectory_reference()
+        self.target_tip = np.zeros(3, dtype=float)
+        target_validation_status = self._initialize_active_reference()
+        self.core = MPPICore(
+            self.config,
+            self.model,
+            lumen_geometry=self.lumen_geometry,
+            lumen_cost_weights=lumen_cost_weights_from_config(self.config),
+        )
+        self.latest_state: CtrState | None = None
         self.latest_reference_horizon: np.ndarray | None = None
         self.latest_reference_horizon_stamp_s: float | None = None
         self._warned_missing_horizon = False
-        self.publish_safe_for_sim = bool(self.get_parameter("publish_safe_command_for_simulation").value)
+        self._warned_missing_reference = False
+        self._last_invalid_reference_warning_s: float | None = None
+        self.publish_safe_for_sim = parse_launch_bool(
+            self.get_parameter("publish_safe_command_for_simulation").value,
+            "publish_safe_command_for_simulation",
+        )
+        if self.config.get("runtime", {}).get("slice_7g_profile") is True and self.publish_safe_for_sim:
+            raise ValueError(
+                "slice_7g_controller_bypass: direct /ctr/safe_command publication is prohibited"
+            )
         self.tracking_metrics_config = TrajectoryMetricsConfig.from_project_config(self.config)
         self.trajectory_metrics = TrajectoryMetricsAccumulator(
             config=self.tracking_metrics_config,
@@ -60,6 +171,9 @@ class MPPIControllerNode(Node):
         self.last_trajectory_metrics_publish_s: float | None = None
 
         self.state_sub = self.create_subscription(CtrState, "/ctr/state", self._on_state, 10)
+        self.tactile_sub = None
+        if self.tactile_cost_config.enabled:
+            self.tactile_sub = self.create_subscription(CtrTactileState, "/ctr/tactile/state", self._on_tactile, 10)
         self.target_sub = self.create_subscription(PoseStamped, "/ctr/reference/tip", self._on_target, 10)
         self.horizon_sub = self.create_subscription(NavPath, "/ctr/reference/horizon", self._on_reference_horizon, 10)
         self.command_pub = self.create_publisher(CtrJointCommand, "/ctr/mppi_command", 10)
@@ -82,6 +196,38 @@ class MPPIControllerNode(Node):
             "MPPI controller wrapper started. Enabled costs: tip, control, smoothness, terminal; "
             f"advanced costs disabled; reference_mode={self.reference_mode}; trajectory_type={self.trajectory_type}."
         )
+        self.get_logger().info(self._geometry_summary(target_validation_status=target_validation_status))
+        self._log_reference_state(reason=target_validation_status)
+
+    def _initialize_active_reference(self) -> str:
+        if self.reference_mode == FIXED_TARGET:
+            frame_id = str(self.config.get("goal", {}).get("frame_id", ""))
+            try:
+                point = goal_position_from_config(self.config)
+                validated = validate_reference_point(
+                    point,
+                    received_frame=frame_id,
+                    expected_frame=self.reference_frame_id,
+                    lumen_geometry=self.lumen_geometry,
+                    require_safety_margin=True,
+                    label="goal.position",
+                )
+            except ValueError as exc:
+                self.active_reference = reject_reference_update(self.active_reference, str(exc))
+                raise ValueError(f"configured fixed target is invalid: {exc}") from exc
+            self.active_reference = accept_point_reference(
+                self.active_reference,
+                source=FIXED_TARGET,
+                point=validated,
+                frame=frame_id,
+            )
+            self.target_tip = validated.copy()
+            return "fixed_target_valid"
+        if self.reference_mode == EXTERNAL_TARGET:
+            return "external_target_waiting"
+        if self.reference_mode == TRAJECTORY:
+            return "trajectory_horizon_waiting"
+        raise ValueError(f"reference_mode must be one of {REFERENCE_MODES}")
 
     def _on_state(self, msg: CtrState) -> None:
         if msg.valid:
@@ -89,19 +235,120 @@ class MPPIControllerNode(Node):
         else:
             self.get_logger().warn("Ignoring invalid /ctr/state message.")
 
-    def _on_target(self, msg: PoseStamped) -> None:
+    def _on_tactile(self, msg: CtrTactileState) -> None:
         try:
-            self.target_tip = _vector3(
-                [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z],
-                "/ctr/reference/tip",
+            timestamp_s = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1.0e-9
+            snapshot = snapshot_from_values(
+                timestamp_s=timestamp_s,
+                frame_id=msg.header.frame_id,
+                source=msg.source,
+                valid=msg.valid,
+                contact=msg.contact,
+                warning=msg.warning,
+                stop=msg.stop,
+                region=msg.region,
+                force_magnitude_n=msg.force_magnitude,
+            )
+            with self._tactile_lock:
+                self.latest_tactile_snapshot = snapshot
+                self.latest_tactile_reason = "received"
+        except (TypeError, ValueError, AttributeError) as exc:
+            with self._tactile_lock:
+                self.latest_tactile_snapshot = None
+                self.latest_tactile_reason = f"invalid_message:{type(exc).__name__}"
+            self.get_logger().warn(f"Ignoring invalid /ctr/tactile/state message: {exc}")
+
+    def _tactile_for_solve(self, *, current_time_s: float) -> tuple[TactileSnapshot | None, str]:
+        tactile_config = getattr(self, "tactile_cost_config", None)
+        if tactile_config is None or not tactile_config.enabled:
+            return None, "disabled"
+        with self._tactile_lock:
+            snapshot = self.latest_tactile_snapshot
+        eligible, reason = snapshot_eligibility(
+            snapshot,
+            now_s=current_time_s,
+            max_age_s=tactile_config.max_age_s,
+            expected_frame=self.frame_id,
+        )
+        return (snapshot if eligible else None), reason
+
+    def _on_target(self, msg: PoseStamped) -> None:
+        point = [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z]
+        frame_id = msg.header.frame_id
+        if self.reference_mode == EXTERNAL_TARGET:
+            self._handle_external_target(point, frame_id)
+            return
+        if self.reference_mode == FIXED_TARGET:
+            self._handle_fixed_target_tip(point, frame_id)
+            return
+        if self.reference_mode == TRAJECTORY:
+            return
+
+    def _handle_fixed_target_tip(self, point, frame_id: str) -> None:
+        try:
+            validated = validate_reference_point(
+                point,
+                received_frame=frame_id,
+                expected_frame=self.reference_frame_id,
+                lumen_geometry=self.lumen_geometry,
+                require_safety_margin=True,
+                label="/ctr/reference/tip",
             )
         except ValueError as exc:
-            self.get_logger().warn(f"Ignoring malformed /ctr/reference/tip message: {exc}")
+            self._warn_invalid_reference(f"Ignoring invalid fixed-target /ctr/reference/tip update: {exc}")
+            return
+        if (
+            self.active_reference.has_valid_target
+            and self.active_reference.target_frame == frame_id
+            and np.array_equal(self.active_reference.target, validated)
+        ):
+            return
+        self._warn_invalid_reference(
+            "Ignoring /ctr/reference/tip update in fixed_target mode; configured fixed target is authoritative."
+        )
+
+    def _handle_external_target(self, point, frame_id: str) -> None:
+        previous = self.active_reference
+        try:
+            validated = validate_reference_point(
+                point,
+                received_frame=frame_id,
+                expected_frame=self.reference_frame_id,
+                lumen_geometry=self.lumen_geometry,
+                require_safety_margin=True,
+                label="/ctr/reference/tip",
+            )
+        except ValueError as exc:
+            self.active_reference = reject_reference_update(previous, str(exc))
+            reason = "invalid_external_target_retained_previous" if previous.has_valid_target else "invalid_external_target"
+            self._warn_invalid_reference(f"Rejected external target: {exc}")
+            self._log_reference_state(reason=reason)
+            return
+
+        self.active_reference = accept_point_reference(
+            previous,
+            source=EXTERNAL_TARGET,
+            point=validated,
+            frame=frame_id,
+        )
+        self.target_tip = validated.copy()
+        self._warned_missing_horizon = False
+        self._warned_missing_reference = False
+        reason = "external_target_accepted"
+        if previous.has_valid_target:
+            reason = (
+                "external_target_duplicate"
+                if self.active_reference.revision == previous.revision
+                else "external_target_replaced"
+            )
+        self.get_logger().info(f"Accepted external target revision={self.active_reference.revision}.")
+        self._log_reference_state(reason=reason)
 
     def _on_reference_horizon(self, msg: NavPath) -> None:
         if self.reference_mode != "trajectory":
             return
         now_s = ros_time_seconds(self.get_clock().now())
+        previous = self.active_trajectory_reference
         try:
             sequence, stamp_s = target_sequence_from_path(
                 msg,
@@ -109,16 +356,46 @@ class MPPIControllerNode(Node):
                 expected_frame_id=self.reference_frame_id,
                 current_time_s=now_s,
                 stale_timeout=self.reference_stale_timeout,
+                lumen_geometry=self.lumen_geometry,
             )
         except ValueError as exc:
-            self.latest_reference_horizon = None
-            self.latest_reference_horizon_stamp_s = None
-            self.get_logger().warn(f"Ignoring malformed /ctr/reference/horizon message: {exc}")
+            should_log_state = (
+                (not previous.has_valid_horizon and previous.state != VALID_REFERENCE and not previous.last_validation_error)
+                or (previous.has_valid_horizon and not previous.last_validation_error)
+            )
+            self.active_trajectory_reference = reject_trajectory_update(previous, str(exc))
+            if self.active_trajectory_reference.has_valid_horizon:
+                self.latest_reference_horizon = self.active_trajectory_reference.points.copy()
+                self.latest_reference_horizon_stamp_s = self.active_trajectory_reference.stamp_s
+                reason = "invalid_trajectory_horizon_retained_previous"
+            else:
+                self.latest_reference_horizon = None
+                self.latest_reference_horizon_stamp_s = None
+                reason = "invalid_trajectory_horizon"
+            self._warn_invalid_reference(f"Rejected /ctr/reference/horizon: {exc}")
+            if should_log_state:
+                self._log_reference_state(reason=reason)
             return
 
-        self.latest_reference_horizon = sequence
-        self.latest_reference_horizon_stamp_s = stamp_s
+        self.active_trajectory_reference = accept_trajectory_reference(
+            previous,
+            points=sequence,
+            frame=self.reference_frame_id,
+            stamp_s=stamp_s,
+        )
+        self.latest_reference_horizon = self.active_trajectory_reference.points.copy()
+        self.latest_reference_horizon_stamp_s = self.active_trajectory_reference.stamp_s
+        self.target_tip = self.active_trajectory_reference.points[0].copy()
         self._warned_missing_horizon = False
+        reason = "trajectory_horizon_accepted"
+        if previous.has_valid_horizon:
+            reason = (
+                "trajectory_horizon_duplicate"
+                if self.active_trajectory_reference.revision == previous.revision
+                else "trajectory_horizon_replaced"
+            )
+        if reason != "trajectory_horizon_duplicate":
+            self._log_reference_state(reason=reason)
 
     def _on_timer(self) -> None:
         if self.latest_state is None:
@@ -126,24 +403,26 @@ class MPPIControllerNode(Node):
 
         try:
             current_time_s = ros_time_seconds(self.get_clock().now())
-            reference_kwargs = solve_reference_kwargs(
-                reference_mode=self.reference_mode,
-                target_tip=self.target_tip,
-                target_tip_sequence=self.latest_reference_horizon,
-                horizon_stamp_s=self.latest_reference_horizon_stamp_s,
-                current_time_s=current_time_s,
-                stale_timeout=self.reference_stale_timeout,
-            )
+            reference_kwargs = self._timer_reference_kwargs(current_time_s=current_time_s)
         except ValueError as exc:
             if not self._warned_missing_horizon:
                 self.get_logger().warn(f"MPPI reference unavailable: {exc}")
                 self._warned_missing_horizon = True
             return
 
+        tactile_snapshot, tactile_reason = self._tactile_for_solve(current_time_s=current_time_s)
+        if self.slice_7g_profile and tactile_snapshot is None:
+            self.get_logger().warn(
+                f"Slice 7G MPPI command withheld until tactile input is eligible: {tactile_reason}"
+            )
+            return
+
         try:
             result = self.core.solve(
                 q=np.asarray(self.latest_state.q, dtype=float),
                 q_dot=np.asarray(self.latest_state.q_dot, dtype=float),
+                tactile_snapshot=tactile_snapshot,
+                tactile_snapshot_reason=tactile_reason,
                 **reference_kwargs,
             )
         except Exception as exc:
@@ -217,13 +496,54 @@ class MPPIControllerNode(Node):
             )
         )
 
+    def _geometry_summary(self, *, target_validation_status: str) -> str:
+        return f"{lumen_geometry_log_line(self.config, role='controller')} target_validation={target_validation_status}"
+
+    def _timer_reference_kwargs(self, *, current_time_s: float) -> dict[str, np.ndarray]:
+        if self.reference_mode in (FIXED_TARGET, EXTERNAL_TARGET):
+            if self.active_reference.state != VALID_REFERENCE:
+                raise ValueError(f"{self.reference_mode} mode is waiting for a valid active reference")
+            return reference_kwargs_from_active(self.active_reference)
+        if self.reference_mode == TRAJECTORY:
+            return trajectory_kwargs_from_active(
+                self.active_trajectory_reference,
+                current_time_s=current_time_s,
+                stale_timeout=self.reference_stale_timeout,
+            )
+        return solve_reference_kwargs(
+            reference_mode=self.reference_mode,
+            target_tip=self.target_tip,
+            target_tip_sequence=self.latest_reference_horizon,
+            horizon_stamp_s=self.latest_reference_horizon_stamp_s,
+            current_time_s=current_time_s,
+            stale_timeout=self.reference_stale_timeout,
+        )
+
+    def _log_reference_state(self, *, reason: str) -> None:
+        if self.reference_mode == TRAJECTORY:
+            self.get_logger().info(trajectory_state_log_line(self.active_trajectory_reference, reason=reason))
+            return
+        self.get_logger().info(reference_state_log_line(self.active_reference, reason=reason))
+
+    def _warn_invalid_reference(self, message: str) -> None:
+        now_s: float | None = None
+        try:
+            now_s = ros_time_seconds(self.get_clock().now())
+        except Exception:
+            now_s = None
+        if (
+            now_s is None
+            or self._last_invalid_reference_warning_s is None
+            or now_s - self._last_invalid_reference_warning_s >= 1.0
+        ):
+            self.get_logger().warn(message)
+            self._last_invalid_reference_warning_s = now_s
+
 
 def reference_mode_from_config(config: dict, override) -> str:
     configured = config.get("reference", {}).get("mode", "fixed_target")
     mode = configured if override is None or override == "" else override
-    if mode not in REFERENCE_MODES:
-        raise ValueError(f"reference_mode must be one of {REFERENCE_MODES}")
-    return str(mode)
+    return validate_reference_mode(mode, "reference_mode")
 
 
 def reference_type_from_config(config: dict, override) -> str:
@@ -242,6 +562,7 @@ def target_sequence_from_path(
     expected_frame_id: str,
     current_time_s: float,
     stale_timeout: float,
+    lumen_geometry=None,
 ) -> tuple[np.ndarray, float]:
     if expected_horizon <= 0:
         raise ValueError("expected_horizon must be positive")
@@ -249,10 +570,9 @@ def target_sequence_from_path(
         raise ValueError("expected_frame_id must be non-empty")
     now_s = _finite_float(current_time_s, "current_time_s")
     timeout = _positive_float(stale_timeout, "stale_timeout")
-    if msg.header.frame_id != expected_frame_id:
-        raise ValueError(f"horizon frame_id must be `{expected_frame_id}`")
-    if len(msg.poses) != expected_horizon:
-        raise ValueError(f"horizon must contain exactly {expected_horizon} poses")
+    frame_id = msg.header.frame_id
+    if frame_id != expected_frame_id:
+        raise ValueError(f"horizon frame mismatch: expected `{expected_frame_id}`, got `{frame_id}`")
 
     stamp_s = ros_time_seconds(msg.header.stamp)
     age_s = now_s - stamp_s
@@ -264,8 +584,8 @@ def target_sequence_from_path(
     points = []
     for index, pose_stamped in enumerate(msg.poses):
         pose_frame = pose_stamped.header.frame_id
-        if pose_frame and pose_frame != expected_frame_id:
-            raise ValueError(f"horizon pose {index} frame_id must be `{expected_frame_id}`")
+        if pose_frame and pose_frame != frame_id:
+            raise ValueError(f"horizon pose {index} frame_id must be `{frame_id}`")
         points.append(
             [
                 pose_stamped.pose.position.x,
@@ -273,10 +593,15 @@ def target_sequence_from_path(
                 pose_stamped.pose.position.z,
             ]
         )
-    array = np.asarray(points, dtype=float)
-    if array.shape != (expected_horizon, 3) or not np.all(np.isfinite(array)):
-        raise ValueError(f"horizon positions must have shape ({expected_horizon}, 3) and contain finite values")
-    return array, stamp_s
+    sequence = validate_reference_sequence(
+        points,
+        received_frame=frame_id,
+        expected_frame=expected_frame_id,
+        lumen_geometry=lumen_geometry,
+        expected_count=expected_horizon,
+        label="reference horizon",
+    )
+    return sequence, stamp_s
 
 
 def solve_reference_kwargs(
@@ -288,7 +613,7 @@ def solve_reference_kwargs(
     current_time_s: float,
     stale_timeout: float,
 ) -> dict[str, np.ndarray]:
-    if reference_mode == "fixed_target":
+    if reference_mode in ("fixed_target", "external_target"):
         return {"target_tip": _vector3(target_tip, "target_tip")}
     if reference_mode != "trajectory":
         raise ValueError(f"reference_mode must be one of {REFERENCE_MODES}")
@@ -396,6 +721,19 @@ def _vector3(values, label: str) -> np.ndarray:
     if array.shape != (3,) or not np.all(np.isfinite(array)):
         raise ValueError(f"{label} must contain 3 finite values")
     return array
+
+
+def _optional_vector3_parameter(values) -> list[float] | None:
+    if values is None or values == "":
+        return None
+    if isinstance(values, (list, tuple)) and len(values) == 0:
+        return None
+    return [float(value) for value in _vector3(values, "cylinder_target_position")]
+
+
+def _optional_seed(value) -> int | None:
+    seed = int(value)
+    return None if seed < 0 else seed
 
 
 def _finite_float(value, label: str) -> float:

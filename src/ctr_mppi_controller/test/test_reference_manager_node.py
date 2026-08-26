@@ -11,14 +11,20 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PACKAGE_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "src" / "ctr_bringup"))
 
-from ctr_bringup.parameter_validation import load_parameter_files, validate_or_raise  # noqa: E402
+from ctr_bringup.parameter_validation import load_parameter_files, project_config_with_overrides, validate_or_raise  # noqa: E402
+from ctr_mppi_controller.cylindrical_lumen import config_with_cylinder_overrides, goal_position_from_config  # noqa: E402
+from ctr_mppi_controller.lumen_factory import config_with_lumen_overrides, lumen_mode_from_config  # noqa: E402
 from ctr_mppi_controller.nodes.reference_manager_node import (  # noqa: E402
     adjusted_trajectory_start_time,
     build_reference_trajectory,
     path_from_points,
     pose_from_point,
+    reference_path_qos_profile,
     reference_settings_from_config,
+    trajectory_start_time_from_policy,
 )
+from ctr_mppi_controller.reference_validation import EXTERNAL_TARGET  # noqa: E402
+from rclpy.qos import DurabilityPolicy, ReliabilityPolicy  # noqa: E402
 
 
 CONFIG_FILES = [
@@ -39,6 +45,12 @@ def make_config():
 
 
 class ReferenceManagerNodeHelpersTest(unittest.TestCase):
+    def test_reference_path_qos_is_reliable_and_transient_local_for_late_joiners(self):
+        profile = reference_path_qos_profile()
+        self.assertEqual(1, profile.depth)
+        self.assertEqual(ReliabilityPolicy.RELIABLE, profile.reliability)
+        self.assertEqual(DurabilityPolicy.TRANSIENT_LOCAL, profile.durability)
+
     def test_reference_settings_default_to_fixed_target(self):
         config = make_config()
         settings = reference_settings_from_config(config)
@@ -56,6 +68,92 @@ class ReferenceManagerNodeHelpersTest(unittest.TestCase):
         self.assertEqual("ellipse", trajectory.trajectory_type)
         self.assertEqual("base_link", trajectory.frame_id)
         self.assertTrue(np.all(np.isfinite(trajectory.points)))
+
+    def test_reference_settings_accept_external_target_mode(self):
+        config = make_config()
+        settings = reference_settings_from_config(config, mode_override=EXTERNAL_TARGET, type_override="circle")
+        self.assertEqual(EXTERNAL_TARGET, settings.mode)
+        self.assertEqual("base_link", settings.frame_id)
+
+    def test_reference_manager_source_rejects_external_target_publishing(self):
+        source = (PACKAGE_ROOT / "ctr_mppi_controller" / "nodes" / "reference_manager_node.py").read_text(encoding="utf-8")
+        self.assertIn("external_target mode", source)
+        self.assertIn("must not publish", source)
+
+    def test_reference_manager_applies_reference_override_before_config_validation(self):
+        source = (PACKAGE_ROOT / "ctr_mppi_controller" / "nodes" / "reference_manager_node.py").read_text(encoding="utf-8")
+        self.assertLess(
+            source.index("reference_config = project_config_with_overrides("),
+            source.index("validate_or_raise(self.config)"),
+        )
+        self.assertLess(
+            source.index("validate_or_raise(self.config)"),
+            source.index("self.settings = reference_settings_from_config("),
+        )
+
+    def test_reference_manager_reference_override_ignores_invalid_fixed_placeholder(self):
+        config = make_config()
+        config["reference"]["mode"] = "fixed_target"
+        config["goal"]["position"] = [float("nan"), 0.0]
+
+        external_config = project_config_with_overrides(config, reference_mode=EXTERNAL_TARGET)
+        validate_or_raise(external_config)
+        external_settings = reference_settings_from_config(external_config)
+        self.assertEqual(EXTERNAL_TARGET, external_settings.mode)
+
+        trajectory_config = project_config_with_overrides(config, reference_mode="trajectory")
+        validate_or_raise(trajectory_config)
+        trajectory_settings = reference_settings_from_config(trajectory_config)
+        self.assertEqual("trajectory", trajectory_settings.mode)
+
+    def test_cylinder_fixed_target_uses_goal_override(self):
+        config = config_with_cylinder_overrides(
+            make_config(),
+            enabled=True,
+            target_position=[0.010, 0.012, 0.095],
+            mppi_profile="cylinder_fast",
+            random_seed=11,
+        )
+        settings = reference_settings_from_config(config, mode_override="fixed_target", type_override="circle")
+        fixed_settings = settings.__class__(
+            mode=settings.mode,
+            trajectory_type=settings.trajectory_type,
+            frame_id=settings.frame_id,
+            completion_behavior=settings.completion_behavior,
+            sample_period=settings.sample_period,
+            duration=settings.duration,
+            publish_frequency=settings.publish_frequency,
+            stale_timeout=settings.stale_timeout,
+            fixed_target=goal_position_from_config(config),
+            horizon=settings.horizon,
+        )
+        self.assertTrue(np.allclose([0.010, 0.012, 0.095], fixed_settings.fixed_target))
+
+    def test_curved_fixed_target_uses_goal_override_without_geometry_construction(self):
+        config = config_with_lumen_overrides(
+            make_config(),
+            enable_cylindrical_lumen=False,
+            enable_curved_lumen=True,
+            curved_lumen_type="circular_arc",
+            target=[0.010, 0.012, 0.095],
+            cylinder_profile="cylinder_fast",
+            random_seed=11,
+        )
+        self.assertEqual("curved", lumen_mode_from_config(config))
+        settings = reference_settings_from_config(config, mode_override="fixed_target", type_override="circle")
+        fixed_settings = settings.__class__(
+            mode=settings.mode,
+            trajectory_type=settings.trajectory_type,
+            frame_id=settings.frame_id,
+            completion_behavior=settings.completion_behavior,
+            sample_period=settings.sample_period,
+            duration=settings.duration,
+            publish_frequency=settings.publish_frequency,
+            stale_timeout=settings.stale_timeout,
+            fixed_target=goal_position_from_config(config),
+            horizon=settings.horizon,
+        )
+        self.assertTrue(np.allclose([0.010, 0.012, 0.095], fixed_settings.fixed_target))
 
     def test_elapsed_ros_time_progression_uses_sample_period(self):
         config = make_config()
@@ -77,6 +175,70 @@ class ReferenceManagerNodeHelpersTest(unittest.TestCase):
         self.assertAlmostEqual(
             1.0,
             adjusted_trajectory_start_time(previous_time_s=5.0, current_time_s=6.0, start_time_s=1.0),
+        )
+
+    def test_scheduled_start_policy_uses_configured_epoch(self):
+        self.assertAlmostEqual(
+            10.0,
+            trajectory_start_time_from_policy(
+                policy="scheduled_time",
+                now_s=2.0,
+                scheduled_reference_epoch_s=10.0,
+            ),
+        )
+        self.assertAlmostEqual(
+            2.0,
+            trajectory_start_time_from_policy(
+                policy="node_start",
+                now_s=2.0,
+                scheduled_reference_epoch_s=10.0,
+            ),
+        )
+
+    def test_scheduled_start_rejects_nonfinite_epoch(self):
+        with self.assertRaises(ValueError):
+            trajectory_start_time_from_policy(
+                policy="scheduled_time",
+                now_s=2.0,
+                scheduled_reference_epoch_s=float("nan"),
+            )
+
+    def test_scheduled_pre_epoch_behavior_keeps_first_horizon_point(self):
+        config = make_config()
+        settings = reference_settings_from_config(config, mode_override="trajectory", type_override="circle")
+        trajectory = build_reference_trajectory(config, settings=settings)
+        horizon = trajectory.horizon_at_time(
+            current_time=9.0,
+            start_time=10.0,
+            horizon_length=settings.horizon,
+        )
+        self.assertEqual(0, horizon.start_index)
+        self.assertEqual(0, horizon.current_index)
+        self.assertTrue(np.allclose(trajectory.points[0], horizon.current_point))
+
+    def test_scheduled_transition_at_epoch_uses_elapsed_sample_period(self):
+        config = make_config()
+        settings = reference_settings_from_config(config, mode_override="trajectory", type_override="circle")
+        trajectory = build_reference_trajectory(config, settings=settings)
+        at_epoch = trajectory.horizon_at_time(current_time=10.0, start_time=10.0, horizon_length=settings.horizon)
+        after_epoch = trajectory.horizon_at_time(
+            current_time=10.0 + 2.0 * settings.sample_period,
+            start_time=10.0,
+            horizon_length=settings.horizon,
+        )
+        self.assertEqual(0, at_epoch.start_index)
+        self.assertEqual(2, after_epoch.start_index)
+
+    def test_scheduled_time_backward_before_epoch_keeps_scheduled_epoch(self):
+        self.assertAlmostEqual(
+            10.0,
+            adjusted_trajectory_start_time(
+                previous_time_s=9.0,
+                current_time_s=2.0,
+                start_time_s=10.0,
+                policy="scheduled_time",
+                scheduled_reference_epoch_s=10.0,
+            ),
         )
 
     def test_loop_behavior_wraps_horizon_indices(self):

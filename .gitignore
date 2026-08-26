@@ -39,3 +39,4 @@ Thumbs.db
 # Large experiment outputs
 results/
 outputs/
+evaluation_results/

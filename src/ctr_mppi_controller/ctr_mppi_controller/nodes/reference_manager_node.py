@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -10,8 +10,17 @@ import rclpy
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path as NavPath
 
-from ctr_bringup.parameter_validation import load_parameter_files, validate_config_paths, validate_or_raise
+from ctr_bringup.parameter_validation import (
+    load_parameter_files,
+    parse_launch_bool,
+    project_config_with_overrides,
+    validate_config_paths,
+    validate_or_raise,
+)
 from ctr_bringup.placeholder_node import run_node_until_shutdown
+from ctr_mppi_controller.cylindrical_lumen import goal_position_from_config
+from ctr_mppi_controller.lumen_factory import config_with_lumen_overrides, lumen_mode_from_config
+from ctr_mppi_controller.reference_validation import EXTERNAL_TARGET, FIXED_TARGET, REFERENCE_MODES, TRAJECTORY
 from ctr_mppi_controller.reference_trajectory import (
     ReferenceTrajectory,
     generate_circle,
@@ -20,11 +29,23 @@ from ctr_mppi_controller.reference_trajectory import (
 )
 from rclpy.node import Node
 from rclpy.parameter import Parameter
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 
-REFERENCE_MODES = ("fixed_target", "trajectory")
 TRAJECTORY_TYPES = ("circle", "ellipse", "helix")
 COMPLETION_BEHAVIORS = ("loop", "hold_final")
+TRAJECTORY_START_POLICIES = ("node_start", "scheduled_time")
+
+
+def reference_path_qos_profile() -> QoSProfile:
+    """Reliable late-joiner delivery for the controller's exact reference path."""
+
+    return QoSProfile(
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    )
 
 
 @dataclass(frozen=True)
@@ -50,33 +71,91 @@ class ReferenceManagerNode(Node):
         self.declare_parameter("runtime_mode", "simulation")
         self.declare_parameter("reference_mode", "")
         self.declare_parameter("reference_type", "")
+        self.declare_parameter("trajectory_start_policy", "node_start")
+        self.declare_parameter("scheduled_reference_epoch", 0.0)
+        self.declare_parameter("enable_cylindrical_lumen", False)
+        self.declare_parameter("enable_curved_lumen", False)
+        self.declare_parameter("curved_lumen_type", "")
+        self.declare_parameter("cylinder_profile", "")
+        self.declare_parameter("cylinder_target_position", Parameter.Type.DOUBLE_ARRAY)
+        self.declare_parameter("mppi_random_seed", -1)
 
         config_paths = validate_config_paths(self.get_parameter("config_paths").value)
-        self.config = load_parameter_files(config_paths)
+        raw_config = load_parameter_files(config_paths)
+        enable_lumen = parse_launch_bool(
+            self.get_parameter("enable_cylindrical_lumen").value,
+            "enable_cylindrical_lumen",
+        )
+        enable_curved_lumen = parse_launch_bool(
+            self.get_parameter("enable_curved_lumen").value,
+            "enable_curved_lumen",
+        )
+        reference_config = project_config_with_overrides(
+            raw_config,
+            reference_mode=self.get_parameter("reference_mode").value,
+            reference_type=self.get_parameter("reference_type").value,
+            cylinder_target_position=self.get_parameter("cylinder_target_position").value,
+        )
+        self.config = config_with_lumen_overrides(
+            reference_config,
+            enable_cylindrical_lumen=enable_lumen,
+            enable_curved_lumen=enable_curved_lumen,
+            curved_lumen_type=str(self.get_parameter("curved_lumen_type").value or ""),
+            cylinder_profile=str(self.get_parameter("cylinder_profile").value or ""),
+            random_seed=_optional_seed(self.get_parameter("mppi_random_seed").value),
+        )
         validate_or_raise(self.config)
+        self.lumen_mode = lumen_mode_from_config(self.config)
 
         self.settings = reference_settings_from_config(
             self.config,
-            mode_override=self.get_parameter("reference_mode").value,
-            type_override=self.get_parameter("reference_type").value,
+            mode_override="",
+            type_override="",
         )
+        if self.settings.mode == EXTERNAL_TARGET:
+            raise ValueError("reference_manager_node must not publish references in external_target mode")
+        if self.settings.mode == FIXED_TARGET:
+            self.settings = replace(self.settings, fixed_target=goal_position_from_config(self.config))
         self.trajectory = (
             build_reference_trajectory(self.config, settings=self.settings)
-            if self.settings.mode == "trajectory"
+            if self.settings.mode == TRAJECTORY
             else None
         )
 
-        self.path_pub = self.create_publisher(NavPath, "/ctr/reference/path", 10)
+        self.path_pub = self.create_publisher(
+            NavPath,
+            "/ctr/reference/path",
+            reference_path_qos_profile(),
+        )
         self.horizon_pub = self.create_publisher(NavPath, "/ctr/reference/horizon", 10)
         self.tip_pub = self.create_publisher(PoseStamped, "/ctr/reference/tip", 10)
 
         now_s = ros_time_seconds(self.get_clock().now())
-        self.trajectory_start_time_s = now_s
+        self.trajectory_start_policy = _choice(
+            self.get_parameter("trajectory_start_policy").value,
+            "trajectory_start_policy",
+            TRAJECTORY_START_POLICIES,
+        )
+        self.scheduled_reference_epoch_s = _number(
+            self.get_parameter("scheduled_reference_epoch").value,
+            "scheduled_reference_epoch",
+        )
+        self.trajectory_start_time_s = trajectory_start_time_from_policy(
+            policy=self.trajectory_start_policy,
+            now_s=now_s,
+            scheduled_reference_epoch_s=self.scheduled_reference_epoch_s,
+        )
+        if self.trajectory_start_policy == "scheduled_time" and self.trajectory_start_time_s < now_s:
+            self.get_logger().warn(
+                "scheduled_reference_epoch is in the past; reference trajectory will start from elapsed scheduled time."
+            )
         self.last_time_s = now_s
         self.timer = self.create_timer(1.0 / self.settings.publish_frequency, self._on_timer)
         self.get_logger().info(
             f"Reference manager started in {self.settings.mode} mode; "
-            f"trajectory_type={self.settings.trajectory_type}."
+            f"trajectory_type={self.settings.trajectory_type}; "
+            f"trajectory_start_policy={self.trajectory_start_policy}; "
+            f"trajectory_start_time_s={self.trajectory_start_time_s:.9f}."
         )
 
     def _on_timer(self) -> None:
@@ -86,6 +165,8 @@ class ReferenceManagerNode(Node):
             previous_time_s=self.last_time_s,
             current_time_s=now_s,
             start_time_s=self.trajectory_start_time_s,
+            policy=self.trajectory_start_policy,
+            scheduled_reference_epoch_s=self.scheduled_reference_epoch_s,
         )
         if next_start_time_s != self.trajectory_start_time_s:
             self.trajectory_start_time_s = next_start_time_s
@@ -93,7 +174,7 @@ class ReferenceManagerNode(Node):
         self.last_time_s = now_s
         stamp = now.to_msg()
 
-        if self.settings.mode == "fixed_target":
+        if self.settings.mode == FIXED_TARGET:
             self._publish_fixed_target(stamp)
             return
 
@@ -244,11 +325,37 @@ def ros_time_seconds(time_value: Any) -> float:
     return seconds
 
 
-def adjusted_trajectory_start_time(*, previous_time_s: float, current_time_s: float, start_time_s: float) -> float:
+def trajectory_start_time_from_policy(
+    *,
+    policy: str,
+    now_s: float,
+    scheduled_reference_epoch_s: float,
+) -> float:
+    selected_policy = _choice(policy, "trajectory_start_policy", TRAJECTORY_START_POLICIES)
+    now = _number(now_s, "now_s")
+    scheduled = _number(scheduled_reference_epoch_s, "scheduled_reference_epoch_s")
+    if selected_policy == "node_start":
+        return now
+    return scheduled
+
+
+def adjusted_trajectory_start_time(
+    *,
+    previous_time_s: float,
+    current_time_s: float,
+    start_time_s: float,
+    policy: str = "node_start",
+    scheduled_reference_epoch_s: float | None = None,
+) -> float:
     previous = _number(previous_time_s, "previous_time_s")
     current = _number(current_time_s, "current_time_s")
     start = _number(start_time_s, "start_time_s")
+    selected_policy = _choice(policy, "trajectory_start_policy", TRAJECTORY_START_POLICIES)
     if current < previous:
+        if selected_policy == "scheduled_time" and scheduled_reference_epoch_s is not None:
+            scheduled = _number(scheduled_reference_epoch_s, "scheduled_reference_epoch_s")
+            if current <= scheduled:
+                return scheduled
         return current
     return start
 
@@ -287,6 +394,19 @@ def _vector3(values: Any, label: str) -> np.ndarray:
     if array.shape != (3,) or not np.all(np.isfinite(array)):
         raise ValueError(f"{label} must contain 3 finite values")
     return array.copy()
+
+
+def _optional_vector3_parameter(values: Any) -> list[float] | None:
+    if values is None or values == "":
+        return None
+    if isinstance(values, (list, tuple)) and len(values) == 0:
+        return None
+    return [float(value) for value in _vector3(values, "cylinder_target_position")]
+
+
+def _optional_seed(value: Any) -> int | None:
+    seed = int(value)
+    return None if seed < 0 else seed
 
 
 def _number(value: Any, label: str) -> float:

@@ -6,6 +6,7 @@ from setuptools import find_packages, setup
 package_name = "ctr_bringup"
 
 config_files = glob(os.path.join("..", "..", "config", "*.yaml"))
+config_files.extend(glob(os.path.join("..", "..", "config", "*.rviz")))
 
 setup(
     name=package_name,
@@ -28,6 +29,7 @@ setup(
         "console_scripts": [
             "parameter_validator_node = ctr_bringup.nodes.parameter_validator_node:main",
             "bringup_placeholder_node = ctr_bringup.nodes.bringup_placeholder_node:main",
+            "ctr-runtime-candidate-validate-only = ctr_bringup.runtime_candidate_validate_only:main",
         ],
     },
 )

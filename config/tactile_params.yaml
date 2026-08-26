@@ -15,6 +15,7 @@ tactile:
 
   filter:
     type: low_pass
+    alpha: 0.25
     cutoff_frequency: 10.0
     moving_average_window: 5
 
@@ -23,9 +24,13 @@ tactile:
     warning: 0.30
     stop: 0.50
     release: 0.08
+    contact_off: 0.08
+    warning_off: 0.28
+    stop_off: 0.48
 
   simulation:
     contact_stiffness: 100.0
     contact_damping: 1.0
+    force_saturation_n: 10.0
     latency: 0.0
     noise_std: 0.0

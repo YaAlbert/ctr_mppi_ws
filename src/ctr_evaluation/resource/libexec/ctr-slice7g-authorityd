@@ -1,0 +1,116 @@
+#!/usr/bin/python3.10 -I
+"""Candidate fixed libexec wrapper; installed only by a later privileged phase."""
+
+import hashlib
+import json
+import os
+from pathlib import PurePosixPath
+import stat
+import sys
+import sysconfig
+
+
+BOOTSTRAP = "/etc/ctr-mppi/slice-7g-authority/bootstrap.json"
+EXPECTED_SCHEMA = "ctr-slice-7g-authority-bootstrap-3"
+MANIFEST_SCHEMA = "ctr-slice-7g-installed-runtime-manifest-3"
+DAEMON_MEMBER = "lib/python3.10/site-packages/ctr_evaluation/slice_7g_authority_daemon.py"
+
+
+def _identity(info):
+    return (
+        info.st_dev, info.st_ino, stat.S_IMODE(info.st_mode), info.st_nlink,
+        info.st_size, info.st_uid, info.st_gid,
+    )
+
+
+def _read_nofollow(path, maximum):
+    parts = PurePosixPath(path).parts[1:]
+    directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for part in parts[:-1]:
+            child = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=directory,
+            )
+            os.close(directory)
+            directory = child
+        descriptor = os.open(
+            parts[-1], os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory,
+        )
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise RuntimeError("authority wrapper target is not regular and single-link")
+            chunks = []
+            total = 0
+            while True:
+                chunk = os.read(descriptor, min(1_048_576, maximum + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > maximum:
+                    raise RuntimeError("authority wrapper target exceeds its bound")
+            raw = b"".join(chunks)
+            if _identity(os.fstat(descriptor)) != _identity(before):
+                raise RuntimeError("authority wrapper target changed or exceeds its bound")
+            return raw, before
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(directory)
+
+
+def _canonical(value):
+    return json.dumps(
+        value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _record(path, schema, mode, owner_uid, owner_gid):
+    raw, info = _read_nofollow(path, 1_048_576)
+    value = json.loads(raw.decode("utf-8", "strict"))
+    if type(value) is not dict or value.get("schema_version") != schema or _canonical(value) != raw:
+        raise RuntimeError("authority wrapper record is invalid or noncanonical")
+    if (
+        info.st_uid != owner_uid or info.st_gid != owner_gid
+        or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != mode
+    ):
+        raise RuntimeError("authority wrapper record ownership or mode differs")
+    return value
+
+
+def main():
+    if sys.argv[1:] not in ([], ["--enforce-revocation"]):
+        return 2
+    sys.dont_write_bytecode = True
+    os.chdir("/")
+    bootstrap = _record(BOOTSTRAP, EXPECTED_SCHEMA, 0o444, 0, 0)
+    manifest = _record(
+        bootstrap["record_paths"]["installed_runtime_manifest"], MANIFEST_SCHEMA, 0o440,
+        bootstrap["authority_uid"], bootstrap["authority_gid"],
+    )
+    root = manifest["root_path"]
+    target = root + "/" + DAEMON_MEMBER
+    expected = next(
+        (member for member in manifest["members"] if member["path"] == DAEMON_MEMBER), None,
+    )
+    raw, info = _read_nofollow(target, 4 * 1024 * 1024)
+    if expected is None or expected != {
+        "path": DAEMON_MEMBER, "type": "regular", "mode": stat.S_IMODE(info.st_mode),
+        "link_count": info.st_nlink, "size": info.st_size,
+        "owner_uid": info.st_uid, "owner_gid": info.st_gid,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }:
+        raise RuntimeError("bootstrap-bound daemon module identity differs")
+    paths = sysconfig.get_paths()
+    sys.path[:] = [paths["stdlib"], paths["platstdlib"], root + "/lib/python3.10/site-packages"]
+    from ctr_evaluation.slice_7g_authority_daemon import main as daemon_main
+    return daemon_main(list(sys.argv[1:]))
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (RuntimeError, OSError, ValueError, KeyError, UnicodeError):
+        raise SystemExit(2)

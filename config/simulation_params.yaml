@@ -19,4 +19,21 @@ simulation:
     command_dropout_probability: 0.0
     state_dropout_probability: 0.0
 
+  visualization:
+    publish_lumen_markers: true
+    publish_lumen_diagnostics: true
+    publish_lumen_surface: false
+    centerline_stride: 1
+    ring_stride: 4
+    ring_segments: 20
+    marker_publish_rate: 5.0
+    surface_alpha: 0.20
+    actual_tip_history_max_points: 500
+    actual_tip_history_min_interval: 0.05
+
+  development_target_selection:
+    projection_limit: 0.035
+    candidate_max_age: 5.0
+    candidate_future_tolerance: 0.5
+
   initial_scenario: fixed_target

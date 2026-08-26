@@ -108,3 +108,88 @@
 
 34. Milestone 5 runtime tests verify simulation-only integration. Hardware
     execution remains disabled and unverified.
+
+35. Milestone 5D quantitative evaluation is treated as software-simulation
+    evaluation infrastructure. It is observation-only and must not be used as
+    evidence that actuator command paths or hardware behavior are validated.
+
+36. Milestone 5D evaluator output is strict JSON/YAML/CSV/Markdown/plot
+    evidence for recorded runs. Missing or non-finite values are represented by
+    validity fields, warnings, counters, or JSON nulls rather than by bare NaN
+    or Infinity tokens.
+
+37. Milestone 5D.1 matched-run orchestration is verified for the
+    software-simulation zero-command baseline and MPPI candidate workflow only.
+    Physical and hardware experiment synchronization remain unresolved.
+
+38. Deterministic initial q/tip matching in Milestone 5D.1 is based on the
+    simulator initial state and the accepted stability window from the current
+    Ubuntu ROS2 environment. It does not validate physical reset repeatability.
+
+39. Scheduled reference behavior uses a run-relative phase policy. Absolute
+    scheduled timestamps naturally differ between separate baseline and
+    candidate runs and are not required to be equal for compatibility.
+
+40. Command timing evidence distinguishes command message timestamp and
+    command receive timestamp. Neither is a command-application timestamp.
+
+41. Horizon reference samples do not currently carry individual timestamps, so
+    horizon-level causal timing remains approximate.
+
+42. The two matched circle experiment pairs demonstrate deterministic
+    orchestration, repeatability, valid comparison conditions, and quantitative
+    reporting. They do not demonstrate meaningful tracking improvement,
+    real-time performance, physical accuracy, or hardware readiness.
+
+43. MPPI deadline overrun remains 100% in the verified matched runs, and the
+    controller remains non-real-time relative to the configured 0.05 s control
+    period.
+
+44. Concurrent `ctr_run_evaluation` invocations assume ROS_DOMAIN_ID selection
+    does not collide in practice. A deterministic cross-process reservation or
+    locking mechanism remains unresolved.
+
+45. Milestone 6A straight-cylinder parameters are provisional
+    software-simulation defaults: radius `0.030 m`, length `0.120 m`, CTR outer
+    radius `0.0015 m`, and safety margin `0.0020 m`. They are not measured
+    physical CTR, tube, anatomical, or hardware parameters.
+
+46. The Milestone 6A default point goal `[0.015, 0.005, 0.100] m`, tolerance
+    `0.003 m`, and required hold duration `0.5 s` are software-simulation
+    acceptance values, not physical task requirements.
+
+47. The `cylinder_fast` profile is a bounded software-simulation profile with
+    36 samples, horizon 7, rollout `dt` `0.55 s`, controller period `0.10 s`,
+    insertion noise `0.003`, rotation noise `0.100`, tip and terminal weights
+    `15000`, control weight `0.005`, and smoothness weight `0.01`. It is not a
+    real-time or optimal-control certification profile.
+
+48. Milestone 6A/6A.1 sampled reachability is a deterministic approximate-
+    model sanity check. It does not prove formal kinematic reachability or
+    guarantee that the controller will reach every sampled-reachable target.
+    The Milestone 6A.1 target-identity fix makes this diagnostic non-mutating:
+    requested targets are never silently replaced by a sampled or suggested
+    target.
+
+49. Milestone 6A verifies whole-backbone cylinder containment for an analytical
+    straight lumen in simulation. It does not verify curved-lumen, obstacle-map,
+    anatomical-mesh, tactile-contact, safety-retreat, physical-validation, or
+    hardware behavior.
+
+50. Milestone 6A.1 runs demonstrate functional integration, quantitative
+    evaluation, exact-target identity, and collision-free behavior for the
+    tested straight-cylinder target/seed matrix: default, axial, and lateral
+    targets with seeds 11, 22, and 33. They do not demonstrate curved-lumen,
+    obstacle, anatomical, physical, or hardware robustness.
+
+51. Milestone 6A.1 timing remains non-real-time. The repeatability matrix
+    measured mean solve time around `0.1339 s` against a `0.10 s` controller
+    period, mean command rate around `7.38 Hz`, and deadline overrun remained
+    about `100%`. Timing measurements remain descriptive performance output;
+    real-time execution is not a prerequisite for current software-simulation
+    navigation acceptance.
+
+52. The verified axial target runs are physically collision-free but do not
+    maintain the full configured `0.002 m` safety margin. Axial safety-margin
+    robustness remains a simulation follow-up separate from target-reaching
+    success and collision-free acceptance.

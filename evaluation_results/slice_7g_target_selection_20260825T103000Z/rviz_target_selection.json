@@ -1,0 +1,22 @@
+{
+  "accepted_target_timestamp": 1787624380.854992,
+  "controller_target_frame": "base_link",
+  "development_simulation": true,
+  "invalid_candidate": {
+    "raw_input_frame": "world",
+    "raw_input_point": [0.0, 0.1, 0.08],
+    "status": "target_projection_too_far"
+  },
+  "orientation_used": false,
+  "production_attempts_consumed": 0,
+  "projection_distance": 0.03,
+  "raw_input_frame": "world",
+  "raw_input_point": [0.01924686842428271, 0.03, 0.08098413850007993],
+  "reference_pose_count": 1,
+  "result_status": "passed",
+  "ros_domain_id": 174,
+  "seed": 11,
+  "status": "target_accepted",
+  "target_source": "rviz",
+  "validated_target": [0.01924686842428271, 0.0, 0.08098413850007993]
+}
