@@ -99,6 +99,8 @@ class PublicationModelTest(unittest.TestCase):
                     "cylinder_navigation", "tracking_error_plot", "trajectory_xy_plot",
                     "trajectory_3d_plot", "tip_trajectory_plot", "command_history_plot",
                     "solve_time_plot", "cumulative_control_effort_plot",
+                    "curved_wall_clearance_plot", "centerline_tracking_error_plot",
+                    "curved_lumen_trajectory_plot",
                     "wall_clearance_plot", "cylinder_backbone_target_plot", "comparison",
                     "comparison_report", "report", "orchestration", "finalization_trace",
                     "finalization_error"}

@@ -53,6 +53,7 @@ from ctr_evaluation.run_evaluation import (  # noqa: E402
     strict_json_file,
     target_vectors_equal,
     validate_target_identity_metadata,
+    validate_task_options,
     unexpected_command_publishers,
     validate_experiment_group,
     write_orchestration_failure,
@@ -827,6 +828,73 @@ class RunEvaluationHelpersTest(unittest.TestCase):
         self.assertEqual("m5d_circle_matched", args.experiment_group)
         self.assertEqual("circle", args.trajectory)
         self.assertAlmostEqual(12.0, args.duration)
+
+    def test_automated_rviz_target_arguments_are_development_only(self):
+        args = parse_args(
+            [
+                "--development-simulation",
+                "--experiment-group",
+                "rviz_evaluation",
+                "--task",
+                "curved_lumen_navigation",
+                "--runtime-mode",
+                "simulation",
+                "--duration",
+                "5",
+                "--target",
+                "0.01924686842428271",
+                "0.0",
+                "0.08098413850007993",
+                "--development-target-source",
+                "rviz",
+                "--development-raw-target",
+                "0.01924686842428271",
+                "0.03",
+                "0.08098413850007993",
+                "--development-target-frame",
+                "world",
+                "--development-target-projection-distance",
+                "0.03",
+            ]
+        )
+        validate_task_options(args)
+        args.development_simulation = False
+        with self.assertRaisesRegex(OrchestrationError, "development target overrides"):
+            validate_task_options(args)
+
+    def test_automated_rviz_base_and_candidate_commands_use_fixed_topic_only(self):
+        raw = [0.01924686842428271, 0.03, 0.08098413850007993]
+        command = build_base_simulation_command(
+            experiment_group="rviz_evaluation",
+            controller_label="mppi",
+            baseline_dir=None,
+            task="curved_lumen_navigation",
+            target_position=[raw[0], 0.0, raw[2]],
+            slice_7g_profile=True,
+            development_simulation=True,
+            development_target_source="rviz",
+            development_raw_target=raw,
+            development_target_frame="world",
+        )
+        self.assertIn("reference_mode:=external_target", command)
+        self.assertNotIn("reference_mode:=fixed_target", command)
+        self.assertEqual(
+            1,
+            len([value for value in command if value.startswith("reference_mode:=")]),
+        )
+        self.assertIn("target_source:=rviz", command)
+        self.assertIn("wait_for_target:=true", command)
+        self.assertFalse(any("target_point_candidate" in value for value in command))
+
+        orchestrator = EvaluationOrchestrator.__new__(EvaluationOrchestrator)
+        orchestrator.development_simulation = True
+        orchestrator.development_target_source = "rviz"
+        orchestrator.development_raw_target = raw
+        orchestrator.development_target_frame = "world"
+        candidate = orchestrator._rviz_candidate_command()
+        self.assertEqual("/ctr/target_point_candidate", candidate[4])
+        self.assertEqual("geometry_msgs/msg/PointStamped", candidate[5])
+        self.assertIn("frame_id: 'world'", candidate[6])
 
     def test_cylinder_cli_argument_parsing(self):
         args = parse_args(

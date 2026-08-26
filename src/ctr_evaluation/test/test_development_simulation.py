@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,13 +26,16 @@ def passing_metrics():
         "readiness_time_seconds": 0.5,
         "command_message_count": 10,
         "final_tip_to_target_distance_m": 0.001,
-        "trajectory_error_rmse_m": 0.002,
+        "tip_to_target_rmse_m": 0.002,
+        "centerline_tracking_rmse_m": 0.0015,
         "minimum_wall_clearance_m": 0.004,
         "collision_count": 0,
         "controller_update_frequency_hz": 19.8,
         "safety_events": 0,
         "tactile_invalid_events": 0,
         "cleanup_clean": True,
+        "run_status": "completed",
+        "navigation_success": True,
         "candidate_plots": [],
     }
 
@@ -124,6 +128,7 @@ def test_run_one_pair_selects_existing_curved_lumen_pipeline(monkeypatch, tmp_pa
     assert captured["args"].task == "curved_lumen_navigation"
     assert captured["args"].seed == 22
     assert captured["args"].mppi_profile == "cylinder_fast"
+    assert captured["args"].development_target_source == "profile"
 
 
 def test_development_cli_target_arguments_reach_existing_target_override(monkeypatch, tmp_path):
@@ -174,7 +179,7 @@ def test_development_cli_target_arguments_reach_existing_target_override(monkeyp
         "projection_distance": 0.0,
         "acceptance_status": "target_accepted",
         "orientation_used": False,
-        "accepted_target_timestamp": result["target_selection"]["accepted_target_timestamp"],
+        "accepted_target_timestamp_s": None,
         "reference_pose_count": 1,
         "seed": 11,
         "result_status": "passed",
@@ -230,6 +235,76 @@ def test_rviz_cli_mode_builds_exact_interactive_launch_command():
     ]
 
 
+def test_automated_rviz_target_reaches_evaluator_through_point_transport(monkeypatch, tmp_path):
+    captured = {}
+    raw = (0.01924686842428271, 0.03, 0.08098413850007993)
+    accepted = (0.01924686842428271, 0.0, 0.08098413850007993)
+
+    class FakeOrchestrator:
+        def __init__(self, args):
+            captured["args"] = args
+
+        def run_pair(self):
+            candidate = tmp_path / "candidate_rviz"
+            candidate.mkdir(exist_ok=True)
+            (candidate / "orchestration.json").write_text(
+                json.dumps(
+                    {
+                        "orchestration_success": True,
+                        "requested_target": list(accepted),
+                        "validated_target": list(accepted),
+                        "development_target_selection": {
+                            "target_source": "rviz",
+                            "raw_input_point": list(raw),
+                            "raw_input_frame": "world",
+                            "validated_target": list(accepted),
+                            "projection_distance_m": 0.03,
+                            "accepted_target_timestamp_s": 123.5,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return {
+                "orchestration_success": True,
+                "comparison_valid": True,
+                "ros_domain_id": 156,
+                "baseline_dir": str(tmp_path / "baseline_rviz"),
+                "candidate_dir": str(candidate),
+            }
+
+    monkeypatch.setattr(development, "EvaluationOrchestrator", FakeOrchestrator)
+    monkeypatch.setattr(development, "collect_metrics", lambda _result: passing_metrics())
+    monkeypatch.setattr(
+        development,
+        "resolve_automated_rviz_candidate",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            accepted=True,
+            status="target_accepted",
+            validated_target=accepted,
+            projection_distance=0.03,
+        ),
+    )
+    result = development.run_one_pair(
+        root=tmp_path,
+        seed=11,
+        duration=5.0,
+        smoke=False,
+        target_source="rviz",
+        target=raw,
+        target_frame="world",
+    )
+    args = captured["args"]
+    assert args.development_target_source == "rviz"
+    assert args.development_raw_target == list(raw)
+    assert args.development_target_frame == "world"
+    assert args.target == list(accepted)
+    assert result["target_selection"]["raw_input_point"] == list(raw)
+    assert result["target_selection"]["validated_target"] == list(accepted)
+    assert result["target_selection"]["projection_distance"] == pytest.approx(0.03)
+    assert result["target_selection"]["accepted_target_timestamp_s"] == pytest.approx(123.5)
+
+
 def test_development_base_command_binds_explicit_mode():
     base = run_evaluation.build_base_simulation_command(
         experiment_group="dev",
@@ -253,6 +328,25 @@ def test_functional_result_rejects_missing_commands_and_unclean_children():
     assert "cleanup" in development.validate_functional_result(
         {"orchestration_success": True}, metrics
     )
+
+
+def test_functional_result_rejects_incomplete_evaluation_window():
+    metrics = passing_metrics()
+    metrics["run_status"] = "incomplete"
+    assert "did not complete" in development.validate_functional_result(
+        {"orchestration_success": True}, metrics
+    )
+
+
+def test_full_evaluation_requires_navigation_success_but_smoke_does_not():
+    metrics = passing_metrics()
+    metrics["navigation_success"] = False
+    assert "accepted target was not reached" in development.validate_functional_result(
+        {"orchestration_success": True}, metrics
+    )
+    assert development.validate_functional_result(
+        {"orchestration_success": True}, metrics, require_navigation=False
+    ) is None
 
 
 def test_result_report_is_explicitly_nonproduction(tmp_path):
@@ -291,4 +385,6 @@ def test_result_report_is_explicitly_nonproduction(tmp_path):
     assert payload["attempts"][0]["target_selection"]["target_source"] == "cli"
     assert payload["attempts"][0]["target_selection"]["reference_pose_count"] == 1
     assert "source=`cli`" in report
+    assert "Tip-to-target RMSE" in report
+    assert "Centerline RMSE" in report
     assert Path(paths["comparison_plot"]).is_file()

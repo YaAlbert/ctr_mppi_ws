@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 from pathlib import Path
@@ -54,8 +55,10 @@ def generate_report(
         f"- git_branch: `{metadata.get('git', {}).get('branch', '')}`",
         f"- workspace_dirty: `{metadata.get('git', {}).get('dirty', '')}`",
         f"- ros_domain_id: `{metadata.get('ros_domain_id', '')}`",
-        f"- configured_duration_s: `{metadata.get('configured_duration', '')}`",
-        f"- actual_duration_s: `{metadata.get('actual_duration', '')}`",
+        f"- recorder_default_configured_duration_s: `{metadata.get('configured_duration', '')}`",
+        f"- requested_evaluation_duration_s: `{metadata.get('requested_evaluation_duration_s', '')}`",
+        f"- evaluation_window_duration_s: `{metadata.get('evaluation_window_duration_s', '')}`",
+        f"- actual_recording_duration_s: `{metadata.get('actual_duration', '')}`",
         "",
         "## Configuration",
         "",
@@ -69,6 +72,25 @@ def generate_report(
         "software_mode",
     ):
         lines.append(f"- {key}: `{configuration.get(key, '')}`")
+
+    target_selection = metadata.get("development_target_selection")
+    if isinstance(target_selection, dict):
+        lines.extend(
+            [
+                "",
+                "## Development Target Selection",
+                "",
+                f"- target_source: `{target_selection.get('target_source', '')}`",
+                f"- raw_input_point_m: `{target_selection.get('raw_input_point', '')}`",
+                f"- raw_input_frame: `{target_selection.get('raw_input_frame', '')}`",
+                f"- validated_target_m: `{target_selection.get('validated_target', '')}`",
+                f"- controller_target_frame: `{target_selection.get('controller_target_frame', '')}`",
+                f"- projection_distance_m: `{target_selection.get('projection_distance_m', '')}`",
+                f"- acceptance_status: `{target_selection.get('acceptance_status', '')}`",
+                f"- orientation_used: `{target_selection.get('orientation_used', '')}`",
+                f"- reference_pose_count: `{target_selection.get('reference_pose_count', '')}`",
+            ]
+        )
     lines.extend(
         [
             "",
@@ -84,15 +106,43 @@ def generate_report(
             f"{values.get('received', False)} | {values.get('count', 0)} |"
         )
 
+    run_status = summary.get("run_status", {})
+    lines.extend(
+        [
+            "",
+            "## Completion Status",
+            "",
+            f"- status: `{run_status.get('status', 'unknown')}`",
+            f"- interrupted: `{run_status.get('interrupted', False)}`",
+            f"- completed_evaluation_window: `{run_status.get('completed_evaluation_window', False)}`",
+        ]
+    )
     lines.extend(["", "## Metrics", ""])
-    lines.extend(_metrics_table("Tracking", summary.get("tracking", {})))
+    tracking = dict(summary.get("tracking", {}))
+    semantics = summary.get("metric_semantics", {})
+    tracking_rmse_name = str(semantics.get("tracking_rmse_name", "reference_tracking_rmse_m"))
+    if "rmse" in tracking:
+        tracking[tracking_rmse_name] = tracking.pop("rmse")
+    lines.extend(_metrics_table("Tracking", tracking))
     lines.extend(_metrics_table("Control", summary.get("control", {})))
-    lines.extend(_metrics_table("Goal", summary.get("goal", {})))
+    goal = dict(summary.get("goal", {}))
+    goal.pop("rmse", None)
+    lines.extend(_metrics_table("Goal", goal))
     lines.extend(_metrics_table("Lumen Safety", summary.get("lumen_safety", {})))
     lines.extend(_metrics_table("Motion", summary.get("motion", {})))
     lines.extend(_metrics_table("Timing (Descriptive)", summary.get("timing", {}), description=TIMING_DESCRIPTION))
     lines.extend(_metrics_table("Data Quality", summary.get("data_quality", {})))
     lines.extend(_metrics_table("Numerical Safety", summary.get("numerical_safety", {})))
+    lines.extend(
+        [
+            "",
+            "### Metric Semantics",
+            "",
+            f"- `{tracking_rmse_name}`: `{semantics.get('tracking_rmse_formula', '')}` in metres.",
+            "- `final_goal_error`: Euclidean distance from the final aligned tip sample to the accepted target, in metres.",
+            "- `centerline_tracking_rmse_m`: RMS closest-centerline radial offset over aligned tip samples, in metres.",
+        ]
+    )
 
     lines.extend(["", "## Acceptance", "", "| Category | Pass |", "| --- | --- |"])
     for key, value in summary.get("acceptance", {}).items():
@@ -159,12 +209,19 @@ _BASE_PLOT_ARTIFACTS = (
     ("cumulative_control_effort_plot", "cumulative_control_effort.png"),
 )
 
+_CURVED_LUMEN_PLOT_ARTIFACTS = (
+    ("curved_wall_clearance_plot", "curved_wall_clearance.png"),
+    ("centerline_tracking_error_plot", "centerline_tracking_error.png"),
+    ("curved_lumen_trajectory_plot", "curved_lumen_trajectory_3d.png"),
+)
+
 
 def plot_artifact_names(
     run_dir: Path,
     metadata: dict[str, Any] | None = None,
     *,
     include_cylinder_plots: bool | None = None,
+    include_lumen_plots: bool | None = None,
 ) -> tuple[str, ...]:
     names = [name for name, _ in _BASE_PLOT_ARTIFACTS]
     if include_cylinder_plots is None:
@@ -180,6 +237,12 @@ def plot_artifact_names(
         raise TypeError("include_cylinder_plots must be a bool or None")
     if include_cylinder_plots:
         names.extend(("wall_clearance_plot", "cylinder_backbone_target_plot"))
+    if include_lumen_plots is None:
+        include_lumen_plots = (run_dir / "lumen_evaluation.csv").is_file()
+    elif type(include_lumen_plots) is not bool:
+        raise TypeError("include_lumen_plots must be a bool or None")
+    if include_lumen_plots:
+        names.extend(name for name, _path in _CURVED_LUMEN_PLOT_ARTIFACTS)
     return tuple(names)
 
 
@@ -190,6 +253,18 @@ def generate_plot_artifact(
     metadata: dict[str, Any] | None = None,
 ) -> Path:
     paths = dict((name, run_dir / path) for name, path in _BASE_PLOT_ARTIFACTS)
+    curved_paths = dict(
+        (name, run_dir / path) for name, path in _CURVED_LUMEN_PLOT_ARTIFACTS
+    )
+    if logical_name in curved_paths:
+        path = curved_paths[logical_name]
+        if logical_name == "curved_wall_clearance_plot":
+            _curved_wall_clearance_plot(path, run_dir / "lumen_evaluation.csv")
+        elif logical_name == "centerline_tracking_error_plot":
+            _centerline_tracking_error_plot(path, run_dir / "lumen_evaluation.csv")
+        else:
+            _curved_lumen_trajectory_plot(path, run_dir, samples)
+        return path
     if logical_name in {
         "wall_clearance_plot",
         "cylinder_backbone_target_plot",
@@ -255,12 +330,13 @@ def generate_plot_artifact(
         dtype=float,
     )
     if logical_name == "tracking_error_plot":
+        fixed_target = _is_fixed_target_metadata(metadata)
         _line_plot(
             path,
             times,
             [errors],
-            ["tip error"],
-            "Tracking Error",
+            ["tip-to-target error" if fixed_target else "tip-to-reference error"],
+            "Tip-To-Target Error" if fixed_target else "Reference Tracking Error",
             "time [s]",
             "error [m]",
         )
@@ -307,6 +383,7 @@ def plot_producer_registry(
     metadata: dict[str, Any] | None = None,
     *,
     include_cylinder_plots: bool | None = None,
+    include_lumen_plots: bool | None = None,
 ) -> dict[str, Any]:
     return {
         name: (
@@ -315,7 +392,10 @@ def plot_producer_registry(
             )
         )
         for name in plot_artifact_names(
-            run_dir, metadata, include_cylinder_plots=include_cylinder_plots
+            run_dir,
+            metadata,
+            include_cylinder_plots=include_cylinder_plots,
+            include_lumen_plots=include_lumen_plots,
         )
     }
 
@@ -330,6 +410,113 @@ def generate_plots(
         registry[name](run_dir)
         for name in plot_artifact_names(run_dir, metadata)
     ]
+
+
+def _is_fixed_target_metadata(metadata: dict[str, Any] | None) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    if metadata.get("target_mode") == "fixed_target":
+        return True
+    override = metadata.get("metadata_override")
+    return isinstance(override, dict) and override.get("target_mode") == "fixed_target"
+
+
+def _curved_wall_clearance_plot(path: Path, csv_path: Path) -> None:
+    data = _csv_numeric_columns(csv_path)
+    times = data.get("timestamp_s", np.asarray([], dtype=float))
+    clearance = data.get("physical_clearance_m", np.asarray([], dtype=float))
+    if times.size == 0 or clearance.size == 0:
+        _empty_plot(path, "No curved-lumen clearance samples")
+        return
+    _line_plot(
+        path,
+        times - times[0],
+        [clearance],
+        ["minimum backbone-to-wall clearance"],
+        "Curved-Lumen Wall Clearance",
+        "time [s]",
+        "clearance [m]",
+    )
+
+
+def _centerline_tracking_error_plot(path: Path, csv_path: Path) -> None:
+    data = _csv_numeric_columns(csv_path)
+    times = data.get("timestamp_s", np.asarray([], dtype=float))
+    offset = data.get("radial_offset_m", np.asarray([], dtype=float))
+    if times.size == 0 or offset.size == 0:
+        _empty_plot(path, "No centerline-deviation samples")
+        return
+    _line_plot(
+        path,
+        times - times[0],
+        [offset],
+        ["closest-centerline radial offset"],
+        "Centerline Tracking Deviation",
+        "time [s]",
+        "deviation [m]",
+    )
+
+
+def _curved_lumen_trajectory_plot(
+    path: Path,
+    run_dir: Path,
+    samples: list[AlignedSample],
+) -> None:
+    try:
+        summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+        lumen = summary["lumen_evaluation"]
+        payload = lumen["geometry"]["fingerprint_payload"]
+        centerline = np.asarray(payload["centerline_points"], dtype=float)
+        radii = np.asarray(payload["lumen_radius"], dtype=float)
+        target = np.asarray(lumen["identity"]["executed_target"], dtype=float)
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        _empty_plot(path, "Curved-lumen geometry metadata unavailable")
+        return
+    tip = np.asarray([sample.tip_position for sample in samples], dtype=float)
+    if (
+        centerline.ndim != 2
+        or centerline.shape[1:] != (3,)
+        or radii.shape != (centerline.shape[0],)
+        or tip.ndim != 2
+        or tip.shape[1:] != (3,)
+        or target.shape != (3,)
+        or not all(np.all(np.isfinite(item)) for item in (centerline, radii, tip, target))
+    ):
+        _empty_plot(path, "Curved-lumen trajectory data invalid")
+        return
+    figure = plt.figure(figsize=(7, 5.5))
+    axes = figure.add_subplot(111, projection="3d")
+    axes.plot(centerline[:, 0], centerline[:, 1], centerline[:, 2], color="#55aaff", label="analytic centerline")
+    axes.plot(tip[:, 0], tip[:, 1], tip[:, 2], color="#22aa44", label="actual tip trajectory")
+    axes.scatter([target[0]], [target[1]], [target[2]], color="#f5c542", s=45, label="accepted target")
+    for index in np.linspace(0, centerline.shape[0] - 1, min(14, centerline.shape[0]), dtype=int):
+        tangent = (
+            centerline[min(index + 1, centerline.shape[0] - 1)]
+            - centerline[max(index - 1, 0)]
+        )
+        norm = float(np.linalg.norm(tangent))
+        if norm <= 0.0:
+            continue
+        tangent /= norm
+        helper = np.array([0.0, 1.0, 0.0])
+        if abs(float(np.dot(helper, tangent))) > 0.9:
+            helper = np.array([1.0, 0.0, 0.0])
+        first = np.cross(tangent, helper)
+        first /= np.linalg.norm(first)
+        second = np.cross(tangent, first)
+        angles = np.linspace(0.0, 2.0 * math.pi, 32)
+        ring = centerline[index] + radii[index] * (
+            np.cos(angles)[:, None] * first + np.sin(angles)[:, None] * second
+        )
+        axes.plot(ring[:, 0], ring[:, 1], ring[:, 2], color="0.65", alpha=0.25)
+    axes.set_title("Actual Tip Trajectory In Analytic Curved Lumen")
+    axes.set_xlabel("x [m]")
+    axes.set_ylabel("y [m]")
+    axes.set_zlabel("z [m]")
+    axes.legend(loc="best")
+    figure.tight_layout()
+    figure.savefig(path)
+    plt.close(figure)
 
 
 def _metrics_table(title: str, values: dict[str, Any], description: str | None = None) -> list[str]:

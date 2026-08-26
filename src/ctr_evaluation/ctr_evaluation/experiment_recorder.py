@@ -964,6 +964,7 @@ class ExperimentRecorder:
             alignment.samples,
             metadata,
             include_cylinder_plots=include_cylinder,
+            include_lumen_plots=include_lumen,
         )
         for name, producer in plot_producers.items():
             producers[name] = lambda _target, producer=producer: producer(
@@ -1965,8 +1966,31 @@ class ExperimentRecorder:
             data_quality=data_quality,
             acceptance=acceptance,
         ).to_dict()
+        interrupted = bool(metadata.get("interrupted", False))
+        summary["run_status"] = {
+            "status": "incomplete" if interrupted else "completed",
+            "interrupted": interrupted,
+            "completed_evaluation_window": not interrupted,
+        }
+        fixed_target_reference = (
+            _metadata_value(metadata, "target_mode") == REFERENCE_MODE_FIXED_TARGET
+        )
+        target_selection = _metadata_value(metadata, "development_target_selection")
+        summary["metric_semantics"] = {
+            "tracking_rmse_name": (
+                "tip_to_target_rmse_m" if fixed_target_reference else "reference_tracking_rmse_m"
+            ),
+            "tracking_rmse_formula": "sqrt(mean(||tip_i-reference_i||_2^2))",
+            "tracking_rmse_units": "m",
+            "reference_pose_count": (
+                target_selection.get("reference_pose_count")
+                if isinstance(target_selection, dict)
+                else None
+            ),
+        }
         if goal_metrics is not None:
             summary["goal"] = dataclass_to_plain(goal_metrics)
+            summary["goal"]["tip_to_target_rmse_m"] = float(goal_metrics.rmse)
         if lumen_safety is not None:
             summary["lumen_safety"] = dataclass_to_plain(lumen_safety)
         if motion is not None:
@@ -1982,12 +2006,27 @@ class ExperimentRecorder:
             }
         if lumen_result is not None and lumen_result.required and lumen_result.section is not None:
             summary["lumen_evaluation"] = lumen_result.section
-            summary["navigation"] = _curved_navigation_summary(lumen_result.section, goal_metrics)
+            summary["navigation"] = _curved_navigation_summary(
+                lumen_result.section,
+                goal_metrics,
+                completed=not interrupted,
+            )
             summary["acceptance"] = _acceptance_with_curved_lumen(
                 summary["acceptance"],
                 lumen_result.section,
                 goal_metrics,
+                completed=not interrupted,
             )
+        elif interrupted:
+            acceptance = dict(summary["acceptance"])
+            reasons = list(acceptance.get("reasons", []))
+            acceptance["functional_pass"] = False
+            _append_reason_once(
+                reasons,
+                "evaluation was interrupted before the configured window completed",
+            )
+            acceptance["reasons"] = reasons
+            summary["acceptance"] = acceptance
         return summary
 
     def _apply_baseline_acceptance(self, summary: dict[str, Any], comparison: dict[str, Any]) -> dict[str, Any]:
@@ -2245,13 +2284,13 @@ class ExperimentRecorder:
             ["timestamp", "q0", "q1", "q2", "q3", "q4", "q5", "q_dot0", "q_dot1", "q_dot2", "q_dot3", "q_dot4", "q_dot5", "tip_x", "tip_y", "tip_z"],
             [
                 [sample.timestamp, *sample.q.tolist(), *sample.q_dot.tolist(), *sample.tip_position.tolist()]
-                for sample in self.states
+                for sample in sorted(self.states, key=lambda item: item.timestamp)
             ],
         )
         write_rows(
             run_dir / "tip.csv",
             ["timestamp", "x", "y", "z"],
-            self.tip_records,
+            sorted(self.tip_records, key=lambda item: item["timestamp"]),
         )
         write_rows(
             run_dir / "reference.csv",
@@ -2262,7 +2301,7 @@ class ExperimentRecorder:
                     *sample.position.tolist(),
                     "" if sample.progress is None else sample.progress,
                 ]
-                for sample in self.references
+                for sample in sorted(self.references, key=lambda item: item.timestamp)
             ],
         )
         selected_commands = self.safe_commands if self.safe_commands else self.raw_commands
@@ -2271,28 +2310,34 @@ class ExperimentRecorder:
             ["timestamp", "source", "u0", "u1", "u2", "u3", "u4", "u5", "saturated"],
             [
                 [sample.timestamp, sample.source, *sample.command.tolist(), sample.saturated]
-                for sample in selected_commands
+                for sample in sorted(selected_commands, key=lambda item: item.timestamp)
             ],
         )
         write_rows(
             run_dir / "solve_timing.csv",
             ["timestamp", "solve_time", "saturated"],
-            [[sample.timestamp, sample.solve_time, sample.saturated] for sample in self.solves],
+            [
+                [sample.timestamp, sample.solve_time, sample.saturated]
+                for sample in sorted(self.solves, key=lambda item: item.timestamp)
+            ],
         )
         write_rows(
             run_dir / "horizon.csv",
             ["timestamp", "count", "first_x", "first_y", "first_z", "final_x", "final_y", "final_z"],
-            self.horizon_records,
+            sorted(self.horizon_records, key=lambda item: item["timestamp"]),
         )
         write_rows(
             run_dir / "reference_path.csv",
             ["timestamp", "count"],
-            self.path_records,
+            sorted(self.path_records, key=lambda item: item["timestamp"]),
         )
         write_rows(
             run_dir / "backbone.csv",
             ["timestamp", "index", "x", "y", "z"],
-            self.backbone_records,
+            sorted(
+                self.backbone_records,
+                key=lambda item: (item["timestamp"], item["index"]),
+            ),
         )
         if self.config.cylindrical_lumen is not None and self.config.goal_position is not None:
             write_rows(
@@ -2405,6 +2450,14 @@ def _curved_lumen_identity(metadata: dict[str, Any]) -> tuple[dict[str, Any], li
         "geometry_fingerprint_match": False,
         "shared_environment_hash": _metadata_value(metadata, "shared_environment_hash"),
         "run_role": _metadata_value(metadata, "run_role"),
+        "development_simulation": _metadata_value(metadata, "development_simulation"),
+        "production_promotion_evidence": _metadata_value(
+            metadata, "production_promotion_evidence"
+        ),
+        "development_disclaimer": _metadata_value(metadata, "development_disclaimer"),
+        "development_target_selection": _metadata_value(
+            metadata, "development_target_selection"
+        ),
         "derived_target": None,
         "requested_target": None,
         "executed_target": None,
@@ -2721,6 +2774,10 @@ def _lumen_identity_section(identity: dict[str, Any]) -> dict[str, Any]:
         "centerline_fraction",
         "centerline_arc_length",
         "radial_offset",
+        "development_simulation",
+        "production_promotion_evidence",
+        "development_disclaimer",
+        "development_target_selection",
         "override_used",
         "shared_environment_hash",
         "run_role",
@@ -2933,7 +2990,12 @@ def _lumen_sample_csv_rows(metrics: LumenEvaluationMetrics) -> list[dict[str, An
     return rows
 
 
-def _curved_navigation_summary(section: dict[str, Any], goal_metrics: Any | None) -> dict[str, Any]:
+def _curved_navigation_summary(
+    section: dict[str, Any],
+    goal_metrics: Any | None,
+    *,
+    completed: bool = True,
+) -> dict[str, Any]:
     goal_success = False if goal_metrics is None else bool(goal_metrics.goal_reached)
     physical_pass = bool(section.get("physical_safety", {}).get("physical_safety_pass", False))
     safety_margin_pass = bool(section.get("safety_margin", {}).get("safety_margin_pass", False))
@@ -2943,7 +3005,8 @@ def _curved_navigation_summary(section: dict[str, Any], goal_metrics: Any | None
         "goal_success": goal_success,
         "physical_safety_pass": physical_pass,
         "safety_margin_pass": safety_margin_pass,
-        "navigation_success": bool(run_valid and goal_success and physical_pass),
+        "navigation_success": bool(completed and run_valid and goal_success and physical_pass),
+        "completed_evaluation_window": bool(completed),
     }
 
 
@@ -2951,6 +3014,8 @@ def _acceptance_with_curved_lumen(
     acceptance: dict[str, Any],
     section: dict[str, Any],
     goal_metrics: Any | None,
+    *,
+    completed: bool = True,
 ) -> dict[str, Any]:
     updated = dict(acceptance)
     reasons = list(updated.get("reasons", []))
@@ -2966,6 +3031,9 @@ def _acceptance_with_curved_lumen(
         _append_reason_once(reasons, "generic lumen physical safety failed or was unavailable")
     if not safety_margin_pass:
         _append_reason_once(reasons, "generic lumen safety margin failed or was unavailable")
+    if not completed:
+        updated["functional_pass"] = False
+        _append_reason_once(reasons, "evaluation was interrupted before the configured window completed")
     updated["reasons"] = reasons
     return updated
 
@@ -3002,12 +3070,12 @@ def write_aligned_csv(path: Path, alignment: AlignmentResult) -> None:
                 *sample.tip_position.tolist(),
                 *sample.reference_position.tolist(),
                 *sample.command.tolist(),
-                sample.solve_time,
+                _finite_csv_value(sample.solve_time),
                 sample.command_saturated,
                 sample.missing_command,
-                sample.reference_gap,
-                sample.command_gap,
-                sample.solve_gap,
+                _finite_csv_value(sample.reference_gap),
+                _finite_csv_value(sample.command_gap),
+                _finite_csv_value(sample.solve_gap),
                 sample.used_reference_interpolation,
                 sample.used_nearest_reference,
                 "" if sample.reference_progress is None else sample.reference_progress,
@@ -3066,6 +3134,13 @@ def write_rows(path: Path, fieldnames: list[str], rows: Any) -> None:
                 writer.writerow(row)
 
 
+def _finite_csv_value(value: Any) -> Any:
+    """Serialize unavailable optional numerics as an empty CSV field, never NaN."""
+    if isinstance(value, (float, np.floating)) and not math.isfinite(float(value)):
+        return ""
+    return value
+
+
 def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(sanitize_for_json(data), indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
@@ -3118,6 +3193,10 @@ def promoted_orchestration_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "orchestration_id",
         "run_role",
+        "development_simulation",
+        "production_promotion_evidence",
+        "development_disclaimer",
+        "development_target_selection",
         "requested_evaluation_duration_s",
         "total_recording_duration_s",
         "pre_roll_duration_s",
@@ -3174,7 +3253,7 @@ def promoted_orchestration_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     result = {key: metadata[key] for key in keys if key in metadata}
     reference = metadata.get("reference_configuration")
     if isinstance(reference, dict):
-        for key in ("task", "reference_mode"):
+        for key in ("task", "reference_mode", "reference_transport"):
             if key in reference and key not in result:
                 result[key] = reference[key]
         scenario = reference.get("curved_scenario")

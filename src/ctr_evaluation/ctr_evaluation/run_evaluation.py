@@ -56,6 +56,7 @@ TASK_CHOICES = (TASK_TRAJECTORY, TASK_CYLINDER_NAVIGATION, TASK_CURVED_LUMEN_NAV
 FIXED_TARGET_TASKS = (TASK_CYLINDER_NAVIGATION, TASK_CURVED_LUMEN_NAVIGATION)
 DEFAULT_CURVED_LUMEN_TYPE = "circular_arc"
 DEFAULT_CURVED_SCENARIO = CENTERLINE_TARGET
+DEVELOPMENT_TARGET_SOURCES = ("profile", "cli", "rviz")
 
 CONFIG_NAMES = (
     "robot_params.yaml",
@@ -271,6 +272,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--require-sampled-reachable", action="store_true")
     parser.add_argument("--output-root", default="")
     parser.add_argument("--config-path", action="append", default=[])
+    parser.add_argument(
+        "--development-target-source",
+        choices=DEVELOPMENT_TARGET_SOURCES,
+        default="profile",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--development-raw-target",
+        nargs=3,
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--development-target-frame",
+        choices=("world", "base_link"),
+        default="base_link",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--development-target-projection-distance",
+        type=float,
+        default=0.0,
+        help=argparse.SUPPRESS,
+    )
     parsed = parser.parse_args(raw_argv)
     parsed._slice_7g_raw_argv = tuple(raw_argv)
     return parsed
@@ -427,6 +453,30 @@ def validate_task_options(args: argparse.Namespace) -> None:
             raise OrchestrationError(
                 "--development-simulation requires --task curved_lumen_navigation"
             )
+    target_source = getattr(args, "development_target_source", "profile")
+    raw_target = getattr(args, "development_raw_target", None)
+    target_frame = getattr(args, "development_target_frame", "base_link")
+    projection_distance = getattr(args, "development_target_projection_distance", 0.0)
+    if target_source not in DEVELOPMENT_TARGET_SOURCES:
+        raise OrchestrationError("development target source is invalid")
+    if target_source != "profile" and not args.development_simulation:
+        raise OrchestrationError("development target overrides require --development-simulation")
+    if target_source == "rviz":
+        if raw_target is None or len(raw_target) != 3 or not all(math.isfinite(value) for value in raw_target):
+            raise OrchestrationError("automated RViz evaluation requires a finite 3D raw target")
+        if args.target is None or len(args.target) != 3 or not all(math.isfinite(value) for value in args.target):
+            raise OrchestrationError("automated RViz evaluation requires the validated target")
+        if target_frame not in {"world", "base_link"}:
+            raise OrchestrationError("automated RViz target frame is invalid")
+    elif raw_target is not None:
+        raise OrchestrationError("a raw RViz target is accepted only for target source rviz")
+    if (
+        isinstance(projection_distance, bool)
+        or not isinstance(projection_distance, (int, float))
+        or not math.isfinite(projection_distance)
+        or projection_distance < 0.0
+    ):
+        raise OrchestrationError("development target projection distance must be finite and nonnegative")
 
 
 class EvaluationOrchestrator:
@@ -435,6 +485,19 @@ class EvaluationOrchestrator:
         if not math.isfinite(args.duration) or args.duration <= 0.0:
             raise OrchestrationError("--duration must be positive and finite")
         validate_task_options(args)
+        self.development_target_source = str(
+            getattr(args, "development_target_source", "profile")
+        )
+        raw_target = getattr(args, "development_raw_target", None)
+        self.development_raw_target = (
+            None if raw_target is None else [float(value) for value in raw_target]
+        )
+        self.development_target_frame = str(
+            getattr(args, "development_target_frame", "base_link")
+        )
+        self.development_target_projection_distance = float(
+            getattr(args, "development_target_projection_distance", 0.0)
+        )
         self.experiment_group = validate_experiment_group(args.experiment_group)
         self.config_paths = default_config_paths(args.config_path)
         raw_config = load_parameter_files(self.config_paths)
@@ -620,6 +683,15 @@ class EvaluationOrchestrator:
                 development_simulation=bool(
                     getattr(self, "development_simulation", False)
                 ),
+                development_target_source=getattr(
+                    self, "development_target_source", "profile"
+                ),
+                development_raw_target=getattr(
+                    self, "development_raw_target", None
+                ),
+                development_target_frame=getattr(
+                    self, "development_target_frame", "base_link"
+                ),
             )
             records.append(self.process_manager.start(role=f"{role}_base", command=base_command, env=env))
             monitor = RosRunMonitor(domain_id=domain_id, slice_7g_governed=self.slice_7g_profile_enabled)
@@ -702,8 +774,24 @@ class EvaluationOrchestrator:
             if started_run_id != run_id:
                 raise OrchestrationError(f"evaluator started unexpected run ID {started_run_id}; expected {run_id}")
 
-            reference_command = self._reference_command(reference_epoch)
-            records.append(self.process_manager.start(role=f"{role}_reference", command=reference_command, env=env))
+            if self._uses_rviz_target_transport():
+                reference_command = self._rviz_candidate_command()
+                records.append(
+                    self.process_manager.start(
+                        role=f"{role}_rviz_target_candidate",
+                        command=reference_command,
+                        env=env,
+                    )
+                )
+            else:
+                reference_command = self._reference_command(reference_epoch)
+                records.append(
+                    self.process_manager.start(
+                        role=f"{role}_reference",
+                        command=reference_command,
+                        env=env,
+                    )
+                )
             monitor.wait_for_reference(self.settings.reference_ready_timeout, require_horizon=self.args.task == TASK_TRAJECTORY)
             if is_fixed_target_task(self.args.task):
                 monitor.verify_fixed_reference_target(self._target_position_for_launch(), TARGET_IDENTITY_ATOL)
@@ -965,6 +1053,9 @@ class EvaluationOrchestrator:
     ) -> dict[str, Any]:
         reference_config = self.project_config["reference"]
         reference_mode = reference_mode_for_task(self.args.task)
+        reference_transport = (
+            "external_target" if self._uses_rviz_target_transport() else reference_mode
+        )
         reference_start_policy = "fixed_target_window_epoch" if is_fixed_target_task(self.args.task) else "scheduled_time"
         reference_pre_epoch_behavior = "fixed_target_ready" if is_fixed_target_task(self.args.task) else "first_trajectory_point"
         policy_reference_start = "fixed_target_window_epoch" if is_curved_lumen_task(self.args.task) else "scheduled_time"
@@ -1039,6 +1130,11 @@ class EvaluationOrchestrator:
             "reference_configuration": {
                 "task": self.args.task,
                 "reference_mode": reference_mode,
+                **(
+                    {"reference_transport": reference_transport}
+                    if self.development_simulation
+                    else {}
+                ),
                 "trajectory_type": self.args.trajectory,
                 "trajectory_parameters": reference_config.get(self.args.trajectory, {}),
                 "sample_period": reference_config.get("sample_period"),
@@ -1050,6 +1146,11 @@ class EvaluationOrchestrator:
                 "curved_scenario": None if self.curved_scenario is None else self._curved_scenario_identity_metadata(),
                 "reference_window_policy": reference_start_policy,
             },
+            **(
+                {"development_target_selection": self._development_target_selection_metadata()}
+                if self.development_simulation
+                else {}
+            ),
             "processes_at_start": [record.to_dict() for record in records],
             "ros_domain_id": str(domain_id),
         }
@@ -1180,8 +1281,65 @@ class EvaluationOrchestrator:
             command.extend(self._fixed_target_launch_arguments())
         return command
 
+    def _uses_rviz_target_transport(self) -> bool:
+        return bool(
+            getattr(self, "development_simulation", False)
+            and getattr(self, "development_target_source", "profile") == "rviz"
+        )
+
+    def _rviz_candidate_command(self) -> list[str]:
+        if not self._uses_rviz_target_transport() or self.development_raw_target is None:
+            raise OrchestrationError("RViz target candidate requested outside automated RViz evaluation")
+        x, y, z = self.development_raw_target
+        message = (
+            "{header: {frame_id: '"
+            + self.development_target_frame
+            + "'}, point: {x: "
+            + format(x, ".17g")
+            + ", y: "
+            + format(y, ".17g")
+            + ", z: "
+            + format(z, ".17g")
+            + "}}"
+        )
+        return [
+            "ros2",
+            "topic",
+            "pub",
+            "--once",
+            "/ctr/target_point_candidate",
+            "geometry_msgs/msg/PointStamped",
+            message,
+        ]
+
+    def _development_target_selection_metadata(self) -> dict[str, Any]:
+        target = self._target_position_for_launch() if is_fixed_target_task(self.args.task) else None
+        raw_target = getattr(self, "development_raw_target", None)
+        return {
+            "target_source": getattr(self, "development_target_source", "profile"),
+            "raw_input_point": (
+                list(target)
+                if raw_target is None and target is not None
+                else raw_target
+            ),
+            "raw_input_frame": getattr(
+                self, "development_target_frame", "base_link"
+            ),
+            "validated_target": target,
+            "controller_target_frame": self.project_config["reference"]["frame_id"],
+            "projection_distance_m": float(
+                getattr(self, "development_target_projection_distance", 0.0)
+            ),
+            "orientation_used": False,
+            "reference_pose_count": 1 if target is not None else 0,
+        }
+
     def _controller_command(self) -> list[str]:
-        reference_mode = reference_mode_for_task(self.args.task)
+        reference_mode = (
+            "external_target"
+            if self._uses_rviz_target_transport()
+            else reference_mode_for_task(self.args.task)
+        )
         command = [
             "ros2",
             "launch",
@@ -1308,7 +1466,17 @@ class EvaluationOrchestrator:
         }
         runtime_metadata.update(self._target_identity_metadata())
         if is_fixed_target_task(self.args.task):
-            runtime_metadata.update(monitor.fixed_reference_target_identity(self._target_position_for_launch(), TARGET_IDENTITY_ATOL))
+            runtime_metadata.update(
+                monitor.fixed_reference_target_identity(
+                    self._target_position_for_launch(), TARGET_IDENTITY_ATOL
+                )
+            )
+        if self.development_simulation:
+            target_selection = self._development_target_selection_metadata()
+            target_selection["accepted_target_timestamp_s"] = runtime_metadata.get(
+                "reference_target_timestamp"
+            )
+            runtime_metadata["development_target_selection"] = target_selection
         return runtime_metadata
 
 
@@ -2432,6 +2600,9 @@ def build_base_simulation_command(
     run_role: str = "",
     slice_7g_profile: bool = False,
     development_simulation: bool = False,
+    development_target_source: str = "profile",
+    development_raw_target: list[float] | None = None,
+    development_target_frame: str = "base_link",
 ) -> list[str]:
     command = [
         "ros2",
@@ -2461,6 +2632,24 @@ def build_base_simulation_command(
                 "development simulation requires the Slice 7G simulation profile"
             )
         command.append("development_simulation:=true")
+        if development_target_source == "rviz":
+            raw = development_raw_target or []
+            if len(raw) != 3 or not all(math.isfinite(value) for value in raw):
+                raise OrchestrationError("RViz evaluation launch requires a finite raw target")
+            if development_target_frame not in {"world", "base_link"}:
+                raise OrchestrationError("RViz evaluation launch target frame is invalid")
+            command.extend(
+                [
+                    "reference_mode:=external_target",
+                    "target_source:=rviz",
+                    "wait_for_target:=true",
+                    f"target_x:={float(raw[0]):.17g}",
+                    f"target_y:={float(raw[1]):.17g}",
+                    f"target_z:={float(raw[2]):.17g}",
+                ]
+            )
+        elif development_target_source not in {"profile", "cli"}:
+            raise OrchestrationError("development target source is invalid")
     if output_root is not None:
         command.append(f"evaluation_output_root:={output_root}")
     if task == TASK_CYLINDER_NAVIGATION:
@@ -2491,12 +2680,13 @@ def build_base_simulation_command(
                 "enable_cylindrical_lumen:=false",
                 "enable_curved_lumen:=true",
                 f"curved_lumen_type:={lumen_type}",
-                "reference_mode:=fixed_target",
                 f"cylinder_target_x:={float(target[0]):.17g}",
                 f"cylinder_target_y:={float(target[1]):.17g}",
                 f"cylinder_target_z:={float(target[2]):.17g}",
             ]
         )
+        if not (development_simulation and development_target_source == "rviz"):
+            command.append("reference_mode:=fixed_target")
         if mppi_profile:
             command.append(f"cylinder_profile:={mppi_profile}")
         if random_seed is not None:

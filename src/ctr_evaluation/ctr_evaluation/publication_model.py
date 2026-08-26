@@ -423,6 +423,11 @@ def build_artifact_inventory(*, include_lumen: bool, include_plots: bool, includ
     if include_cylinder is None:
         include_cylinder = include_lumen
     plots = (("tracking_error_plot", "tracking_error.png"), ("trajectory_xy_plot", "trajectory_xy.png"), ("trajectory_3d_plot", "trajectory_3d.png"), ("tip_trajectory_plot", "tip_trajectory.png"), ("command_history_plot", "command_history.png"), ("solve_time_plot", "solve_time.png"), ("cumulative_control_effort_plot", "cumulative_control_effort.png"))
+    curved_plots = (
+        ("curved_wall_clearance_plot", "curved_wall_clearance.png"),
+        ("centerline_tracking_error_plot", "centerline_tracking_error.png"),
+        ("curved_lumen_trajectory_plot", "curved_lumen_trajectory_3d.png"),
+    )
     plot_names = tuple(name for name, _ in plots)
     specs = [
         ArtifactSpec("raw_state", "state.csv", True, Applicability.APPLICABLE, ArtifactRepresentation.OPAQUE, "regular_file"),
@@ -439,10 +444,25 @@ def build_artifact_inventory(*, include_lumen: bool, include_plots: bool, includ
         ArtifactSpec("lumen_evaluation", "lumen_evaluation.csv", False, _app(include_lumen), ArtifactRepresentation.OPAQUE, "regular_file", ("aligned_samples",)),
         ArtifactSpec("cylinder_navigation", "cylinder_navigation.csv", False, _app(include_cylinder), ArtifactRepresentation.OPAQUE, "regular_file"),
         *[ArtifactSpec(name, path, False, _app(include_plots), ArtifactRepresentation.OPAQUE, "regular_file", ("aligned_samples",)) for name, path in plots],
+        *[
+            ArtifactSpec(
+                name,
+                path,
+                False,
+                _app(include_lumen and include_plots),
+                ArtifactRepresentation.OPAQUE,
+                "regular_file",
+                ("lumen_evaluation", "aligned_samples", "summary"),
+            )
+            for name, path in curved_plots
+        ],
         ArtifactSpec("wall_clearance_plot", "wall_clearance.png", False, _app(include_cylinder and include_plots), ArtifactRepresentation.OPAQUE, "regular_file", ("cylinder_navigation",)),
         ArtifactSpec("cylinder_backbone_target_plot", "cylinder_backbone_target_3d.png", False, _app(include_cylinder and include_plots), ArtifactRepresentation.OPAQUE, "regular_file", ("cylinder_navigation", "metadata", "backbone")),
         ArtifactSpec("comparison", "comparison.json", False, _app(include_comparison), ArtifactRepresentation.OPAQUE, "regular_file", ("metadata", "summary")),
         ArtifactSpec("comparison_report", "comparison.md", False, _app(include_comparison), ArtifactRepresentation.OPAQUE, "regular_file", ("comparison",)),
+        # The report remains publishable when optional lumen diagnostics fail;
+        # each curved plot has its own explicit dependency record and is listed
+        # by the report only when it was actually produced.
         ArtifactSpec("report", "report.md", True, Applicability.APPLICABLE, ArtifactRepresentation.OPAQUE, "regular_file", ("metadata", "summary", "aligned_samples", "comparison", "comparison_report", *plot_names, "wall_clearance_plot", "cylinder_backbone_target_plot")),
         ArtifactSpec("orchestration", "orchestration.json", True, Applicability.APPLICABLE, ArtifactRepresentation.OPAQUE, "regular_file"),
         ArtifactSpec("finalization_trace", "finalization_trace.json", False, Applicability.APPLICABLE, ArtifactRepresentation.OPAQUE, "regular_file"),

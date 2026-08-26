@@ -1,11 +1,13 @@
 import copy
 import cProfile
+import csv
 import json
 import math
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -205,6 +207,34 @@ class ExperimentRecorderTest(unittest.TestCase):
         }
         metadata = promoted_orchestration_metadata({"reference_configuration": {"curved_scenario": scenario}})
         self.assertEqual(scenario, metadata)
+
+    def test_recorder_promotes_development_target_provenance(self):
+        selection = {
+            "target_source": "rviz",
+            "raw_input_point": [0.02, 0.03, 0.08],
+            "raw_input_frame": "world",
+            "validated_target": [0.02, 0.0, 0.08],
+            "controller_target_frame": "base_link",
+            "projection_distance_m": 0.03,
+            "orientation_used": False,
+            "reference_pose_count": 1,
+        }
+        metadata = promoted_orchestration_metadata(
+            {
+                "development_simulation": True,
+                "production_promotion_evidence": False,
+                "development_disclaimer": "development only",
+                "development_target_selection": selection,
+                "reference_configuration": {
+                    "reference_mode": "fixed_target",
+                    "reference_transport": "external_target",
+                },
+            }
+        )
+        self.assertTrue(metadata["development_simulation"])
+        self.assertFalse(metadata["production_promotion_evidence"])
+        self.assertEqual(selection, metadata["development_target_selection"])
+        self.assertEqual("external_target", metadata["reference_transport"])
 
     def test_curved_configuration_records_authoritative_goal_tolerance(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -589,6 +619,70 @@ class ExperimentRecorderTest(unittest.TestCase):
                 result.promotion.status,
             )
 
+    def test_fixed_target_summary_names_target_distance_rmse_unambiguously(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = make_recorder(temp_dir)
+            recorder.start(
+                experiment_name="fixed_target_metric_semantics",
+                metadata={
+                    "target_mode": "fixed_target",
+                    "development_target_selection": {"reference_pose_count": 1},
+                },
+                monotonic_time=0.0,
+            )
+            add_samples(recorder, tip_offset=0.002)
+            result = recorder.stop(monotonic_time=1.0)
+            summary = strict_json_load(result.run_dir / "summary.json")
+            self.assertEqual(
+                "tip_to_target_rmse_m",
+                summary["metric_semantics"]["tracking_rmse_name"],
+            )
+            self.assertEqual(1, summary["metric_semantics"]["reference_pose_count"])
+            self.assertAlmostEqual(0.002, summary["tracking"]["rmse"])
+
+    def test_aligned_csv_uses_empty_fields_for_missing_optional_numbers(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sample = SimpleNamespace(
+                timestamp=1.0,
+                q=np.zeros(6),
+                q_dot=np.zeros(6),
+                tip_position=np.zeros(3),
+                reference_position=np.zeros(3),
+                command=np.zeros(6),
+                solve_time=math.nan,
+                command_saturated=False,
+                missing_command=False,
+                reference_gap=0.0,
+                command_gap=0.0,
+                solve_gap=math.nan,
+                used_reference_interpolation=False,
+                used_nearest_reference=True,
+                reference_progress=None,
+            )
+            path = Path(temp_dir) / "aligned_samples.csv"
+            recorder_module.write_aligned_csv(
+                path,
+                SimpleNamespace(samples=[sample]),
+            )
+            text = path.read_text(encoding="utf-8").lower()
+            self.assertNotIn("nan", text)
+
+    def test_interrupted_run_is_explicitly_incomplete_and_not_successful(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = make_recorder(temp_dir)
+            recorder.start(
+                experiment_name="interrupted",
+                metadata={"target_mode": "fixed_target"},
+                monotonic_time=0.0,
+            )
+            add_samples(recorder)
+            result = recorder.stop(monotonic_time=0.25, interrupted=True)
+            summary = strict_json_load(result.run_dir / "summary.json")
+            self.assertEqual("incomplete", summary["run_status"]["status"])
+            self.assertTrue(summary["run_status"]["interrupted"])
+            self.assertFalse(summary["run_status"]["completed_evaluation_window"])
+            self.assertFalse(summary["acceptance"]["functional_pass"])
+
     def test_non_applicable_lumen_and_cylinder_remain_not_applicable(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             recorder = make_recorder(temp_dir)
@@ -817,11 +911,16 @@ class ExperimentRecorderTest(unittest.TestCase):
             recorder.record_reference(timestamp=0.0, position=[0.0, 0.0, 0.0], progress=0.0)
             recorder.record_state(timestamp=1.0, q=[0.0] * 6, q_dot=[0.0] * 6, tip_position=[0.0, 0.0, 0.0])
             recorder.record_reference(timestamp=1.0, position=[0.0, 0.0, 0.0], progress=1.0)
+            recorder.record_reference(timestamp=0.5, position=[0.0, 0.0, 0.0], progress=0.5)
             recorder.record_solve_timing(timestamp=1.0, solve_time=0.02, saturated=False)
             recorder.record_solve_timing(timestamp=0.0, solve_time=0.01, saturated=False)
             result = recorder.stop(monotonic_time=1.0)
             summary = strict_json_load(result.run_dir / "summary.json")
             self.assertAlmostEqual(1.0, summary["timing"]["effective_solve_frequency"])
+            for artifact in ("reference.csv", "solve_timing.csv"):
+                with (result.run_dir / artifact).open(encoding="utf-8", newline="") as stream:
+                    timestamps = [float(row["timestamp"]) for row in csv.DictReader(stream)]
+                self.assertEqual(sorted(timestamps), timestamps)
 
     def test_disconnected_prepromotion_pipeline_continues_and_terminalizes(
         self,

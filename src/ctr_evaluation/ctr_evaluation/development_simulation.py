@@ -11,11 +11,22 @@ import subprocess
 import sys
 from typing import Any
 
+from ctr_bringup.parameter_validation import load_parameter_files, validate_or_raise
+from ctr_bringup.slice_7g_profile import apply_slice_7g_development_simulation_profile
+from ctr_model.approximate_model import ApproximateCTRModel
+from ctr_mppi_controller.curved_lumen import CurvedLumen
+from ctr_mppi_controller.lumen_factory import config_with_lumen_overrides, lumen_geometry_from_config
+from ctr_sim.nodes.development_target_selector_node import (
+    build_sampled_reachability_cloud,
+    sampled_reachability_predicate,
+    select_development_target,
+)
 from ctr_evaluation.metrics import sanitize_for_json
 from ctr_evaluation.run_evaluation import (
     DEVELOPMENT_SIMULATION_DISCLAIMER,
     EvaluationOrchestrator,
     OrchestrationError,
+    default_config_paths,
     parse_args as parse_evaluation_args,
     validate_development_output_root,
 )
@@ -47,14 +58,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="profile",
         help="Development target source: profile (default), cli, or interactive rviz.",
     )
-    parser.add_argument("--target-x", type=float, default=None, help="CLI target X in base_link, metres.")
-    parser.add_argument("--target-y", type=float, default=None, help="CLI target Y in base_link, metres.")
-    parser.add_argument("--target-z", type=float, default=None, help="CLI target Z in base_link, metres.")
+    parser.add_argument("--target-x", type=float, default=None, help="CLI target or automated RViz candidate X, metres.")
+    parser.add_argument("--target-y", type=float, default=None, help="CLI target or automated RViz candidate Y, metres.")
+    parser.add_argument("--target-z", type=float, default=None, help="CLI target or automated RViz candidate Z, metres.")
     parser.add_argument(
         "--target-selection-timeout",
         type=float,
         default=0.0,
         help="Interactive RViz selection timeout in seconds; zero disables it.",
+    )
+    parser.add_argument(
+        "--automated-rviz-evaluation",
+        action="store_true",
+        help=(
+            "Publish the supplied target coordinates through the RViz PointStamped topic "
+            "and run the complete evaluator instead of opening an interactive RViz session."
+        ),
+    )
+    parser.add_argument(
+        "--target-frame",
+        choices=("world", "base_link"),
+        default="base_link",
+        help="Input frame for an automated RViz candidate; CLI targets are always base_link.",
     )
     return parser.parse_args(argv)
 
@@ -71,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
         if len(set(args.seeds)) != len(args.seeds):
             raise OrchestrationError("development seeds must not contain duplicates")
         target = development_cli_target(args)
-        if args.target_source == "rviz":
+        if args.target_source == "rviz" and not args.automated_rviz_evaluation:
             if len(args.seeds) != 1:
                 raise OrchestrationError("interactive RViz target selection requires exactly one seed")
             return run_interactive_rviz(args)
@@ -89,6 +114,7 @@ def main(argv: list[str] | None = None) -> int:
                 smoke=True,
                 target_source=args.target_source,
                 target=target,
+                target_frame=args.target_frame,
             )
             attempts.append(smoke)
             if smoke["status"] != "passed":
@@ -106,6 +132,7 @@ def main(argv: list[str] | None = None) -> int:
                     smoke=False,
                     target_source=args.target_source,
                     target=target,
+                    target_frame=args.target_frame,
                 )
             )
 
@@ -126,11 +153,11 @@ def run_one_pair(
     smoke: bool,
     target_source: str = "profile",
     target: tuple[float, float, float] | None = None,
+    target_frame: str = "base_link",
 ) -> dict[str, Any]:
     label = "smoke" if smoke else "example"
     group = f"slice_7g_development_{label}_seed_{seed}"
     result: dict[str, Any] | None = None
-    target_accepted_at = datetime.now(timezone.utc).isoformat()
     try:
         argv = [
                 "--development-simulation",
@@ -153,21 +180,50 @@ def run_one_pair(
                 "--output-root",
                 str(root),
             ]
-        if target_source == "cli":
+        evaluation_target = target
+        projection_distance = 0.0
+        if target_source == "rviz":
             if target is None:
-                raise OrchestrationError("CLI target source requires target coordinates")
-            argv.extend(["--target", *(format(value, ".17g") for value in target)])
+                raise OrchestrationError("automated RViz target source requires candidate coordinates")
+            selection = resolve_automated_rviz_candidate(
+                target,
+                input_frame=target_frame,
+                seed=seed,
+            )
+            if not selection.accepted or selection.validated_target is None:
+                raise OrchestrationError(f"automated RViz candidate rejected: {selection.status}")
+            evaluation_target = tuple(selection.validated_target)
+            projection_distance = float(selection.projection_distance)
+        if target_source in {"cli", "rviz"}:
+            if evaluation_target is None:
+                raise OrchestrationError(f"{target_source} target source requires target coordinates")
+            argv.extend(["--target", *(format(value, ".17g") for value in evaluation_target)])
+        argv.extend(["--development-target-source", target_source])
+        if target_source == "rviz" and target is not None:
+            argv.extend(
+                [
+                    "--development-raw-target",
+                    *(format(value, ".17g") for value in target),
+                    "--development-target-frame",
+                    target_frame,
+                    "--development-target-projection-distance",
+                    format(projection_distance, ".17g"),
+                ]
+            )
         evaluation_args = parse_evaluation_args(argv)
         result = EvaluationOrchestrator(evaluation_args).run_pair()
         metrics = collect_metrics(result)
-        failure_reason = validate_functional_result(result, metrics)
+        failure_reason = validate_functional_result(
+            result,
+            metrics,
+            require_navigation=not smoke,
+        )
         orchestration = _read_json(Path(result["candidate_dir"]) / "orchestration.json")
         target_selection = target_selection_result(
             target_source=target_source,
             supplied_target=target,
             orchestration=orchestration,
             seed=seed,
-            accepted_target_timestamp=target_accepted_at,
         )
         return {
             "kind": label,
@@ -195,7 +251,7 @@ def run_one_pair(
             "target_selection": {
                 "target_source": target_source,
                 "raw_input_point": None if target is None else list(target),
-                "raw_input_frame": "base_link",
+                "raw_input_frame": target_frame,
                 "validated_target": None,
                 "controller_target_frame": "base_link",
                 "projection_distance": 0.0,
@@ -212,18 +268,68 @@ def run_one_pair(
 def development_cli_target(args: argparse.Namespace) -> tuple[float, float, float] | None:
     values = (args.target_x, args.target_y, args.target_z)
     supplied = tuple(value is not None for value in values)
-    if args.target_source == "cli":
+    coordinates_required = args.target_source == "cli" or (
+        args.target_source == "rviz" and args.automated_rviz_evaluation
+    )
+    if coordinates_required:
         if supplied != (True, True, True):
-            raise OrchestrationError("target_source=cli requires --target-x, --target-y, and --target-z")
+            raise OrchestrationError(
+                f"target_source={args.target_source} requires --target-x, --target-y, and --target-z"
+            )
         target = tuple(float(value) for value in values)
         if not all(math.isfinite(value) for value in target):
-            raise OrchestrationError("CLI target coordinates must be finite")
+            raise OrchestrationError("target coordinates must be finite")
+        if args.target_source == "cli" and args.target_frame != "base_link":
+            raise OrchestrationError("CLI target coordinates must use target frame base_link")
         return target
     if any(supplied):
-        raise OrchestrationError("target coordinates are accepted only with --target-source cli")
+        raise OrchestrationError(
+            "target coordinates require --target-source cli or automated RViz evaluation"
+        )
+    if args.automated_rviz_evaluation:
+        raise OrchestrationError("--automated-rviz-evaluation requires --target-source rviz")
     if not _finite_number(args.target_selection_timeout) or args.target_selection_timeout < 0.0:
         raise OrchestrationError("target selection timeout must be finite and nonnegative")
     return None
+
+
+def resolve_automated_rviz_candidate(
+    raw_target: tuple[float, float, float],
+    *,
+    input_frame: str,
+    seed: int,
+):
+    raw_config = load_parameter_files(default_config_paths([]))
+    config = config_with_lumen_overrides(
+        raw_config,
+        enable_cylindrical_lumen=False,
+        enable_curved_lumen=True,
+        curved_lumen_type="circular_arc",
+        cylinder_profile="cylinder_fast",
+        random_seed=seed,
+    )
+    config = apply_slice_7g_development_simulation_profile(config, enabled=True)
+    validate_or_raise(config)
+    geometry = lumen_geometry_from_config(config)
+    if not isinstance(geometry, CurvedLumen):
+        raise OrchestrationError("automated RViz evaluation requires CurvedLumen geometry")
+    reachability = sampled_reachability_predicate(
+        build_sampled_reachability_cloud(ApproximateCTRModel(config), config),
+        float(config["goal"]["tolerance"]),
+    )
+    selection_config = config["simulation"]["development_target_selection"]
+    return select_development_target(
+        raw_target,
+        input_frame=input_frame,
+        target_source="rviz",
+        geometry=geometry,
+        controller_frame=str(config["reference"]["frame_id"]),
+        world_frame=str(config["robot"]["frames"]["world"]),
+        projection_limit=float(selection_config["projection_limit"]),
+        reachable=reachability,
+        accepted_target_timestamp=0.0,
+        seed=seed,
+    )
 
 
 def interactive_rviz_command(args: argparse.Namespace) -> list[str]:
@@ -256,10 +362,12 @@ def target_selection_result(
     supplied_target: tuple[float, float, float] | None,
     orchestration: dict[str, Any],
     seed: int,
-    accepted_target_timestamp: str | None = None,
 ) -> dict[str, Any]:
-    validated = orchestration.get("validated_target")
-    requested = orchestration.get("requested_target")
+    selection = orchestration.get("development_target_selection", {})
+    if not isinstance(selection, dict):
+        selection = {}
+    validated = selection.get("validated_target", orchestration.get("validated_target"))
+    requested = selection.get("raw_input_point", orchestration.get("requested_target"))
     accepted = (
         isinstance(validated, list)
         and len(validated) == 3
@@ -268,15 +376,15 @@ def target_selection_result(
     return {
         "target_source": target_source,
         "raw_input_point": list(supplied_target) if supplied_target is not None else requested,
-        "raw_input_frame": "base_link",
+        "raw_input_frame": selection.get("raw_input_frame", "base_link"),
         "validated_target": validated if accepted else None,
         "controller_target_frame": "base_link",
-        "projection_distance": 0.0,
+        "projection_distance": float(selection.get("projection_distance_m", 0.0)),
         "acceptance_status": "target_accepted" if accepted else "target_unreachable",
         "orientation_used": False,
-        "accepted_target_timestamp": (
-            accepted_target_timestamp or datetime.now(timezone.utc).isoformat()
-        ) if accepted else None,
+        "accepted_target_timestamp_s": (
+            selection.get("accepted_target_timestamp_s") if accepted else None
+        ),
         "reference_pose_count": 1 if accepted else 0,
         "seed": seed,
         "result_status": "passed" if orchestration.get("orchestration_success") is True else "failed",
@@ -292,6 +400,9 @@ def collect_metrics(result: dict[str, Any]) -> dict[str, Any]:
     progress = lumen.get("progress", {}) if isinstance(lumen, dict) else {}
     timing = summary.get("timing", {})
     tracking = summary.get("tracking", {})
+    goal = summary.get("goal", {})
+    run_status = summary.get("run_status", {})
+    topic_status = summary.get("topic_status", {})
     cleanup = orchestration.get("cleanup_audit", {})
     readiness = orchestration.get("readiness_diagnostics", {})
     created = readiness.get("monitor_created_monotonic")
@@ -308,8 +419,13 @@ def collect_metrics(result: dict[str, Any]) -> dict[str, Any]:
         "command_message_count": int(
             orchestration.get("command_audit", {}).get("command_message_count", 0)
         ),
-        "final_tip_to_target_distance_m": tracking.get("final_error"),
-        "trajectory_error_rmse_m": tracking.get("rmse"),
+        "controller_update_count": int(
+            orchestration.get("command_audit", {}).get("command_message_count", 0)
+        ),
+        "tip_sample_count": int(topic_status.get("/ctr/tip", {}).get("count", 0)),
+        "aligned_tip_sample_count": int(summary.get("data_quality", {}).get("valid_aligned_sample_count", 0)),
+        "final_tip_to_target_distance_m": goal.get("final_goal_error", tracking.get("final_error")),
+        "tip_to_target_rmse_m": goal.get("tip_to_target_rmse_m", goal.get("rmse")),
         "minimum_wall_clearance_m": physical.get("minimum_physical_clearance_m"),
         "collision_count": physical.get("collision_event_count"),
         "centerline_tracking_rmse_m": progress.get("centerline_tracking_rmse_m"),
@@ -321,19 +437,31 @@ def collect_metrics(result: dict[str, Any]) -> dict[str, Any]:
             "invalid_sample_count", 0
         ),
         "navigation_success": bool(summary.get("navigation", {}).get("navigation_success", False)),
+        "goal_reached": bool(goal.get("goal_reached", False)),
+        "run_status": run_status.get("status"),
         "cleanup_clean": bool(cleanup.get("clean", False)),
         "candidate_report": str(candidate_dir / "report.md"),
         "candidate_plots": [str(path) for path in sorted(candidate_dir.glob("*.png"))],
     }
 
 
-def validate_functional_result(result: dict[str, Any], metrics: dict[str, Any]) -> str | None:
+def validate_functional_result(
+    result: dict[str, Any],
+    metrics: dict[str, Any],
+    *,
+    require_navigation: bool = True,
+) -> str | None:
     checks = (
         (result.get("orchestration_success") is True, "orchestration did not complete"),
         (metrics["comparison_valid"] is True, "baseline/candidate comparison is invalid"),
         (metrics["readiness_succeeded"] is True, "readiness was not reached"),
         (metrics["command_message_count"] > 0, "controller produced no command messages"),
         (metrics["cleanup_clean"] is True, "owned process cleanup did not pass"),
+        (metrics.get("run_status") == "completed", "evaluation window did not complete"),
+        (
+            not require_navigation or metrics.get("navigation_success") is True,
+            "accepted target was not reached with valid collision-free navigation",
+        ),
         (int(metrics.get("safety_events", 0)) == 0, "a safety fault occurred"),
     )
     for passed, reason in checks:
@@ -344,7 +472,7 @@ def validate_functional_result(result: dict[str, Any], metrics: dict[str, Any]) 
 
 def write_development_results(root: Path, attempts: list[dict[str, Any]]) -> dict[str, str]:
     payload = {
-        "schema_version": "ctr-slice-7g-development-simulation-results-1",
+        "schema_version": "ctr-slice-7g-development-simulation-results-2",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "development_simulation": True,
         "simulator_only": True,
@@ -406,24 +534,25 @@ def development_report(root: Path, attempts: list[dict[str, Any]], plot_path: Pa
         "",
         "## Results",
         "",
-        "| Kind | Seed | Status | ROS domain | Readiness (s) | Final error (m) | RMSE (m) | Min clearance (m) | Collisions | Command Hz | Safety/tactile events | Failure |",
-        "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+        "| Kind | Seed | Status | ROS domain | Readiness (s) | Final target error (m) | Tip-to-target RMSE (m) | Centerline RMSE (m) | Min clearance (m) | Collisions | Solve Hz | Safety/tactile events | Failure |",
+        "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
     ]
     for item in attempts:
         metrics = item["metrics"]
         lines.append(
             "| {kind} | {seed} | {status} | {domain} | {ready} | {final} | {rmse} | "
-            "{clearance} | {collisions} | {frequency} | {safety}/{tactile} | {failure} |".format(
+            "{centerline} | {clearance} | {collisions} | {frequency} | {safety}/{tactile} | {failure} |".format(
                 kind=item["kind"],
                 seed=item["seed"],
                 status=item["status"],
                 domain=_format(item.get("ros_domain_id")),
                 ready=_format(metrics.get("readiness_time_seconds")),
                 final=_format(metrics.get("final_tip_to_target_distance_m")),
-                rmse=_format(metrics.get("trajectory_error_rmse_m")),
+                rmse=_format(metrics.get("tip_to_target_rmse_m")),
+                centerline=_format(metrics.get("centerline_tracking_rmse_m")),
                 clearance=_format(metrics.get("minimum_wall_clearance_m")),
                 collisions=_format(metrics.get("collision_count")),
-                frequency=_format(metrics.get("controller_update_frequency_hz")),
+                frequency=_format(metrics.get("effective_solve_frequency_hz")),
                 safety=_format(metrics.get("safety_events")),
                 tactile=_format(metrics.get("tactile_invalid_events")),
                 failure=item.get("failure_reason") or "",
