@@ -112,6 +112,7 @@ def simulator_shell(config):
     node._static_lumen_marker_frame_id = node.frame_id
     node._last_static_lumen_publish_time_s = None
     node._last_development_visualization_publish_time_s = None
+    node._last_runtime_marker_publish_time_s = None
     node._static_lumen_build_count = 0
     node._static_lumen_cache_hit_logged = False
     node._dynamic_lumen_marker_keys = ()
@@ -120,6 +121,7 @@ def simulator_shell(config):
     node._lumen_diagnostic_update_count = 0
     node.development_simulation = False
     node.development_visualization = False
+    node.evaluation_diagnostics_enabled = False
     node.development_marker_pubs = {}
     node._reference_path_points = np.empty((0, 3), dtype=np.float64)
     node._reference_path_frame_id = node.frame_id
@@ -139,6 +141,17 @@ def sample_backbone():
 
 
 class SimulatorNodeLumenRuntimeTest(unittest.TestCase):
+    def test_paper_diagnostics_rate_limit_only_visualization_work(self):
+        node = simulator_shell(curved_config("circular_arc"))
+        node.evaluation_diagnostics_enabled = True
+        self.assertTrue(node._runtime_marker_publication_due(_time_msg(1.0)))
+        self.assertFalse(node._runtime_marker_publication_due(_time_msg(1.1)))
+        self.assertTrue(node._runtime_marker_publication_due(_time_msg(1.2)))
+
+        node.evaluation_diagnostics_enabled = False
+        self.assertTrue(node._runtime_marker_publication_due(_time_msg(1.21)))
+        self.assertTrue(node._runtime_marker_publication_due(_time_msg(1.22)))
+
     def test_simulator_source_uses_shared_lumen_factory(self):
         source = (PACKAGE_ROOT / "ctr_sim" / "nodes" / "simulator_node.py").read_text(encoding="utf-8")
         self.assertIn("config_with_lumen_overrides", source)

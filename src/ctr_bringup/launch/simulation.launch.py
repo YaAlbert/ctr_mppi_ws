@@ -416,6 +416,9 @@ def generate_launch_description():
                         "enable_development_visualization": ParameterValue(
                             enable_development_visualization, value_type=bool
                         ),
+                        "evaluation_diagnostics_enabled": ParameterValue(
+                            evaluation_diagnostics_enabled, value_type=bool
+                        ),
                     }
                 ],
             ),

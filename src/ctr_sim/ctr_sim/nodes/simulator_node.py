@@ -96,6 +96,7 @@ class CTRSimulatorNode(Node):
         self.declare_parameter("slice_7g_profile", False)
         self.declare_parameter("development_simulation", False)
         self.declare_parameter("enable_development_visualization", False)
+        self.declare_parameter("evaluation_diagnostics_enabled", False)
 
         config_paths = validate_config_paths(self.get_parameter("config_paths").value)
 
@@ -130,12 +131,17 @@ class CTRSimulatorNode(Node):
             self.get_parameter("enable_development_visualization").value,
             "enable_development_visualization",
         )
+        evaluation_diagnostics_enabled = parse_launch_bool(
+            self.get_parameter("evaluation_diagnostics_enabled").value,
+            "evaluation_diagnostics_enabled",
+        )
         if development_visualization_enabled and not development_enabled:
             raise ValueError(
                 "enable_development_visualization requires development_simulation=true"
             )
         self.development_simulation = development_enabled
         self.development_visualization = development_visualization_enabled
+        self.evaluation_diagnostics_enabled = evaluation_diagnostics_enabled
         self.config = (
             apply_slice_7g_development_simulation_profile(self.config, enabled=True)
             if development_enabled
@@ -185,6 +191,7 @@ class CTRSimulatorNode(Node):
         self._static_lumen_marker_frame_id = self.frame_id
         self._last_static_lumen_publish_time_s: float | None = None
         self._last_development_visualization_publish_time_s: float | None = None
+        self._last_runtime_marker_publish_time_s: float | None = None
         self._static_lumen_build_count = 0
         self._static_lumen_cache_hit_logged = False
         self._dynamic_lumen_marker_keys: tuple[tuple[str, int], ...] = ()
@@ -349,20 +356,21 @@ class CTRSimulatorNode(Node):
         if self.tactile_pub is not None:
             self.tactile_pub.publish(self._tactile_msg(stamp, model_result.tip_position))
         self.diagnostics_pub.publish(self._diagnostics_msg(stamp, command_age, model_result.diagnostic_status))
-        publish_development_visualization = self._development_visualization_publish_due(stamp)
-        marker_array = self._marker_array_msg(
-            stamp,
-            backbone_points,
-            model_result.backbone_points,
-            include_development=publish_development_visualization,
-        )
-        self.marker_pub.publish(
-            MarkerArray(
-                markers=[marker for marker in marker_array.markers if marker.ns != "lumen_surface"]
+        if self._runtime_marker_publication_due(stamp):
+            publish_development_visualization = self._development_visualization_publish_due(stamp)
+            marker_array = self._marker_array_msg(
+                stamp,
+                backbone_points,
+                model_result.backbone_points,
+                include_development=publish_development_visualization,
             )
-        )
-        if publish_development_visualization:
-            self._publish_development_marker_topics(marker_array)
+            self.marker_pub.publish(
+                MarkerArray(
+                    markers=[marker for marker in marker_array.markers if marker.ns != "lumen_surface"]
+                )
+            )
+            if publish_development_visualization:
+                self._publish_development_marker_topics(marker_array)
 
     def _joint_state_msg(self, stamp, q: np.ndarray, q_dot: np.ndarray) -> CtrJointState:
         msg = CtrJointState()
@@ -573,6 +581,29 @@ class CTRSimulatorNode(Node):
         period = 1.0 / self.lumen_marker_config.marker_publish_rate
         if last_publish is None or stamp_s < last_publish or stamp_s - last_publish >= period - 1.0e-12:
             self._last_development_visualization_publish_time_s = stamp_s
+            return True
+        return False
+
+    def _runtime_marker_publication_due(self, stamp) -> bool:
+        """Rate-limit non-control visualization work in explicit diagnostic runs.
+
+        The normal simulator behavior is unchanged.  Paper diagnostics do not
+        consume live marker data, so honoring the configured marker rate avoids
+        making 100 Hz physics/tactile publication compete with large MarkerArray
+        construction while still retaining an inspectable marker stream.
+        """
+
+        if not self.evaluation_diagnostics_enabled:
+            return True
+        stamp_s = _stamp_seconds(stamp)
+        last_publish = self._last_runtime_marker_publish_time_s
+        period = 1.0 / self.lumen_marker_config.marker_publish_rate
+        if (
+            last_publish is None
+            or stamp_s < last_publish
+            or stamp_s - last_publish >= period - 1.0e-12
+        ):
+            self._last_runtime_marker_publish_time_s = stamp_s
             return True
         return False
 
