@@ -123,6 +123,77 @@ LUMEN_EVALUATION_CSV_FIELDS = [
     "radial_offset_m",
     "local_radius_m",
 ]
+MPPI_COST_TERM_NAMES = (
+    "stage_tip_target",
+    "terminal_target",
+    "control_effort",
+    "control_rate",
+    "safety_margin",
+    "wall_collision",
+    "end_cap_collision",
+    "terminal_lumen",
+    "tactile",
+)
+MPPI_COST_CSV_FIELDS = [
+    "timestamp_s",
+    "minimum_cost",
+    "mean_cost",
+    "effective_sample_weight",
+    *[f"raw.{name}" for name in MPPI_COST_TERM_NAMES],
+    *[f"weight.{name}" for name in MPPI_COST_TERM_NAMES],
+    *[f"weighted.{name}" for name in MPPI_COST_TERM_NAMES],
+    *[f"weighted_mean.{name}" for name in MPPI_COST_TERM_NAMES],
+]
+MPPI_TIMING_CSV_FIELDS = [
+    "timestamp_s",
+    "timing.sampling_s",
+    "timing.rollout_propagation_s",
+    "timing.target_control_cost_s",
+    "timing.lumen_cost_s",
+    "timing.tactile_cost_s",
+    "timing.weight_normalization_s",
+    "timing.control_update_s",
+    "ros_message_conversion_s",
+    "timing.solve_total_s",
+]
+TACTILE_SAFETY_CSV_FIELDS = [
+    "timestamp_s",
+    "event_type",
+    "received_timestamp_s",
+    "data_age_s",
+    "frame_id",
+    "frame_valid",
+    "source",
+    "simulation_source",
+    "raw_force_n",
+    "filtered_force_n",
+    "force_magnitude_n",
+    "clearance_m",
+    "contact",
+    "warning",
+    "stop",
+    "valid",
+    "region",
+    "contact_on_n",
+    "contact_off_n",
+    "warning_on_n",
+    "warning_off_n",
+    "stop_on_n",
+    "stop_off_n",
+    *[f"commanded_u{index}" for index in range(6)],
+    *[f"safe_u{index}" for index in range(6)],
+    "commanded_norm",
+    "safe_norm",
+    "applied_scale",
+    "command_gated",
+    "safety_state",
+    "safety_state_name",
+    "safety_command_allowed",
+    "safety_emergency_stop",
+    "safety_fault",
+    "safety_valid",
+    "safety_reason",
+]
 
 
 @dataclass(frozen=True)
@@ -143,6 +214,7 @@ class EvaluationRecorderConfig:
     plot_generation: bool
     report_generation: bool
     enable_finalization_profiling: bool
+    diagnostic_data_collection: bool
     physical_validation: bool
     hardware_validation: bool
     software_mode: str
@@ -266,6 +338,10 @@ class EvaluationRecorderConfig:
             enable_finalization_profiling=_bool(
                 evaluation.get("enable_finalization_profiling", False),
                 "evaluation.enable_finalization_profiling",
+            ),
+            diagnostic_data_collection=_bool(
+                evaluation.get("diagnostic_data_collection", False),
+                "evaluation.diagnostic_data_collection",
             ),
             physical_validation=_bool(evaluation["physical_validation"], "evaluation.physical_validation"),
             hardware_validation=_bool(evaluation["hardware_validation"], "evaluation.hardware_validation"),
@@ -941,6 +1017,7 @@ class ExperimentRecorder:
                 if comparison_applicable is None
                 else comparison_applicable
             ),
+            include_diagnostics=self.config.diagnostic_data_collection,
         )
         existing = self._existing_artifact_producer
         producers: dict[str, Callable[[Path], Any]] = {
@@ -965,6 +1042,7 @@ class ExperimentRecorder:
             metadata,
             include_cylinder_plots=include_cylinder,
             include_lumen_plots=include_lumen,
+            include_diagnostic_plots=self.config.diagnostic_data_collection,
         )
         for name, producer in plot_producers.items():
             producers[name] = lambda _target, producer=producer: producer(
@@ -1036,6 +1114,10 @@ class ExperimentRecorder:
         self.horizon_records: list[dict[str, Any]] = []
         self.path_records: list[dict[str, Any]] = []
         self.backbone_records: list[dict[str, Any]] = []
+        self.tactile_evidence_records: list[dict[str, Any]] = []
+        self.safety_evidence_records: list[dict[str, Any]] = []
+        self.mppi_diagnostic_records: list[dict[str, Any]] = []
+        self.invalid_mppi_diagnostic_count = 0
         self.initial_state_q: list[float] | None = None
         self.initial_tip_position: list[float] | None = None
         self.slice_7g_safety_fault_count = 0
@@ -1173,6 +1255,9 @@ class ExperimentRecorder:
                 "reference_path",
                 "backbone",
                 "cylinder_navigation",
+                "tactile_safety_evidence",
+                "mppi_cost_terms",
+                "mppi_computation",
             )
             raw_start_ns = time.monotonic_ns()
             self._record_optional_diagnostic(
@@ -1645,6 +1730,85 @@ class ExperimentRecorder:
         ):
             self.slice_7g_safety_fault_count += 1
 
+    def record_tactile_evidence(self, **values: Any) -> None:
+        if not self.config.diagnostic_data_collection or self.lifecycle_state != STATE_RECORDING:
+            return
+        try:
+            timestamp = _number(values["timestamp"], "tactile timestamp")
+            received = _number(values["received_timestamp"], "tactile received timestamp")
+            raw = np.asarray(values["raw_values"], dtype=float)
+            filtered = np.asarray(values["filtered_values"], dtype=float)
+            if raw.ndim != 1 or filtered.ndim != 1 or not np.all(np.isfinite(raw)) or not np.all(np.isfinite(filtered)):
+                raise ValueError("tactile arrays must be finite one-dimensional values")
+            thresholds = self.project_config["tactile"]["thresholds"]
+            self.tactile_evidence_records.append(
+                {
+                    "timestamp_s": timestamp,
+                    "received_timestamp_s": received,
+                    "data_age_s": max(0.0, received - timestamp),
+                    "frame_id": str(values["frame_id"]),
+                    "frame_valid": str(values["frame_id"]) == self.config.frame_id,
+                    "source": str(values["source"]),
+                    "simulation_source": str(values["source"]) == "simulated",
+                    "raw_force_n": float(raw[0]) if raw.size else float(values["force_magnitude"]),
+                    "filtered_force_n": float(filtered[0]) if filtered.size else float(values["force_magnitude"]),
+                    "force_magnitude_n": _number(values["force_magnitude"], "force magnitude"),
+                    "clearance_m": _number(values["clearance_m"], "tactile clearance"),
+                    "contact": bool(values["contact"]),
+                    "warning": bool(values["warning"]),
+                    "stop": bool(values["stop"]),
+                    "valid": bool(values["valid"]),
+                    "region": int(values["region"]),
+                    "contact_on_n": float(thresholds["contact"]),
+                    "contact_off_n": float(thresholds["contact_off"]),
+                    "warning_on_n": float(thresholds["warning"]),
+                    "warning_off_n": float(thresholds["warning_off"]),
+                    "stop_on_n": float(thresholds["stop"]),
+                    "stop_off_n": float(thresholds["stop_off"]),
+                }
+            )
+        except (KeyError, TypeError, ValueError):
+            self.slice_7g_tactile_invalid_count += 1
+
+    def record_safety_evidence(self, **values: Any) -> None:
+        if not self.config.diagnostic_data_collection or self.lifecycle_state != STATE_RECORDING:
+            return
+        try:
+            self.safety_evidence_records.append(
+                {
+                    "timestamp_s": _number(values["timestamp"], "safety timestamp"),
+                    "state": int(values["state"]),
+                    "state_name": str(values["state_name"]),
+                    "command_allowed": bool(values["command_allowed"]),
+                    "emergency_stop": bool(values["emergency_stop"]),
+                    "fault": bool(values["fault"]),
+                    "valid": bool(values["valid"]),
+                    "diagnostic_status": str(values["diagnostic_status"]),
+                }
+            )
+        except (KeyError, TypeError, ValueError):
+            self.slice_7g_safety_fault_count += 1
+
+    def record_mppi_diagnostic(self, *, timestamp: Any, values: Mapping[str, str]) -> None:
+        if not self.config.diagnostic_data_collection or self.lifecycle_state != STATE_RECORDING:
+            return
+        try:
+            if values.get("schema_version") != "ctr_mppi_evaluation_iteration_v1" or values.get("valid") != "true":
+                raise ValueError("unexpected MPPI diagnostic schema")
+            record: dict[str, Any] = {"timestamp_s": _number(timestamp, "MPPI diagnostic timestamp")}
+            for key, value in values.items():
+                if key in {"schema_version", "valid"}:
+                    continue
+                record[key] = _number(value, f"MPPI diagnostic {key}")
+            self.mppi_diagnostic_records.append(record)
+            self.record_topic("/ctr/evaluation/mppi_diagnostics")
+        except (TypeError, ValueError):
+            self.invalid_mppi_diagnostic_count += 1
+
+    def record_invalid_mppi_diagnostic(self) -> None:
+        if self.config.diagnostic_data_collection and self.lifecycle_state == STATE_RECORDING:
+            self.invalid_mppi_diagnostic_count += 1
+
     def _accept_sample(self, topic: str) -> bool:
         if self.lifecycle_state != STATE_RECORDING:
             return False
@@ -1710,6 +1874,7 @@ class ExperimentRecorder:
                 "configured_control_period": self.config.thresholds.control_period,
                 "reference_sample_period": self.config.reference_sample_period,
                 "software_mode": self.config.software_mode,
+                "diagnostic_data_collection": self.config.diagnostic_data_collection,
             },
             "metadata_override": self.metadata_override,
             "timestamp_limitations": [
@@ -2027,7 +2192,109 @@ class ExperimentRecorder:
             )
             acceptance["reasons"] = reasons
             summary["acceptance"] = acceptance
+        summary["paper_metrics"] = self._paper_metrics(
+            alignment=alignment,
+            metadata=metadata,
+            lumen_result=lumen_result,
+        )
         return summary
+
+    def _paper_metrics(
+        self,
+        *,
+        alignment: AlignmentResult,
+        metadata: dict[str, Any],
+        lumen_result: LumenRecorderResult | None,
+    ) -> dict[str, Any]:
+        samples = alignment.samples
+        tip = np.asarray([sample.tip_position for sample in samples], dtype=float)
+        path_length = (
+            float(np.sum(np.linalg.norm(np.diff(tip, axis=0), axis=1)))
+            if tip.shape[0] > 1
+            else 0.0
+        )
+        selected = sorted(self.safe_commands or self.raw_commands, key=lambda item: item.timestamp)
+        commands = np.asarray([sample.command for sample in selected], dtype=float)
+        insertion_variation = (
+            float(np.sum(np.linalg.norm(np.diff(commands[:, :3], axis=0), axis=1)))
+            if commands.shape[0] > 1
+            else 0.0
+        )
+        rotation_variation = (
+            float(np.sum(np.linalg.norm(np.diff(commands[:, 3:], axis=0), axis=1)))
+            if commands.shape[0] > 1
+            else 0.0
+        )
+        if commands.size:
+            saturated = np.isclose(np.abs(commands), self.config.command_limits[None, :], rtol=0.0, atol=1.0e-12)
+            insertion_saturation = float(100.0 * np.mean(np.any(saturated[:, :3], axis=1)))
+            rotation_saturation = float(100.0 * np.mean(np.any(saturated[:, 3:], axis=1)))
+        else:
+            insertion_saturation = rotation_saturation = 0.0
+        result: dict[str, Any] = {
+            "schema_version": "ctr_final_system_run_metrics_v1",
+            "cartesian_path_length_m": path_length,
+            "cumulative_control_effort_formula": "sum_i(||u_i||_2^2 * dt_i)",
+            "cumulative_control_effort_units": "mixed_command_units_squared_second",
+            "insertion_total_variation_m_per_s": insertion_variation,
+            "rotation_total_variation_rad_per_s": rotation_variation,
+            "insertion_saturation_percentage": insertion_saturation,
+            "rotation_saturation_percentage": rotation_saturation,
+            "tip_sample_count": len(self.tip_records),
+            "solve_sample_count": len(self.solves),
+            "aligned_sample_count": len(samples),
+            "requested_runtime_s": metadata.get("requested_evaluation_duration_s"),
+            "configured_runtime_s": metadata.get("configured_duration"),
+            "actual_runtime_s": metadata.get("actual_duration"),
+            "diagnostic_data_collection": self.config.diagnostic_data_collection,
+            "invalid_mppi_diagnostic_count": self.invalid_mppi_diagnostic_count,
+        }
+        if lumen_result is not None and lumen_result.csv_rows:
+            rows = list(lumen_result.csv_rows)
+            clearance = np.asarray([float(row["physical_clearance_m"]) for row in rows])
+            radial = np.asarray([float(row["radial_offset_m"]) for row in rows])
+            stamps = np.asarray([float(row["timestamp_s"]) for row in rows])
+            margin = np.asarray([bool(row["safety_margin_violation"]) for row in rows])
+            collision = np.asarray([bool(row["physical_collision"]) for row in rows])
+            minimum_index = int(np.argmin(clearance))
+            maximum_index = int(np.argmax(radial))
+            result.update(
+                {
+                    "maximum_centerline_distance_m": float(radial[maximum_index]),
+                    "maximum_centerline_distance_timestamp_s": float(stamps[maximum_index]),
+                    "minimum_whole_backbone_clearance_m": float(clearance[minimum_index]),
+                    "minimum_whole_backbone_clearance_timestamp_s": float(stamps[minimum_index]),
+                    "safety_margin_crossing_count": _transition_count(margin),
+                    "safety_margin_violation_duration_s": _flag_duration(stamps, margin),
+                    "collision_transition_count": _transition_count(collision),
+                }
+            )
+        if self.config.diagnostic_data_collection:
+            tactile_rows = sorted(self.tactile_evidence_records, key=lambda row: row["timestamp_s"])
+            safety_rows = sorted(self.safety_evidence_records, key=lambda row: row["timestamp_s"])
+            for name in ("contact", "warning", "stop"):
+                flags = np.asarray([bool(row[name]) for row in tactile_rows])
+                stamps = np.asarray([float(row["timestamp_s"]) for row in tactile_rows])
+                result[f"tactile_{name}_event_count"] = _transition_count(flags)
+                result[f"tactile_{name}_duration_s"] = _flag_duration(stamps, flags)
+            for name, predicate in (
+                ("invalid", lambda row: not bool(row["valid"])),
+                ("stale", lambda row: float(row["data_age_s"]) > float(self.project_config["safety"]["tactile_timeout"])),
+            ):
+                flags = np.asarray([predicate(row) for row in tactile_rows])
+                stamps = np.asarray([float(row["timestamp_s"]) for row in tactile_rows])
+                result[f"tactile_{name}_event_count"] = _transition_count(flags)
+                result[f"tactile_{name}_duration_s"] = _flag_duration(stamps, flags)
+            safety_stamps = np.asarray([float(row["timestamp_s"]) for row in safety_rows])
+            for name, predicate in (
+                ("scaling", lambda row: row["state_name"] == "warning"),
+                ("stop", lambda row: bool(row["emergency_stop"])),
+                ("latch", lambda row: bool(row["fault"])),
+            ):
+                flags = np.asarray([predicate(row) for row in safety_rows])
+                result[f"safety_{name}_event_count"] = _transition_count(flags)
+                result[f"safety_{name}_duration_s"] = _flag_duration(safety_stamps, flags)
+        return result
 
     def _apply_baseline_acceptance(self, summary: dict[str, Any], comparison: dict[str, Any]) -> dict[str, Any]:
         updated = dict(summary)
@@ -2126,7 +2393,9 @@ class ExperimentRecorder:
                 times=backbone_data.timestamps,
                 backbone_points=backbone_data.backbones,
                 tip_points=backbone_data.tip_points,
-                compute_centerline_tracking_rmse=identity["scenario_id"] == "centerline_target",
+                # This is a descriptive geometric metric for every lumen run; it is
+                # independent of whether the selected target lies on the centerline.
+                compute_centerline_tracking_rmse=True,
                 tip_backbone_tolerance=TIP_BACKBONE_CONSISTENCY_TOLERANCE,
             )
         except Exception as exc:
@@ -2353,6 +2622,70 @@ class ExperimentRecorder:
                 ],
                 self._cylinder_rows(),
             )
+        if self.config.diagnostic_data_collection:
+            tactile_safety_rows = self._tactile_safety_rows()
+            write_rows(
+                run_dir / "tactile_safety.csv",
+                TACTILE_SAFETY_CSV_FIELDS,
+                ([row.get(field, "") for field in TACTILE_SAFETY_CSV_FIELDS] for row in tactile_safety_rows),
+            )
+            write_rows(
+                run_dir / "mppi_cost_terms.csv",
+                MPPI_COST_CSV_FIELDS,
+                ([row.get(field, "") for field in MPPI_COST_CSV_FIELDS] for row in self.mppi_diagnostic_records),
+            )
+            write_rows(
+                run_dir / "mppi_computation.csv",
+                MPPI_TIMING_CSV_FIELDS,
+                ([row.get(field, "") for field in MPPI_TIMING_CSV_FIELDS] for row in self.mppi_diagnostic_records),
+            )
+
+    def _tactile_safety_rows(self) -> list[dict[str, Any]]:
+        events = [
+            (float(row["timestamp_s"]), "tactile", row)
+            for row in self.tactile_evidence_records
+        ] + [
+            (float(row["timestamp_s"]), "safety", row)
+            for row in self.safety_evidence_records
+        ]
+        events.sort(key=lambda item: (item[0], item[1]))
+        tactile: dict[str, Any] = {}
+        safety: dict[str, Any] = {}
+        rows: list[dict[str, Any]] = []
+        raw_commands = sorted(self.raw_commands, key=lambda item: item.timestamp)
+        safe_commands = sorted(self.safe_commands, key=lambda item: item.timestamp)
+        for timestamp, kind, event in events:
+            if kind == "tactile":
+                tactile = event
+            else:
+                safety = event
+            raw = _latest_command_at_or_before(raw_commands, timestamp)
+            safe = _latest_command_at_or_before(safe_commands, timestamp)
+            raw_values = np.zeros(6, dtype=float) if raw is None else raw.command
+            safe_values = np.zeros(6, dtype=float) if safe is None else safe.command
+            raw_norm = float(np.linalg.norm(raw_values))
+            safe_norm = float(np.linalg.norm(safe_values))
+            scale = 0.0 if raw_norm <= 1.0e-15 else min(1.0, safe_norm / raw_norm)
+            row: dict[str, Any] = {
+                "timestamp_s": timestamp,
+                "event_type": kind,
+                **tactile,
+                **{f"commanded_u{index}": float(value) for index, value in enumerate(raw_values)},
+                **{f"safe_u{index}": float(value) for index, value in enumerate(safe_values)},
+                "commanded_norm": raw_norm,
+                "safe_norm": safe_norm,
+                "applied_scale": scale,
+                "command_gated": bool(safety) and not bool(safety.get("command_allowed", False)),
+                "safety_state": safety.get("state", ""),
+                "safety_state_name": safety.get("state_name", ""),
+                "safety_command_allowed": safety.get("command_allowed", ""),
+                "safety_emergency_stop": safety.get("emergency_stop", ""),
+                "safety_fault": safety.get("fault", ""),
+                "safety_valid": safety.get("valid", ""),
+                "safety_reason": safety.get("diagnostic_status", ""),
+            }
+            rows.append(row)
+        return rows
 
     def _write_aggregate(self, group_dir: Path) -> None:
         summaries = []
@@ -3134,6 +3467,33 @@ def write_rows(path: Path, fieldnames: list[str], rows: Any) -> None:
                 writer.writerow(row)
 
 
+def _latest_command_at_or_before(
+    commands: list[TimedCommand], timestamp: float
+) -> TimedCommand | None:
+    latest = None
+    for command in commands:
+        if command.timestamp > timestamp:
+            break
+        latest = command
+    return latest
+
+
+def _transition_count(flags: np.ndarray) -> int:
+    values = np.asarray(flags, dtype=bool)
+    if values.size == 0:
+        return 0
+    return int(values[0]) + int(np.sum(values[1:] & ~values[:-1]))
+
+
+def _flag_duration(timestamps: np.ndarray, flags: np.ndarray) -> float:
+    times = np.asarray(timestamps, dtype=float)
+    values = np.asarray(flags, dtype=bool)
+    if times.size < 2 or values.size != times.size:
+        return 0.0
+    dt = np.maximum(0.0, np.diff(times, append=times[-1]))
+    return float(np.sum(dt[values]))
+
+
 def _finite_csv_value(value: Any) -> Any:
     """Serialize unavailable optional numerics as an empty CSV field, never NaN."""
     if isinstance(value, (float, np.floating)) and not math.isfinite(float(value)):
@@ -3160,6 +3520,9 @@ def observed_topics() -> tuple[str, ...]:
         "/ctr/safe_command",
         "/ctr/controller/metrics",
         "/ctr/controller/trajectory_metrics",
+        "/ctr/evaluation/mppi_diagnostics",
+        "/ctr/tactile/state",
+        "/ctr/safety/status",
         "/diagnostics",
     )
 

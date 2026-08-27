@@ -56,6 +56,7 @@ class EvaluationNode(Node):
         self.declare_parameter("run_role", "")
         self.declare_parameter("slice_7g_profile", False)
         self.declare_parameter("development_simulation", False)
+        self.declare_parameter("evaluation_diagnostics_enabled", False)
 
         config_paths = validate_config_paths(self.get_parameter("config_paths").value)
         raw_config = load_parameter_files(config_paths)
@@ -73,6 +74,11 @@ class EvaluationNode(Node):
         development_enabled = _bool_value(
             self.get_parameter("development_simulation").value
         )
+        diagnostics_enabled = _bool_value(
+            self.get_parameter("evaluation_diagnostics_enabled").value
+        )
+        if diagnostics_enabled and not development_enabled:
+            raise ValueError("evaluation diagnostics require explicit development_simulation mode")
         self.project_config = (
             apply_slice_7g_development_simulation_profile(
                 self.project_config, enabled=True
@@ -86,6 +92,9 @@ class EvaluationNode(Node):
         output_root = str(self.get_parameter("output_root").value or "")
         if output_root:
             self.project_config.setdefault("evaluation", {})["output_root"] = output_root
+        self.project_config.setdefault("evaluation", {})[
+            "diagnostic_data_collection"
+        ] = diagnostics_enabled
         validate_or_raise(self.project_config)
 
         self.recorder = ExperimentRecorder(
@@ -131,6 +140,12 @@ class EvaluationNode(Node):
             lambda msg: self.recorder.record_topic("/ctr/controller/trajectory_metrics"),
             10,
         )
+        self.mppi_evaluation_diagnostics_sub = self.create_subscription(
+            DiagnosticArray,
+            "/ctr/evaluation/mppi_diagnostics",
+            self._on_mppi_evaluation_diagnostics,
+            10,
+        )
         self.diagnostics_sub = self.create_subscription(
             DiagnosticArray,
             "/diagnostics",
@@ -140,19 +155,13 @@ class EvaluationNode(Node):
         self.tactile_sub = self.create_subscription(
             CtrTactileState,
             "/ctr/tactile/state",
-            lambda msg: self.recorder.record_slice_7g_tactile(
-                valid=bool(msg.valid), source=str(msg.source),
-            ),
+            self._on_tactile,
             10,
         )
         self.safety_status_sub = self.create_subscription(
             CtrSafetyStatus,
             "/ctr/safety/status",
-            lambda msg: self.recorder.record_slice_7g_safety(
-                valid=bool(msg.valid),
-                fault=bool(msg.fault),
-                emergency_stop=bool(msg.emergency_stop),
-            ),
+            self._on_safety_status,
             10,
         )
 
@@ -262,6 +271,58 @@ class EvaluationNode(Node):
             timestamp=stamp_seconds(msg.header.stamp),
             solve_time=msg.solve_time,
             saturated=bool(msg.command_saturated),
+        )
+
+    def _on_mppi_evaluation_diagnostics(self, msg: DiagnosticArray) -> None:
+        if len(msg.status) != 1:
+            self.recorder.record_invalid_mppi_diagnostic()
+            return
+        status = msg.status[0]
+        if status.name != "ctr_mppi_evaluation_iteration_v1":
+            self.recorder.record_invalid_mppi_diagnostic()
+            return
+        values = {item.key: item.value for item in status.values}
+        if len(values) != len(status.values):
+            self.recorder.record_invalid_mppi_diagnostic()
+            return
+        self.recorder.record_mppi_diagnostic(
+            timestamp=stamp_seconds(msg.header.stamp),
+            values=values,
+        )
+
+    def _on_tactile(self, msg: CtrTactileState) -> None:
+        self.recorder.record_slice_7g_tactile(valid=bool(msg.valid), source=str(msg.source))
+        self.recorder.record_tactile_evidence(
+            timestamp=stamp_seconds(msg.header.stamp),
+            received_timestamp=self._now_seconds(),
+            frame_id=str(msg.header.frame_id),
+            source=str(msg.source),
+            raw_values=list(msg.raw_values),
+            filtered_values=list(msg.filtered_values),
+            force_magnitude=float(msg.force_magnitude),
+            clearance_m=float(msg.clearance_m),
+            contact=bool(msg.contact),
+            warning=bool(msg.warning),
+            stop=bool(msg.stop),
+            valid=bool(msg.valid),
+            region=int(msg.region),
+        )
+
+    def _on_safety_status(self, msg: CtrSafetyStatus) -> None:
+        self.recorder.record_slice_7g_safety(
+            valid=bool(msg.valid),
+            fault=bool(msg.fault),
+            emergency_stop=bool(msg.emergency_stop),
+        )
+        self.recorder.record_safety_evidence(
+            timestamp=stamp_seconds(msg.header.stamp),
+            state=int(msg.state),
+            state_name=str(msg.state_name),
+            command_allowed=bool(msg.command_allowed),
+            emergency_stop=bool(msg.emergency_stop),
+            fault=bool(msg.fault),
+            valid=bool(msg.valid),
+            diagnostic_status=str(msg.diagnostic_status),
         )
 
     def _now_seconds(self) -> float:

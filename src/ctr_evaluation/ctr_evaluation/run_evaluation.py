@@ -271,6 +271,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--require-improvement", action="store_true")
     parser.add_argument("--require-sampled-reachable", action="store_true")
     parser.add_argument("--output-root", default="")
+    parser.add_argument(
+        "--paper-diagnostics",
+        action="store_true",
+        help="Record evaluation-only MPPI cost/timing and tactile/safety evidence.",
+    )
     parser.add_argument("--config-path", action="append", default=[])
     parser.add_argument(
         "--development-target-source",
@@ -523,7 +528,7 @@ class EvaluationOrchestrator:
             )
         self.slice_7g_profile_enabled = self.slice_7g_governed or self.development_simulation
         if self.slice_7g_profile_enabled:
-            if not is_curved_lumen_task(args.task):
+            if self.slice_7g_governed and not is_curved_lumen_task(args.task):
                 raise OrchestrationError("Slice 7G simulation profile requires curved_lumen_navigation")
             self.project_config = (
                 apply_slice_7g_development_simulation_profile(
@@ -692,6 +697,9 @@ class EvaluationOrchestrator:
                 development_target_frame=getattr(
                     self, "development_target_frame", "base_link"
                 ),
+                evaluation_diagnostics_enabled=bool(
+                    getattr(self.args, "paper_diagnostics", False)
+                ),
             )
             records.append(self.process_manager.start(role=f"{role}_base", command=base_command, env=env))
             monitor = RosRunMonitor(domain_id=domain_id, slice_7g_governed=self.slice_7g_profile_enabled)
@@ -783,7 +791,7 @@ class EvaluationOrchestrator:
                         env=env,
                     )
                 )
-            else:
+            elif not self._uses_target_selector_transport():
                 reference_command = self._reference_command(reference_epoch)
                 records.append(
                     self.process_manager.start(
@@ -1287,6 +1295,12 @@ class EvaluationOrchestrator:
             and getattr(self, "development_target_source", "profile") == "rviz"
         )
 
+    def _uses_target_selector_transport(self) -> bool:
+        return bool(
+            getattr(self, "development_simulation", False)
+            and getattr(self, "development_target_source", "profile") in {"cli", "rviz"}
+        )
+
     def _rviz_candidate_command(self) -> list[str]:
         if not self._uses_rviz_target_transport() or self.development_raw_target is None:
             raise OrchestrationError("RViz target candidate requested outside automated RViz evaluation")
@@ -1337,7 +1351,7 @@ class EvaluationOrchestrator:
     def _controller_command(self) -> list[str]:
         reference_mode = (
             "external_target"
-            if self._uses_rviz_target_transport()
+            if self._uses_target_selector_transport()
             else reference_mode_for_task(self.args.task)
         )
         command = [
@@ -1355,6 +1369,10 @@ class EvaluationOrchestrator:
             command.append("slice_7g_profile:=true")
         if bool(getattr(self, "development_simulation", False)):
             command.append("development_simulation:=true")
+        if bool(getattr(self.args, "paper_diagnostics", False)):
+            if not bool(getattr(self, "development_simulation", False)):
+                raise OrchestrationError("paper diagnostics require development simulation")
+            command.append("evaluation_diagnostics_enabled:=true")
         if is_fixed_target_task(self.args.task):
             command.extend(self._fixed_target_launch_arguments())
         return command
@@ -2603,6 +2621,7 @@ def build_base_simulation_command(
     development_target_source: str = "profile",
     development_raw_target: list[float] | None = None,
     development_target_frame: str = "base_link",
+    evaluation_diagnostics_enabled: bool = False,
 ) -> list[str]:
     command = [
         "ros2",
@@ -2648,8 +2667,26 @@ def build_base_simulation_command(
                     f"target_z:={float(raw[2]):.17g}",
                 ]
             )
+        elif development_target_source == "cli":
+            target = target_position or []
+            if len(target) != 3 or not all(math.isfinite(value) for value in target):
+                raise OrchestrationError("CLI evaluation launch requires a finite target")
+            command.extend(
+                [
+                    "reference_mode:=external_target",
+                    "target_source:=cli",
+                    "wait_for_target:=false",
+                    f"target_x:={float(target[0]):.17g}",
+                    f"target_y:={float(target[1]):.17g}",
+                    f"target_z:={float(target[2]):.17g}",
+                ]
+            )
         elif development_target_source not in {"profile", "cli"}:
             raise OrchestrationError("development target source is invalid")
+    if evaluation_diagnostics_enabled:
+        if not development_simulation:
+            raise OrchestrationError("paper diagnostics require development simulation")
+        command.append("evaluation_diagnostics_enabled:=true")
     if output_root is not None:
         command.append(f"evaluation_output_root:={output_root}")
     if task == TASK_CYLINDER_NAVIGATION:

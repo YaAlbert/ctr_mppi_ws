@@ -303,7 +303,8 @@ class ReportGeneratorTest(unittest.TestCase):
                 plot_paths=[],
             )
             text = report.read_text(encoding="utf-8")
-            self.assertIn("Development Target Selection", text)
+            self.assertIn("## Target Selection", text)
+            self.assertNotIn("Development Target Selection", text)
             self.assertIn("target_source: `rviz`", text)
             self.assertIn("validated_target_m: `[0.02, 0.0, 0.08]`", text)
             self.assertIn("reference_pose_count: `1`", text)
@@ -328,6 +329,60 @@ class ReportGeneratorTest(unittest.TestCase):
             text = report.read_text(encoding="utf-8")
             self.assertIn("Comparison is not valid; improvement was not evaluated.", text)
             self.assertNotIn("candidate improved", text.lower())
+
+    def test_diagnostic_plot_set_is_complete_and_neutrally_named(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            with (run_dir / "tactile_safety.csv").open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=(
+                    "timestamp_s", "raw_force_n", "filtered_force_n", "contact_on_n",
+                    "warning_on_n", "stop_on_n", "applied_scale", "safety_state",
+                ))
+                writer.writeheader()
+                writer.writerow({"timestamp_s": 1.0, "raw_force_n": 0.1, "filtered_force_n": 0.09,
+                                 "contact_on_n": 0.1, "warning_on_n": 0.3, "stop_on_n": 0.5,
+                                 "applied_scale": 1.0, "safety_state": 1})
+            cost_fields = ["timestamp_s", "weighted.stage_tip_target", "weighted.control_effort"]
+            with (run_dir / "mppi_cost_terms.csv").open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=cost_fields)
+                writer.writeheader()
+                writer.writerow({"timestamp_s": 1.0, "weighted.stage_tip_target": 1.0,
+                                 "weighted.control_effort": 0.2})
+            timing_fields = ["timestamp_s", "timing.sampling_s", "timing.rollout_propagation_s",
+                             "timing.solve_total_s", "ros_message_conversion_s"]
+            with (run_dir / "mppi_computation.csv").open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=timing_fields)
+                writer.writeheader()
+                writer.writerow({"timestamp_s": 1.0, "timing.sampling_s": 0.001,
+                                 "timing.rollout_propagation_s": 0.01,
+                                 "timing.solve_total_s": 0.02, "ros_message_conversion_s": 0.0001})
+            names = plot_artifact_names(run_dir, include_diagnostic_plots=True)
+            registry = plot_producer_registry(
+                run_dir, [sample(0.0)],
+                {"configuration": {"configured_control_period": 0.05}},
+                include_diagnostic_plots=True,
+            )
+            expected = {
+                "tactile_safety_response_plot", "cost_term_breakdown_plot",
+                "mppi_computation_breakdown_plot", "deadline_analysis_plot",
+            }
+            self.assertTrue(expected.issubset(names))
+            paths = [registry[name](run_dir) for name in expected]
+            self.assertTrue(all(path.is_file() and path.stat().st_size > 0 for path in paths))
+
+    def test_generated_publication_headings_reject_stage_and_branch_language(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report = generate_report(
+                run_dir=Path(temp_dir),
+                metadata={"git": {"short_commit": "abc", "branch": "feature/example", "dirty": False},
+                          "development_simulation": True},
+                summary={"acceptance": {"reasons": []}},
+                comparison=None,
+                plot_paths=[],
+            )
+            text = report.read_text(encoding="utf-8").lower()
+            for forbidden in ("slice 7g", "slice_7g", "feature/", "pre-merge", "post-merge", "not production evidence"):
+                self.assertNotIn(forbidden, text)
 
     def test_legacy_comparison_without_validity_field_uses_compatibility_fallback(self):
         with tempfile.TemporaryDirectory() as temp_dir:

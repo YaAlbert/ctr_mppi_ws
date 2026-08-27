@@ -19,8 +19,19 @@ from .cost_functions import (
     terminal_tip_cost,
     tip_tracking_cost,
 )
-from .lumen_geometry import LumenCostWeights, LumenGeometry, compute_lumen_cost
-from .tactile_cost import TactileCostConfig, TactileSnapshot, tactile_cost_value
+from .lumen_geometry import (
+    LumenCostBreakdown,
+    LumenCostWeights,
+    LumenGeometry,
+    compute_lumen_cost,
+    compute_lumen_cost_breakdown,
+)
+from .tactile_cost import (
+    TactileCostConfig,
+    TactileSnapshot,
+    tactile_cost_raw_value,
+    tactile_cost_value,
+)
 
 
 REQUIRED_WEIGHT_KEYS = (
@@ -138,6 +149,17 @@ class MPPIResult:
     tactile_force_magnitude_n: float = 0.0
     tactile_minimum_predicted_clearance_m: float = float("nan")
     tactile_cost: float = 0.0
+    evaluation_diagnostics: "MPPIEvaluationDiagnostics | None" = None
+
+
+@dataclass(frozen=True)
+class MPPIEvaluationDiagnostics:
+    """Evaluation-only evidence for one optimizer iteration."""
+
+    best_raw_terms: dict[str, float]
+    best_weighted_terms: dict[str, float]
+    weighted_mean_terms: dict[str, float]
+    timings_s: dict[str, float]
 
 
 @dataclass(frozen=True)
@@ -148,6 +170,9 @@ class MPPIRollout:
     command_saturated: bool
     tactile_cost: float = 0.0
     minimum_predicted_clearance_m: float = float("nan")
+    raw_terms: dict[str, float] | None = None
+    weighted_terms: dict[str, float] | None = None
+    timings_s: dict[str, float] | None = None
 
 
 class MPPICore:
@@ -160,6 +185,7 @@ class MPPICore:
         *,
         lumen_geometry: LumenGeometry | None = None,
         lumen_cost_weights: LumenCostWeights | None = None,
+        evaluation_diagnostics_enabled: bool = False,
     ):
         self._config = config
         self._model = model
@@ -186,6 +212,7 @@ class MPPICore:
         self.last_rollout_final_q = np.zeros((0, self.control_dimension), dtype=float)
         self.lumen = lumen_geometry
         self.lumen_cost_weights = None
+        self.evaluation_diagnostics_enabled = bool(evaluation_diagnostics_enabled)
         if self.lumen is not None:
             self.lumen_cost_weights = lumen_cost_weights or LumenCostWeights.from_config(config)
         self.tactile_cost_config = TactileCostConfig.from_project_config(config)
@@ -244,8 +271,12 @@ class MPPICore:
         minimum_predicted_clearance_m = float("inf")
         command_saturated = False
         final_model_result = None
+        raw_terms = _empty_cost_terms() if self.evaluation_diagnostics_enabled else None
+        weighted_terms = _empty_cost_terms() if self.evaluation_diagnostics_enabled else None
+        timings = _empty_timing_terms() if self.evaluation_diagnostics_enabled else None
 
         for step_index, command in enumerate(sequence_array):
+            propagation_start = perf_counter()
             clipped_command = np.clip(command, -self.velocity_max, self.velocity_max)
             next_q_unclipped = q + self.dt * clipped_command
             q = np.clip(next_q_unclipped, self.q_min, self.q_max)
@@ -253,25 +284,61 @@ class MPPICore:
             command_saturated = command_saturated or not np.allclose(next_q_unclipped, q)
 
             model_result = self._validated_model_result(q)
+            if timings is not None:
+                timings["rollout_propagation_s"] += perf_counter() - propagation_start
             final_model_result = model_result
-            total += self._weight("tip") * tip_tracking_cost(model_result.tip_position, reference_sequence[step_index])
-            total += self._weight("control") * control_magnitude_cost(clipped_command)
-            total += self._weight("smoothness") * control_smoothness_cost(clipped_command, previous)
-            total += self._lumen_cost(model_result.backbone_points, terminal=False)
+            cost_start = perf_counter()
+            tip_raw = tip_tracking_cost(model_result.tip_position, reference_sequence[step_index])
+            control_raw = control_magnitude_cost(clipped_command)
+            smoothness_raw = control_smoothness_cost(clipped_command, previous)
+            tip_weighted = self._weight("tip") * tip_raw
+            control_weighted = self._weight("control") * control_raw
+            smoothness_weighted = self._weight("smoothness") * smoothness_raw
+            total += tip_weighted
+            total += control_weighted
+            total += smoothness_weighted
+            if raw_terms is not None and weighted_terms is not None:
+                raw_terms["stage_tip_target"] += tip_raw
+                raw_terms["control_effort"] += control_raw
+                raw_terms["control_rate"] += smoothness_raw
+                weighted_terms["stage_tip_target"] += tip_weighted
+                weighted_terms["control_effort"] += control_weighted
+                weighted_terms["control_rate"] += smoothness_weighted
+            if timings is not None:
+                timings["target_control_cost_s"] += perf_counter() - cost_start
+            lumen_start = perf_counter()
+            lumen_breakdown = self._lumen_cost_breakdown(model_result.backbone_points, terminal=False)
+            total += lumen_breakdown.weighted_total
+            if raw_terms is not None and weighted_terms is not None:
+                self._accumulate_lumen_terms(raw_terms, weighted_terms, lumen_breakdown)
+            if timings is not None:
+                timings["lumen_cost_s"] += perf_counter() - lumen_start
             total += shape_tracking_cost(enabled=self._weight("shape") > 0.0)
             total += obstacle_cost(enabled=self._weight("obstacle") > 0.0)
             predicted_clearance_m = None
             if tactile_snapshot is not None and self.lumen is not None:
                 predicted_clearance_m = float(self.lumen.point_clearance(model_result.tip_position).physical_clearance)
                 minimum_predicted_clearance_m = min(minimum_predicted_clearance_m, predicted_clearance_m)
+            tactile_start = perf_counter()
+            tactile_enabled = tactile_snapshot is not None and self.tactile_cost_config.enabled
             tactile_value = tactile_cost_value(
-                enabled=tactile_snapshot is not None and self.tactile_cost_config.enabled,
+                enabled=tactile_enabled,
                 snapshot=tactile_snapshot,
                 predicted_clearance_m=predicted_clearance_m,
                 config=self.tactile_cost_config,
             )
             tactile_total += tactile_value
             total += tactile_value
+            if raw_terms is not None and weighted_terms is not None:
+                raw_terms["tactile"] += tactile_cost_raw_value(
+                    enabled=tactile_enabled,
+                    snapshot=tactile_snapshot,
+                    predicted_clearance_m=predicted_clearance_m,
+                    config=self.tactile_cost_config,
+                )
+                weighted_terms["tactile"] += tactile_value
+            if timings is not None:
+                timings["tactile_cost_s"] += perf_counter() - tactile_start
             total += stability_cost(enabled=self._weight("stability") > 0.0)
             previous = clipped_command
 
@@ -281,8 +348,22 @@ class MPPICore:
         # state. Reuse it for terminal costs instead of repeating kinematics.
         terminal_result = final_model_result
         terminal = terminal_result.tip_position
-        total += self._weight("terminal") * terminal_tip_cost(terminal, reference_sequence[-1])
-        total += self._lumen_cost(terminal_result.backbone_points, terminal=True)
+        terminal_start = perf_counter()
+        terminal_raw = terminal_tip_cost(terminal, reference_sequence[-1])
+        terminal_weighted = self._weight("terminal") * terminal_raw
+        total += terminal_weighted
+        if raw_terms is not None and weighted_terms is not None:
+            raw_terms["terminal_target"] += terminal_raw
+            weighted_terms["terminal_target"] += terminal_weighted
+        if timings is not None:
+            timings["target_control_cost_s"] += perf_counter() - terminal_start
+        lumen_start = perf_counter()
+        terminal_lumen = self._lumen_cost_breakdown(terminal_result.backbone_points, terminal=True)
+        total += terminal_lumen.weighted_total
+        if raw_terms is not None and weighted_terms is not None:
+            self._accumulate_lumen_terms(raw_terms, weighted_terms, terminal_lumen)
+        if timings is not None:
+            timings["lumen_cost_s"] += perf_counter() - lumen_start
         if not np.isfinite(total):
             raise ValueError("rollout cost is not finite")
         return MPPIRollout(
@@ -296,6 +377,9 @@ class MPPICore:
                 if math.isfinite(minimum_predicted_clearance_m)
                 else float("nan")
             ),
+            raw_terms=raw_terms,
+            weighted_terms=weighted_terms,
+            timings_s=timings,
         )
 
     def normalized_importance_weights(self, costs: np.ndarray) -> np.ndarray:
@@ -334,13 +418,22 @@ class MPPICore:
         elif not self.warm_start:
             self.nominal_sequence.fill(0.0)
 
+        sample_start = perf_counter()
         perturbations = self.sample_control_noise()
         candidate_sequences = self.candidate_sequences(perturbations)
+        sampling_s = perf_counter() - sample_start
 
         costs = np.zeros(self.num_samples, dtype=float)
         tactile_costs = np.zeros(self.num_samples, dtype=float)
         minimum_clearances = np.full(self.num_samples, np.nan, dtype=float)
         final_q = np.zeros((self.num_samples, self.control_dimension), dtype=float)
+        raw_term_arrays = {
+            name: np.zeros(self.num_samples, dtype=float) for name in _empty_cost_terms()
+        } if self.evaluation_diagnostics_enabled else None
+        weighted_term_arrays = {
+            name: np.zeros(self.num_samples, dtype=float) for name in _empty_cost_terms()
+        } if self.evaluation_diagnostics_enabled else None
+        rollout_timings = _empty_timing_terms() if self.evaluation_diagnostics_enabled else None
         for sample_index in range(self.num_samples):
             rollout = self.rollout_candidate(
                 q0=q0,
@@ -353,9 +446,18 @@ class MPPICore:
             tactile_costs[sample_index] = rollout.tactile_cost
             minimum_clearances[sample_index] = rollout.minimum_predicted_clearance_m
             final_q[sample_index] = rollout.final_q
+            if raw_term_arrays is not None and weighted_term_arrays is not None:
+                for name in raw_term_arrays:
+                    raw_term_arrays[name][sample_index] = float(rollout.raw_terms[name])
+                    weighted_term_arrays[name][sample_index] = float(rollout.weighted_terms[name])
+                for name in rollout_timings:
+                    rollout_timings[name] += float(rollout.timings_s[name])
 
+        normalization_start = perf_counter()
         normalized = self.normalized_importance_weights(costs)
+        weight_normalization_s = perf_counter() - normalization_start
 
+        update_start = perf_counter()
         self.nominal_sequence = np.tensordot(normalized, candidate_sequences, axes=(0, 0))
         if not np.all(np.isfinite(self.nominal_sequence)):
             raise ValueError("updated nominal control sequence contains non-finite values")
@@ -363,6 +465,7 @@ class MPPICore:
         command = np.clip(command_unclipped, -self.velocity_max, self.velocity_max)
         command_saturated = not np.allclose(command_unclipped, command)
         self.nominal_sequence[0] = command
+        control_update_s = perf_counter() - update_start
 
         self.last_candidate_sequences = candidate_sequences.copy()
         self.last_costs = costs.copy()
@@ -384,6 +487,26 @@ class MPPICore:
         )
         tactile_region = int(tactile_snapshot.region) if tactile_snapshot is not None else 0
         tactile_force = float(tactile_snapshot.force_magnitude_n) if tactile_snapshot is not None else 0.0
+        evaluation_diagnostics = None
+        if raw_term_arrays is not None and weighted_term_arrays is not None and rollout_timings is not None:
+            best_index = int(np.argmin(costs))
+            timings = dict(rollout_timings)
+            timings.update(
+                {
+                    "sampling_s": sampling_s,
+                    "weight_normalization_s": weight_normalization_s,
+                    "control_update_s": control_update_s,
+                    "solve_total_s": solve_time,
+                }
+            )
+            evaluation_diagnostics = MPPIEvaluationDiagnostics(
+                best_raw_terms={name: float(values[best_index]) for name, values in raw_term_arrays.items()},
+                best_weighted_terms={name: float(values[best_index]) for name, values in weighted_term_arrays.items()},
+                weighted_mean_terms={
+                    name: float(np.dot(normalized, values)) for name, values in weighted_term_arrays.items()
+                },
+                timings_s=timings,
+            )
         return MPPIResult(
             command=command,
             nominal_sequence=self.nominal_sequence.copy(),
@@ -400,6 +523,7 @@ class MPPICore:
             tactile_force_magnitude_n=tactile_force,
             tactile_minimum_predicted_clearance_m=self.last_tactile_minimum_predicted_clearance_m,
             tactile_cost=self.last_tactile_cost,
+            evaluation_diagnostics=evaluation_diagnostics,
         )
 
     def _rollout_cost(
@@ -481,6 +605,38 @@ class MPPICore:
             terminal=terminal,
         )
 
+    def _lumen_cost_breakdown(self, backbone_points: np.ndarray, *, terminal: bool) -> LumenCostBreakdown:
+        if self.lumen is None or self.lumen_cost_weights is None:
+            return LumenCostBreakdown(0.0, 0.0, 0.0, 0.0, 0.0)
+        if all(value == 0.0 for value in vars(self.lumen_cost_weights).values()):
+            return LumenCostBreakdown(0.0, 0.0, 0.0, 0.0, 0.0)
+        return compute_lumen_cost_breakdown(
+            lumen=self.lumen,
+            weights=self.lumen_cost_weights,
+            backbone_points=backbone_points,
+            terminal=terminal,
+        )
+
+    def _accumulate_lumen_terms(
+        self,
+        raw_terms: dict[str, float],
+        weighted_terms: dict[str, float],
+        breakdown: LumenCostBreakdown,
+    ) -> None:
+        weights = self.lumen_cost_weights
+        if weights is None:
+            return
+        raw_terms["safety_margin"] += breakdown.safety_margin_raw
+        raw_terms["wall_collision"] += breakdown.wall_collision_raw
+        raw_terms["end_cap_collision"] += breakdown.end_cap_collision_raw
+        raw_terms["terminal_lumen"] += breakdown.terminal_collision_raw
+        weighted_terms["safety_margin"] += weights.safety_margin_weight * breakdown.safety_margin_raw
+        weighted_terms["wall_collision"] += weights.radial_collision_weight * breakdown.wall_collision_raw
+        weighted_terms["end_cap_collision"] += weights.end_cap_weight * breakdown.end_cap_collision_raw
+        weighted_terms["terminal_lumen"] += (
+            weights.terminal_collision_weight * breakdown.terminal_collision_raw
+        )
+
     def _diagnostic_status(self) -> str:
         costs = "tip/control/smoothness/terminal"
         if self.lumen is not None:
@@ -499,6 +655,29 @@ class MPPICore:
 
 def _array(values: Any, label: str, size: int) -> np.ndarray:
     return _array_shape(values, label, (size,))
+
+
+def _empty_cost_terms() -> dict[str, float]:
+    return {
+        "stage_tip_target": 0.0,
+        "terminal_target": 0.0,
+        "control_effort": 0.0,
+        "control_rate": 0.0,
+        "safety_margin": 0.0,
+        "wall_collision": 0.0,
+        "end_cap_collision": 0.0,
+        "terminal_lumen": 0.0,
+        "tactile": 0.0,
+    }
+
+
+def _empty_timing_terms() -> dict[str, float]:
+    return {
+        "rollout_propagation_s": 0.0,
+        "target_control_cost_s": 0.0,
+        "lumen_cost_s": 0.0,
+        "tactile_cost_s": 0.0,
+    }
 
 
 def _array_shape(values: Any, label: str, shape: tuple[int, ...]) -> np.ndarray:

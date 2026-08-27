@@ -856,10 +856,11 @@ class LumenRecorderIntegrationTest(unittest.TestCase):
                 self.assertEqual(progress.mean_tip_radial_offset, serialized_progress["mean_radial_offset_m"])
                 self.assertEqual(progress.rms_tip_radial_offset, serialized_progress["rms_radial_offset_m"])
                 self.assertEqual(progress.final_local_lumen_radius, serialized_progress["final_local_radius_m"])
-                if scenario_id == CENTERLINE_TARGET:
-                    self.assertIsNotNone(serialized_progress["centerline_tracking_rmse_m"])
-                else:
-                    self.assertIsNone(serialized_progress["centerline_tracking_rmse_m"])
+                self.assertIsNotNone(serialized_progress["centerline_tracking_rmse_m"])
+                self.assertEqual(
+                    progress.rms_tip_radial_offset,
+                    serialized_progress["centerline_tracking_rmse_m"],
+                )
                 self.assertEqual(
                     bool(summary["navigation"]["goal_success"] and summary["navigation"]["physical_safety_pass"]),
                     summary["navigation"]["navigation_success"],

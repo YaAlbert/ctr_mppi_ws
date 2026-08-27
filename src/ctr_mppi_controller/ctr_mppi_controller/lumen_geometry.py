@@ -159,6 +159,17 @@ class LumenCostWeights:
         )
 
 
+@dataclass(frozen=True)
+class LumenCostBreakdown:
+    """Unweighted lumen terms plus their exact weighted total."""
+
+    safety_margin_raw: float
+    wall_collision_raw: float
+    end_cap_collision_raw: float
+    terminal_collision_raw: float
+    weighted_total: float
+
+
 def make_backbone_clearance(
     *,
     points: np.ndarray,
@@ -238,6 +249,23 @@ def compute_lumen_cost(
     backbone_points: Any,
     terminal: bool = False,
 ) -> float:
+    return compute_lumen_cost_breakdown(
+        lumen=lumen,
+        weights=weights,
+        backbone_points=backbone_points,
+        terminal=terminal,
+    ).weighted_total
+
+
+def compute_lumen_cost_breakdown(
+    *,
+    lumen: LumenGeometry,
+    weights: LumenCostWeights,
+    backbone_points: Any,
+    terminal: bool = False,
+) -> LumenCostBreakdown:
+    """Return the exact component values used by :func:`compute_lumen_cost`."""
+
     clearance = lumen.backbone_clearance(backbone_points)
     _validate_clearance_arrays(clearance)
     denominator = max(float(lumen.safety_margin), 1.0e-12)
@@ -246,18 +274,29 @@ def compute_lumen_cost(
     inlet = clearance.inlet_penetrations / denominator
     outlet = clearance.outlet_penetrations / denominator
     end_cap = clearance.end_cap_penetrations / denominator
+    safety_margin_raw = float(np.mean(soft**2))
+    wall_collision_raw = float(np.mean(wall**2))
+    end_cap_collision_raw = float(np.mean(end_cap**2))
+    terminal_collision_raw = 0.0
     cost = (
-        weights.safety_margin_weight * float(np.mean(soft**2))
-        + weights.radial_collision_weight * float(np.mean(wall**2))
-        + weights.end_cap_weight * float(np.mean(end_cap**2))
+        weights.safety_margin_weight * safety_margin_raw
+        + weights.radial_collision_weight * wall_collision_raw
+        + weights.end_cap_weight * end_cap_collision_raw
     )
     if terminal and clearance.points.shape[0] > 0:
         terminal_violation = max(float(np.max(wall)), float(np.max(inlet)), float(np.max(outlet)))
         if terminal_violation > 0.0:
-            cost += weights.terminal_collision_weight * terminal_violation**2
+            terminal_collision_raw = terminal_violation**2
+            cost += weights.terminal_collision_weight * terminal_collision_raw
     if not math.isfinite(cost):
         raise ValueError("lumen cost is not finite")
-    return float(cost)
+    return LumenCostBreakdown(
+        safety_margin_raw=safety_margin_raw,
+        wall_collision_raw=wall_collision_raw,
+        end_cap_collision_raw=end_cap_collision_raw,
+        terminal_collision_raw=terminal_collision_raw,
+        weighted_total=float(cost),
+    )
 
 
 def _validate_clearance_arrays(clearance: BackboneClearance) -> None:

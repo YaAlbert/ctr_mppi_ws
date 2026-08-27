@@ -31,6 +31,7 @@ setup(
             "compare_results = ctr_evaluation.compare_results:main",
             "ctr_run_evaluation = ctr_evaluation.run_evaluation:main",
             "ctr_run_slice_7g_development = ctr_evaluation.development_simulation:main",
+            "ctr_run_final_system_evaluation = ctr_evaluation.paper_evidence:main",
             "ctr_run_slice_7g_campaign = ctr_evaluation.slice_7g_runtime:main",
         ]
     },

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from time import perf_counter
 import numpy as np
 import rclpy
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
@@ -82,6 +83,7 @@ class MPPIControllerNode(Node):
         self.declare_parameter("mppi_random_seed", -1)
         self.declare_parameter("slice_7g_profile", False)
         self.declare_parameter("development_simulation", False)
+        self.declare_parameter("evaluation_diagnostics_enabled", False)
 
         config_paths = validate_config_paths(self.get_parameter("config_paths").value)
 
@@ -125,6 +127,12 @@ class MPPIControllerNode(Node):
         )
         validate_or_raise(self.config)
         self.slice_7g_profile = self.config.get("runtime", {}).get("slice_7g_profile") is True
+        self.evaluation_diagnostics_enabled = parse_launch_bool(
+            self.get_parameter("evaluation_diagnostics_enabled").value,
+            "evaluation_diagnostics_enabled",
+        )
+        if self.evaluation_diagnostics_enabled and not development_enabled:
+            raise ValueError("evaluation diagnostics require explicit development_simulation mode")
 
         self.model = ApproximateCTRModel(self.config)
         self.lumen_geometry = lumen_geometry_from_config(self.config)
@@ -147,6 +155,7 @@ class MPPIControllerNode(Node):
             self.model,
             lumen_geometry=self.lumen_geometry,
             lumen_cost_weights=lumen_cost_weights_from_config(self.config),
+            evaluation_diagnostics_enabled=self.evaluation_diagnostics_enabled,
         )
         self.latest_state: CtrState | None = None
         self.latest_reference_horizon: np.ndarray | None = None
@@ -183,6 +192,13 @@ class MPPIControllerNode(Node):
             "/ctr/controller/trajectory_metrics",
             10,
         )
+        self.evaluation_diagnostics_pub = None
+        if self.evaluation_diagnostics_enabled:
+            self.evaluation_diagnostics_pub = self.create_publisher(
+                DiagnosticArray,
+                "/ctr/evaluation/mppi_diagnostics",
+                10,
+            )
         self.safe_command_pub = None
         if self.publish_safe_for_sim:
             self.safe_command_pub = self.create_publisher(CtrJointCommand, "/ctr/safe_command", 10)
@@ -430,16 +446,13 @@ class MPPIControllerNode(Node):
             return
 
         stamp = self.get_clock().now().to_msg()
+        conversion_start = perf_counter()
         command_msg = CtrJointCommand()
         command_msg.header.stamp = stamp
         command_msg.header.frame_id = self.frame_id
         command_msg.q_dot = [float(value) for value in result.command]
         command_msg.valid = True
         command_msg.diagnostic_status = result.diagnostic_status
-        self.command_pub.publish(command_msg)
-        if self.safe_command_pub is not None:
-            self.safe_command_pub.publish(command_msg)
-
         metrics = CtrControllerMetrics()
         metrics.header.stamp = stamp
         metrics.header.frame_id = self.frame_id
@@ -451,7 +464,23 @@ class MPPIControllerNode(Node):
         metrics.command_saturated = bool(result.command_saturated)
         metrics.valid = True
         metrics.diagnostic_status = result.diagnostic_status
+        ros_message_conversion_s = perf_counter() - conversion_start
+
+        self.command_pub.publish(command_msg)
+        if self.safe_command_pub is not None:
+            self.safe_command_pub.publish(command_msg)
         self.metrics_pub.publish(metrics)
+        evaluation_diagnostics_pub = getattr(self, "evaluation_diagnostics_pub", None)
+        if evaluation_diagnostics_pub is not None:
+            evaluation_diagnostics_pub.publish(
+                mppi_evaluation_diagnostics_array(
+                    result,
+                    frame_id=self.frame_id,
+                    stamp=stamp,
+                    ros_message_conversion_s=ros_message_conversion_s,
+                    weights=self._diagnostic_weights(),
+                )
+            )
 
         self._update_and_publish_trajectory_metrics(
             current_time_s=current_time_s,
@@ -459,6 +488,25 @@ class MPPIControllerNode(Node):
             result=result,
             reference_kwargs=reference_kwargs,
         )
+
+    def _diagnostic_weights(self) -> dict[str, float]:
+        values = {
+            "stage_tip_target": float(self.core.weights.get("tip", 0.0)),
+            "terminal_target": float(self.core.weights.get("terminal", 0.0)),
+            "control_effort": float(self.core.weights.get("control", 0.0)),
+            "control_rate": float(self.core.weights.get("smoothness", 0.0)),
+            "tactile": float(self.core.tactile_cost_config.tactile_weight),
+        }
+        lumen = self.core.lumen_cost_weights
+        values.update(
+            {
+                "safety_margin": 0.0 if lumen is None else float(lumen.safety_margin_weight),
+                "wall_collision": 0.0 if lumen is None else float(lumen.radial_collision_weight),
+                "end_cap_collision": 0.0 if lumen is None else float(lumen.end_cap_weight),
+                "terminal_lumen": 0.0 if lumen is None else float(lumen.terminal_collision_weight),
+            }
+        )
+        return values
 
     def _update_and_publish_trajectory_metrics(self, *, current_time_s: float, stamp, result, reference_kwargs) -> None:
         if not self.tracking_metrics_config.enabled:
@@ -702,6 +750,60 @@ def trajectory_metrics_diagnostic_array(snapshot, *, frame_id: str, stamp) -> Di
     msg.header.frame_id = frame_id
     msg.status = [status]
     return msg
+
+
+def mppi_evaluation_diagnostics_array(
+    result,
+    *,
+    frame_id: str,
+    stamp,
+    ros_message_conversion_s: float,
+    weights: dict[str, float],
+) -> DiagnosticArray:
+    """Build one closed evaluation-only optimizer diagnostic record."""
+
+    diagnostics = result.evaluation_diagnostics
+    if diagnostics is None:
+        raise ValueError("MPPI evaluation diagnostics are unavailable")
+    status = DiagnosticStatus()
+    status.level = DiagnosticStatus.OK
+    status.name = "ctr_mppi_evaluation_iteration_v1"
+    status.hardware_id = "software_simulation"
+    status.message = "complete"
+    fields: list[tuple[str, object]] = [
+        ("schema_version", "ctr_mppi_evaluation_iteration_v1"),
+        ("valid", True),
+        ("minimum_cost", result.minimum_cost),
+        ("mean_cost", result.mean_cost),
+        ("effective_sample_weight", result.effective_sample_weight),
+        ("ros_message_conversion_s", ros_message_conversion_s),
+    ]
+    for name in sorted(diagnostics.best_raw_terms):
+        fields.append((f"raw.{name}", diagnostics.best_raw_terms[name]))
+        fields.append((f"weighted.{name}", diagnostics.best_weighted_terms[name]))
+        fields.append((f"weighted_mean.{name}", diagnostics.weighted_mean_terms[name]))
+        fields.append((f"weight.{name}", weights[name]))
+    for name in sorted(diagnostics.timings_s):
+        fields.append((f"timing.{name}", diagnostics.timings_s[name]))
+    status.values = [KeyValue(key=key, value=_diagnostic_value(value)) for key, value in fields]
+    message = DiagnosticArray()
+    message.header.stamp = stamp
+    message.header.frame_id = frame_id
+    message.status = [status]
+    return message
+
+
+def _diagnostic_value(value) -> str:
+    if type(value) is bool:
+        return "true" if value else "false"
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        numeric = float(value)
+        if not np.isfinite(numeric):
+            raise ValueError("diagnostic value must be finite")
+        return format(numeric, ".17g")
+    if type(value) is str and value:
+        return value
+    raise ValueError("diagnostic value has an unsupported type")
 
 
 def ros_time_seconds(time_value) -> float:

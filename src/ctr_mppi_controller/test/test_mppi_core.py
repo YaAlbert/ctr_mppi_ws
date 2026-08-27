@@ -575,6 +575,40 @@ class MPPICoreTest(unittest.TestCase):
 
         self.assertAlmostEqual(0.0, rollout.cost)
 
+    def test_evaluation_diagnostics_do_not_change_deterministic_command(self):
+        config = make_test_config()
+        model = ApproximateCTRModel(config)
+        target = model.forward_kinematics(np.zeros(6)).tip_position
+        plain = make_core(config, model)
+        diagnostic = MPPICore(
+            config,
+            model,
+            lumen_geometry=lumen_geometry_from_config(config),
+            lumen_cost_weights=lumen_cost_weights_from_config(config),
+            evaluation_diagnostics_enabled=True,
+        )
+        plain_result = plain.solve(q=np.zeros(6), q_dot=np.zeros(6), target_tip=target)
+        diagnostic_result = diagnostic.solve(q=np.zeros(6), q_dot=np.zeros(6), target_tip=target)
+        self.assertTrue(np.array_equal(plain_result.command, diagnostic_result.command))
+        self.assertTrue(np.array_equal(plain_result.nominal_sequence, diagnostic_result.nominal_sequence))
+        self.assertEqual(plain_result.minimum_cost, diagnostic_result.minimum_cost)
+        self.assertIsNone(plain_result.evaluation_diagnostics)
+        self.assertIsNotNone(diagnostic_result.evaluation_diagnostics)
+        evidence = diagnostic_result.evaluation_diagnostics
+        self.assertEqual(
+            {
+                "stage_tip_target", "terminal_target", "control_effort", "control_rate",
+                "safety_margin", "wall_collision", "end_cap_collision", "terminal_lumen", "tactile",
+            },
+            set(evidence.best_raw_terms),
+        )
+        self.assertAlmostEqual(
+            diagnostic_result.minimum_cost,
+            sum(evidence.best_weighted_terms.values()),
+            places=12,
+        )
+        self.assertGreater(evidence.timings_s["solve_total_s"], 0.0)
+
 
 class ClosedLoopFixedTargetIntegrationTest(unittest.TestCase):
     def test_fixed_target_error_decreases(self):

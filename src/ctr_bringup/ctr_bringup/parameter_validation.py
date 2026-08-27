@@ -823,6 +823,10 @@ def _validate_evaluation(evaluation: Any) -> list[str]:
     ):
         if not isinstance(evaluation.get(key), bool):
             errors.append(f"`evaluation.{key}` must be a boolean.")
+    if "diagnostic_data_collection" in evaluation and not isinstance(
+        evaluation["diagnostic_data_collection"], bool
+    ):
+        errors.append("`evaluation.diagnostic_data_collection` must be a boolean.")
     for key in ("output_root", "experiment_group", "controller_label", "baseline_label", "baseline_result_dir"):
         if key not in evaluation or not isinstance(evaluation[key], str):
             errors.append(f"`evaluation.{key}` must be a string.")

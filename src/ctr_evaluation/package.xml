@@ -13,6 +13,7 @@
   <exec_depend>ctr_model</exec_depend>
   <exec_depend>ctr_mppi_controller</exec_depend>
   <exec_depend>ctr_sim</exec_depend>
+  <exec_depend>ctr_tactile</exec_depend>
   <exec_depend>diagnostic_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>nav_msgs</exec_depend>

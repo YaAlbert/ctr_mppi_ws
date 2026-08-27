@@ -17,6 +17,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
+plt.rcParams.update({"savefig.dpi": 300, "font.size": 9})
+
 from ctr_evaluation.metrics import compute_control_effort_series
 from ctr_evaluation.time_alignment import AlignedSample
 
@@ -38,13 +40,6 @@ def generate_report(
         "# CTR Evaluation Report",
         "",
     ]
-    if metadata.get("development_simulation") is True:
-        lines.extend(
-            [
-                "> **Development simulation only.** This report is not production promotion evidence.",
-                "",
-            ]
-        )
     lines.extend([
         "## Experiment Identity",
         "",
@@ -52,7 +47,6 @@ def generate_report(
         f"- experiment_group: `{metadata.get('experiment_group', '')}`",
         f"- controller_label: `{metadata.get('controller_label', '')}`",
         f"- git_commit: `{metadata.get('git', {}).get('short_commit', '')}`",
-        f"- git_branch: `{metadata.get('git', {}).get('branch', '')}`",
         f"- workspace_dirty: `{metadata.get('git', {}).get('dirty', '')}`",
         f"- ros_domain_id: `{metadata.get('ros_domain_id', '')}`",
         f"- recorder_default_configured_duration_s: `{metadata.get('configured_duration', '')}`",
@@ -78,7 +72,7 @@ def generate_report(
         lines.extend(
             [
                 "",
-                "## Development Target Selection",
+                "## Target Selection",
                 "",
                 f"- target_source: `{target_selection.get('target_source', '')}`",
                 f"- raw_input_point_m: `{target_selection.get('raw_input_point', '')}`",
@@ -215,6 +209,13 @@ _CURVED_LUMEN_PLOT_ARTIFACTS = (
     ("curved_lumen_trajectory_plot", "curved_lumen_trajectory_3d.png"),
 )
 
+_DIAGNOSTIC_PLOT_ARTIFACTS = (
+    ("tactile_safety_response_plot", "tactile_safety_response.png"),
+    ("cost_term_breakdown_plot", "cost_term_breakdown.png"),
+    ("mppi_computation_breakdown_plot", "mppi_computation_breakdown.png"),
+    ("deadline_analysis_plot", "deadline_analysis.png"),
+)
+
 
 def plot_artifact_names(
     run_dir: Path,
@@ -222,6 +223,7 @@ def plot_artifact_names(
     *,
     include_cylinder_plots: bool | None = None,
     include_lumen_plots: bool | None = None,
+    include_diagnostic_plots: bool | None = None,
 ) -> tuple[str, ...]:
     names = [name for name, _ in _BASE_PLOT_ARTIFACTS]
     if include_cylinder_plots is None:
@@ -243,6 +245,15 @@ def plot_artifact_names(
         raise TypeError("include_lumen_plots must be a bool or None")
     if include_lumen_plots:
         names.extend(name for name, _path in _CURVED_LUMEN_PLOT_ARTIFACTS)
+    if include_diagnostic_plots is None:
+        include_diagnostic_plots = all(
+            (run_dir / name).is_file()
+            for name in ("tactile_safety.csv", "mppi_cost_terms.csv", "mppi_computation.csv")
+        )
+    elif type(include_diagnostic_plots) is not bool:
+        raise TypeError("include_diagnostic_plots must be a bool or None")
+    if include_diagnostic_plots:
+        names.extend(name for name, _path in _DIAGNOSTIC_PLOT_ARTIFACTS)
     return tuple(names)
 
 
@@ -256,6 +267,23 @@ def generate_plot_artifact(
     curved_paths = dict(
         (name, run_dir / path) for name, path in _CURVED_LUMEN_PLOT_ARTIFACTS
     )
+    diagnostic_paths = dict(
+        (name, run_dir / path) for name, path in _DIAGNOSTIC_PLOT_ARTIFACTS
+    )
+    if logical_name in diagnostic_paths:
+        path = diagnostic_paths[logical_name]
+        if logical_name == "tactile_safety_response_plot":
+            _tactile_safety_response_plot(path, run_dir / "tactile_safety.csv")
+        elif logical_name == "cost_term_breakdown_plot":
+            _cost_term_breakdown_plot(path, run_dir / "mppi_cost_terms.csv")
+        elif logical_name == "mppi_computation_breakdown_plot":
+            _mppi_computation_breakdown_plot(path, run_dir / "mppi_computation.csv")
+        else:
+            period = None
+            if metadata is not None:
+                period = metadata.get("configuration", {}).get("configured_control_period")
+            _deadline_analysis_plot(path, run_dir / "mppi_computation.csv", period)
+        return path
     if logical_name in curved_paths:
         path = curved_paths[logical_name]
         if logical_name == "curved_wall_clearance_plot":
@@ -384,6 +412,7 @@ def plot_producer_registry(
     *,
     include_cylinder_plots: bool | None = None,
     include_lumen_plots: bool | None = None,
+    include_diagnostic_plots: bool | None = None,
 ) -> dict[str, Any]:
     return {
         name: (
@@ -396,6 +425,7 @@ def plot_producer_registry(
             metadata,
             include_cylinder_plots=include_cylinder_plots,
             include_lumen_plots=include_lumen_plots,
+            include_diagnostic_plots=include_diagnostic_plots,
         )
     }
 
@@ -530,6 +560,133 @@ def _metrics_table(title: str, values: dict[str, Any], description: str | None =
             rendered = _fmt(value)
         lines.append(f"| {key} | {rendered} |")
     return lines
+
+
+def _relative_time(data: dict[str, np.ndarray]) -> np.ndarray:
+    values = data.get("timestamp_s", np.asarray([], dtype=float))
+    finite = values[np.isfinite(values)]
+    return values - finite[0] if finite.size else values
+
+
+def _tactile_safety_response_plot(path: Path, csv_path: Path) -> None:
+    data = _csv_numeric_columns(csv_path)
+    times = _relative_time(data)
+    force = data.get("filtered_force_n", np.asarray([], dtype=float))
+    if times.size == 0 or force.size == 0:
+        _empty_plot(path, "No tactile/safety evidence")
+        return
+    fig, axes = plt.subplots(2, 1, figsize=(7.1, 5.4), sharex=True)
+    axes[0].plot(times, data.get("raw_force_n", force), color="#0072B2", alpha=0.45, label="raw simulated force")
+    axes[0].plot(times, force, color="#D55E00", label="filtered simulated force")
+    for field, label, color in (
+        ("contact_on_n", "contact threshold", "#009E73"),
+        ("warning_on_n", "warning threshold", "#E69F00"),
+        ("stop_on_n", "stop threshold", "#CC79A7"),
+    ):
+        values = data.get(field, np.asarray([], dtype=float))
+        if values.size:
+            axes[0].plot(times, values, linestyle="--", color=color, label=label)
+    axes[0].set_ylabel("force [N]")
+    axes[0].set_title("Tactile and Safety Response")
+    axes[0].legend(loc="best", ncol=2)
+    axes[0].grid(True, alpha=0.25)
+    axes[1].plot(times, data.get("applied_scale", np.zeros_like(times)), color="#009E73", label="applied command scale")
+    axes[1].step(times, data.get("safety_state", np.zeros_like(times)), where="post", color="#CC79A7", label="safety state")
+    axes[1].set_xlabel("time [s]")
+    axes[1].set_ylabel("state / scale [-]")
+    axes[1].set_ylim(-0.1, 4.3)
+    axes[1].legend(loc="best")
+    axes[1].grid(True, alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def _cost_term_breakdown_plot(path: Path, csv_path: Path) -> None:
+    data = _csv_numeric_columns(csv_path)
+    times = _relative_time(data)
+    term_fields = [key for key in data if key.startswith("weighted.")]
+    if times.size == 0 or not term_fields:
+        _empty_plot(path, "No MPPI cost-term evidence")
+        return
+    fig, ax = plt.subplots(figsize=(7.1, 4.4))
+    for field in sorted(term_fields):
+        values = data[field]
+        if np.any(np.abs(np.nan_to_num(values)) > 0.0):
+            ax.plot(times, values, label=field.removeprefix("weighted.").replace("_", " "))
+    ax.set_title("MPPI Cost-Term Breakdown")
+    ax.set_xlabel("time [s]")
+    ax.set_ylabel("weighted cost [-]")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best", ncol=2)
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def _mppi_computation_breakdown_plot(path: Path, csv_path: Path) -> None:
+    data = _csv_numeric_columns(csv_path)
+    times = _relative_time(data)
+    fields = [
+        "timing.sampling_s",
+        "timing.rollout_propagation_s",
+        "timing.target_control_cost_s",
+        "timing.lumen_cost_s",
+        "timing.tactile_cost_s",
+        "timing.weight_normalization_s",
+        "timing.control_update_s",
+        "ros_message_conversion_s",
+    ]
+    if times.size == 0:
+        _empty_plot(path, "No MPPI computation evidence")
+        return
+    fig, ax = plt.subplots(figsize=(7.1, 4.5))
+    for field in fields:
+        values = data.get(field, np.asarray([], dtype=float))
+        if values.size and np.any(np.nan_to_num(values) > 0.0):
+            ax.plot(times, 1000.0 * values, label=field.replace("timing.", "").replace("_s", "").replace("_", " "))
+    ax.set_title("MPPI Computation-Time Breakdown")
+    ax.set_xlabel("time [s]")
+    ax.set_ylabel("component time [ms]")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best", ncol=2)
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def _deadline_analysis_plot(path: Path, csv_path: Path, control_period: Any) -> None:
+    data = _csv_numeric_columns(csv_path)
+    times = _relative_time(data)
+    solve = data.get("timing.solve_total_s", np.asarray([], dtype=float))
+    if times.size == 0 or solve.size == 0:
+        _empty_plot(path, "No deadline evidence")
+        return
+    period = float(control_period) if control_period is not None else math.nan
+    finite = solve[np.isfinite(solve)]
+    misses = int(np.sum(finite > period)) if math.isfinite(period) else 0
+    miss_percentage = 100.0 * misses / finite.size if finite.size else math.nan
+    fig, ax = plt.subplots(figsize=(7.1, 4.4))
+    ax.plot(times, 1000.0 * solve, color="#0072B2", alpha=0.65, label="full solve time")
+    if math.isfinite(period):
+        ax.axhline(1000.0 * period, color="#D55E00", linestyle="--", label="requested control period")
+    ax.set_title("Deadline Analysis")
+    ax.set_xlabel("time [s]")
+    ax.set_ylabel("time [ms]")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best")
+    if finite.size:
+        text = (
+            f"median={1000*np.median(finite):.2f} ms\n"
+            f"P95={1000*np.percentile(finite, 95):.2f} ms\n"
+            f"max={1000*np.max(finite):.2f} ms\n"
+            f"misses={misses}/{finite.size} ({miss_percentage:.1f}%)"
+        )
+        ax.text(0.99, 0.97, text, transform=ax.transAxes, va="top", ha="right", fontsize=8,
+                bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "0.7"})
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
 
 
 def _line_plot(path: Path, x: np.ndarray, series: list[np.ndarray], labels: list[str], title: str, xlabel: str, ylabel: str) -> None:

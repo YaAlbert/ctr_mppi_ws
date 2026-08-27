@@ -177,6 +177,75 @@ def strict_json_load(path: Path):
 
 
 class ExperimentRecorderTest(unittest.TestCase):
+    def test_evaluation_diagnostics_are_preserved_as_raw_csv_and_plots(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = project_config(temp_dir)
+            config["evaluation"]["diagnostic_data_collection"] = True
+            recorder = ExperimentRecorder(
+                config=EvaluationRecorderConfig.from_project_config(config),
+                project_config=config,
+            )
+            recorder.start(experiment_name="paper_diagnostics", monotonic_time=0.0)
+            add_samples(recorder)
+            for timestamp, force, warning in ((0.1, 0.05, False), (0.6, 0.35, True)):
+                recorder.record_tactile_evidence(
+                    timestamp=timestamp,
+                    received_timestamp=timestamp + 0.001,
+                    frame_id="base_link",
+                    source="simulated",
+                    raw_values=[force],
+                    filtered_values=[force],
+                    force_magnitude=force,
+                    clearance_m=0.02,
+                    contact=warning,
+                    warning=warning,
+                    stop=False,
+                    valid=True,
+                    region=2 if warning else 0,
+                )
+                recorder.record_safety_evidence(
+                    timestamp=timestamp,
+                    state=2 if warning else 1,
+                    state_name="warning" if warning else "ready",
+                    command_allowed=True,
+                    emergency_stop=False,
+                    fault=False,
+                    valid=True,
+                    diagnostic_status="eligible_warning" if warning else "eligible_no_contact",
+                )
+                values = {
+                    "schema_version": "ctr_mppi_evaluation_iteration_v1",
+                    "valid": "true",
+                    "minimum_cost": "1.0",
+                    "mean_cost": "2.0",
+                    "effective_sample_weight": "3.0",
+                    "ros_message_conversion_s": "0.0001",
+                    "timing.sampling_s": "0.001",
+                    "timing.rollout_propagation_s": "0.01",
+                    "timing.target_control_cost_s": "0.002",
+                    "timing.lumen_cost_s": "0.003",
+                    "timing.tactile_cost_s": "0.0002",
+                    "timing.weight_normalization_s": "0.0001",
+                    "timing.control_update_s": "0.0001",
+                    "timing.solve_total_s": "0.02",
+                }
+                for name in recorder_module.MPPI_COST_TERM_NAMES:
+                    values[f"raw.{name}"] = "0.1"
+                    values[f"weight.{name}"] = "1.0"
+                    values[f"weighted.{name}"] = "0.1"
+                    values[f"weighted_mean.{name}"] = "0.2"
+                recorder.record_mppi_diagnostic(timestamp=timestamp, values=values)
+            result = recorder.stop(monotonic_time=1.0)
+            expected = {
+                "tactile_safety.csv", "mppi_cost_terms.csv", "mppi_computation.csv",
+                "tactile_safety_response.png", "cost_term_breakdown.png",
+                "mppi_computation_breakdown.png", "deadline_analysis.png",
+            }
+            self.assertTrue(expected.issubset({path.name for path in result.output_files}))
+            self.assertTrue(all((result.run_dir / name).stat().st_size > 0 for name in expected))
+            self.assertTrue(result.summary["paper_metrics"]["diagnostic_data_collection"])
+            self.assertEqual(2, result.summary["paper_metrics"]["solve_sample_count"])
+
     def test_slice_7g_fault_accounting_starts_with_recording_window(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             recorder = make_recorder(temp_dir)

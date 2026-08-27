@@ -141,6 +141,7 @@ def generate_launch_description():
     config_root = LaunchConfiguration("config_root")
     slice_7g_profile = LaunchConfiguration("slice_7g_profile")
     development_simulation = LaunchConfiguration("development_simulation")
+    evaluation_diagnostics_enabled = LaunchConfiguration("evaluation_diagnostics_enabled")
     enable_development_visualization = LaunchConfiguration("enable_development_visualization")
     target_source = LaunchConfiguration("target_source")
     target_x = LaunchConfiguration("target_x")
@@ -320,6 +321,11 @@ def generate_launch_description():
                 description="Explicit non-production user-level Slice 7G workflow.",
             ),
             DeclareLaunchArgument(
+                "evaluation_diagnostics_enabled",
+                default_value="false",
+                description="Enable evaluation-only synchronized diagnostic evidence.",
+            ),
+            DeclareLaunchArgument(
                 "enable_development_visualization",
                 default_value="false",
                 description=(
@@ -449,6 +455,9 @@ def generate_launch_description():
                                 "development_simulation": ParameterValue(
                                     development_simulation, value_type=bool
                                 ),
+                                "evaluation_diagnostics_enabled": ParameterValue(
+                                    evaluation_diagnostics_enabled, value_type=bool
+                                ),
                             }
                         ],
                     )
@@ -477,6 +486,9 @@ def generate_launch_description():
                         "slice_7g_profile": ParameterValue(slice_7g_profile, value_type=bool),
                         "development_simulation": ParameterValue(
                             development_simulation, value_type=bool
+                        ),
+                        "evaluation_diagnostics_enabled": ParameterValue(
+                            evaluation_diagnostics_enabled, value_type=bool
                         ),
                     }
                 ],
@@ -553,6 +565,9 @@ def generate_launch_description():
                         "slice_7g_profile": ParameterValue(slice_7g_profile, value_type=bool),
                         "development_simulation": ParameterValue(
                             development_simulation, value_type=bool
+                        ),
+                        "evaluation_diagnostics_enabled": ParameterValue(
+                            evaluation_diagnostics_enabled, value_type=bool
                         ),
                     }
                 ],

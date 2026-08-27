@@ -63,7 +63,21 @@ def apply_slice_7g_development_simulation_profile(
         raise Slice7GProfileError("development_enabled_type", "enabled must be an exact bool")
     if not enabled:
         return deepcopy(config)
+    requested_curved = bool(config.get("curved_lumen", {}).get("enabled", False))
+    requested_cylinder = bool(config.get("cylindrical_lumen", {}).get("enabled", False))
+    requested_curved_type = str(config.get("curved_lumen", {}).get("type", "circular_arc"))
+    if requested_curved and requested_cylinder:
+        raise Slice7GProfileError("development_geometry", "exactly one lumen geometry may be enabled")
     result = apply_slice_7g_simulation_profile(config, enabled=True)
+    if requested_cylinder:
+        result["cylindrical_lumen"]["enabled"] = True
+        result["curved_lumen"]["enabled"] = False
+    elif requested_curved:
+        if requested_curved_type not in {"circular_arc", "s_curve"}:
+            raise Slice7GProfileError("development_geometry", "unsupported curved lumen type")
+        result["cylindrical_lumen"]["enabled"] = False
+        result["curved_lumen"]["enabled"] = True
+        result["curved_lumen"]["type"] = requested_curved_type
     values = result.get("slice_7g_development_simulation")
     required = {
         "safety_command_timeout_seconds",

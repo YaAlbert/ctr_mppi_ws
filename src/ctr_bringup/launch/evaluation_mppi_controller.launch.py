@@ -42,6 +42,7 @@ def generate_launch_description():
     mppi_random_seed = LaunchConfiguration("mppi_random_seed")
     slice_7g_profile = LaunchConfiguration("slice_7g_profile")
     development_simulation = LaunchConfiguration("development_simulation")
+    evaluation_diagnostics_enabled = LaunchConfiguration("evaluation_diagnostics_enabled")
     cylinder_target_position = ParameterValue(
         [
             [cylinder_target_x],
@@ -123,6 +124,11 @@ def generate_launch_description():
                 default_value="false",
                 description="Explicit non-production user-level Slice 7G workflow.",
             ),
+            DeclareLaunchArgument(
+                "evaluation_diagnostics_enabled",
+                default_value="false",
+                description="Enable evaluation-only MPPI term and timing diagnostics.",
+            ),
             Node(
                 package="ctr_mppi_controller",
                 executable="mppi_controller_node",
@@ -145,6 +151,9 @@ def generate_launch_description():
                         "slice_7g_profile": ParameterValue(slice_7g_profile, value_type=bool),
                         "development_simulation": ParameterValue(
                             development_simulation, value_type=bool
+                        ),
+                        "evaluation_diagnostics_enabled": ParameterValue(
+                            evaluation_diagnostics_enabled, value_type=bool
                         ),
                     }
                 ],

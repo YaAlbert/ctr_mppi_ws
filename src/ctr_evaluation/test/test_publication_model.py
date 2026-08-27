@@ -101,6 +101,9 @@ class PublicationModelTest(unittest.TestCase):
                     "solve_time_plot", "cumulative_control_effort_plot",
                     "curved_wall_clearance_plot", "centerline_tracking_error_plot",
                     "curved_lumen_trajectory_plot",
+                    "tactile_safety_evidence", "mppi_cost_terms", "mppi_computation",
+                    "tactile_safety_response_plot", "cost_term_breakdown_plot",
+                    "mppi_computation_breakdown_plot", "deadline_analysis_plot",
                     "wall_clearance_plot", "cylinder_backbone_target_plot", "comparison",
                     "comparison_report", "report", "orchestration", "finalization_trace",
                     "finalization_error"}

@@ -107,6 +107,7 @@ class SafetySupervisorNode(Node):
         self.declare_parameter("cylinder_target_position", Parameter.Type.DOUBLE_ARRAY)
         self.declare_parameter("slice_7g_profile", False)
         self.declare_parameter("development_simulation", False)
+        self.declare_parameter("evaluation_diagnostics_enabled", False)
         paths = validate_config_paths(self.get_parameter("config_paths").value)
         config = project_config_with_overrides(
             load_parameter_files(paths),
@@ -120,6 +121,12 @@ class SafetySupervisorNode(Node):
             self.get_parameter("development_simulation").value,
             "development_simulation",
         )
+        evaluation_diagnostics_enabled = parse_launch_bool(
+            self.get_parameter("evaluation_diagnostics_enabled").value,
+            "evaluation_diagnostics_enabled",
+        )
+        if evaluation_diagnostics_enabled and not development_enabled:
+            raise ValueError("evaluation diagnostics require explicit development_simulation mode")
         config = (
             apply_slice_7g_development_simulation_profile(config, enabled=True)
             if development_enabled

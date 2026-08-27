@@ -413,7 +413,7 @@ class ArtifactRecord:
         return ArtifactRecord(self._spec, self._layer_a, **values, run_applicability=self.run_applicability)
 
 
-def build_artifact_inventory(*, include_lumen: bool, include_plots: bool, include_comparison: bool, include_finalization_error: bool = False, include_cylinder: bool | None = None) -> tuple[ArtifactSpec, ...]:
+def build_artifact_inventory(*, include_lumen: bool, include_plots: bool, include_comparison: bool, include_finalization_error: bool = False, include_cylinder: bool | None = None, include_diagnostics: bool = False) -> tuple[ArtifactSpec, ...]:
     """Return current producer-backed payloads; late sidecar is deferred.
 
     Optional dependencies are satisfied by a NOT_APPLICABLE dependency when
@@ -428,6 +428,12 @@ def build_artifact_inventory(*, include_lumen: bool, include_plots: bool, includ
         ("centerline_tracking_error_plot", "centerline_tracking_error.png"),
         ("curved_lumen_trajectory_plot", "curved_lumen_trajectory_3d.png"),
     )
+    diagnostic_plots = (
+        ("tactile_safety_response_plot", "tactile_safety_response.png"),
+        ("cost_term_breakdown_plot", "cost_term_breakdown.png"),
+        ("mppi_computation_breakdown_plot", "mppi_computation_breakdown.png"),
+        ("deadline_analysis_plot", "deadline_analysis.png"),
+    )
     plot_names = tuple(name for name, _ in plots)
     specs = [
         ArtifactSpec("raw_state", "state.csv", True, Applicability.APPLICABLE, ArtifactRepresentation.OPAQUE, "regular_file"),
@@ -438,6 +444,9 @@ def build_artifact_inventory(*, include_lumen: bool, include_plots: bool, includ
         ArtifactSpec("horizon", "horizon.csv", True, Applicability.APPLICABLE, ArtifactRepresentation.OPAQUE, "regular_file"),
         ArtifactSpec("reference_path", "reference_path.csv", True, Applicability.APPLICABLE, ArtifactRepresentation.OPAQUE, "regular_file"),
         ArtifactSpec("backbone", "backbone.csv", True, Applicability.APPLICABLE, ArtifactRepresentation.OPAQUE, "regular_file"),
+        ArtifactSpec("tactile_safety_evidence", "tactile_safety.csv", False, _app(include_diagnostics), ArtifactRepresentation.OPAQUE, "regular_file"),
+        ArtifactSpec("mppi_cost_terms", "mppi_cost_terms.csv", False, _app(include_diagnostics), ArtifactRepresentation.OPAQUE, "regular_file"),
+        ArtifactSpec("mppi_computation", "mppi_computation.csv", False, _app(include_diagnostics), ArtifactRepresentation.OPAQUE, "regular_file"),
         ArtifactSpec("metadata", "metadata.yaml", True, Applicability.APPLICABLE, ArtifactRepresentation.OPAQUE, "regular_file"),
         ArtifactSpec("summary", "summary.json", True, Applicability.APPLICABLE, ArtifactRepresentation.OPAQUE, "regular_file"),
         ArtifactSpec("aligned_samples", "aligned_samples.csv", True, Applicability.APPLICABLE, ArtifactRepresentation.OPAQUE, "regular_file"),
@@ -456,6 +465,24 @@ def build_artifact_inventory(*, include_lumen: bool, include_plots: bool, includ
             )
             for name, path in curved_plots
         ],
+        *[
+            ArtifactSpec(
+                name,
+                path,
+                False,
+                _app(include_diagnostics and include_plots),
+                ArtifactRepresentation.OPAQUE,
+                "regular_file",
+                (
+                    "tactile_safety_evidence"
+                    if name == "tactile_safety_response_plot"
+                    else "mppi_cost_terms"
+                    if name == "cost_term_breakdown_plot"
+                    else "mppi_computation"
+                ,),
+            )
+            for name, path in diagnostic_plots
+        ],
         ArtifactSpec("wall_clearance_plot", "wall_clearance.png", False, _app(include_cylinder and include_plots), ArtifactRepresentation.OPAQUE, "regular_file", ("cylinder_navigation",)),
         ArtifactSpec("cylinder_backbone_target_plot", "cylinder_backbone_target_3d.png", False, _app(include_cylinder and include_plots), ArtifactRepresentation.OPAQUE, "regular_file", ("cylinder_navigation", "metadata", "backbone")),
         ArtifactSpec("comparison", "comparison.json", False, _app(include_comparison), ArtifactRepresentation.OPAQUE, "regular_file", ("metadata", "summary")),
@@ -463,7 +490,7 @@ def build_artifact_inventory(*, include_lumen: bool, include_plots: bool, includ
         # The report remains publishable when optional lumen diagnostics fail;
         # each curved plot has its own explicit dependency record and is listed
         # by the report only when it was actually produced.
-        ArtifactSpec("report", "report.md", True, Applicability.APPLICABLE, ArtifactRepresentation.OPAQUE, "regular_file", ("metadata", "summary", "aligned_samples", "comparison", "comparison_report", *plot_names, "wall_clearance_plot", "cylinder_backbone_target_plot")),
+        ArtifactSpec("report", "report.md", True, Applicability.APPLICABLE, ArtifactRepresentation.OPAQUE, "regular_file", ("metadata", "summary", "aligned_samples", "comparison", "comparison_report", *plot_names, "wall_clearance_plot", "cylinder_backbone_target_plot", *(name for name, _ in diagnostic_plots))),
         ArtifactSpec("orchestration", "orchestration.json", True, Applicability.APPLICABLE, ArtifactRepresentation.OPAQUE, "regular_file"),
         ArtifactSpec("finalization_trace", "finalization_trace.json", False, Applicability.APPLICABLE, ArtifactRepresentation.OPAQUE, "regular_file"),
         ArtifactSpec("finalization_error", "finalization_error.json", False, _app(include_finalization_error), ArtifactRepresentation.OPAQUE, "regular_file"),

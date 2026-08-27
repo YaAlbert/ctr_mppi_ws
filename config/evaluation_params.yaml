@@ -27,6 +27,7 @@ evaluation:
   plot_generation: true
   report_generation: true
   enable_finalization_profiling: false
+  diagnostic_data_collection: false
   physical_validation: false
   hardware_validation: false
   orchestration:

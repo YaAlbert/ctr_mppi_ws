@@ -184,6 +184,27 @@ def tactile_cost_value(
     return float(value)
 
 
+def tactile_cost_raw_value(
+    *,
+    enabled: bool,
+    snapshot: TactileSnapshot | None,
+    predicted_clearance_m: float | None,
+    config: TactileCostConfig,
+) -> float:
+    """Return the dimensionless tactile severity before its configured weight."""
+
+    if not enabled or snapshot is None or predicted_clearance_m is None:
+        return 0.0
+    if config.tactile_weight <= 0.0:
+        return 0.0
+    return tactile_cost_value(
+        enabled=enabled,
+        snapshot=snapshot,
+        predicted_clearance_m=predicted_clearance_m,
+        config=config,
+    ) / config.tactile_weight
+
+
 def _bool(value: Any, label: str) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{label} must be boolean")

@@ -517,7 +517,7 @@ def generate_seed_plot(attempts: list[dict[str, Any]], path: Path) -> None:
     axes[1].set_title("Minimum physical clearance")
     axes[1].set_xlabel("Seed")
     axes[1].set_ylabel("Clearance (m)")
-    figure.suptitle("Slice 7G development simulation (not production evidence)")
+    figure.suptitle("Seed Repeatability")
     figure.tight_layout()
     figure.savefig(path, dpi=140)
     plt.close(figure)
@@ -525,7 +525,7 @@ def generate_seed_plot(attempts: list[dict[str, Any]], path: Path) -> None:
 
 def development_report(root: Path, attempts: list[dict[str, Any]], plot_path: Path) -> str:
     lines = [
-        "# Slice 7G Development Simulation Results",
+        "# CTR Autonomous-Navigation Results",
         "",
         f"> **{DEVELOPMENT_SIMULATION_DISCLAIMER}**",
         "",

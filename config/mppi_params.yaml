@@ -65,6 +65,38 @@ mppi_profiles:
     control_period: 0.05
     simulation_default: true
     note: existing Milestone 5 reference-quality software-test profile
+  paper_economy:
+    samples: 24
+    horizon: 5
+    dt: 0.55
+    lambda: 0.001
+    control_period: 0.10
+    noise_std:
+      insertion: [0.0030, 0.0030, 0.0030]
+      rotation: [0.100, 0.100, 0.100]
+    weights:
+      tip: 15000.0
+      terminal: 15000.0
+      control: 0.005
+      smoothness: 0.01
+    simulation_default: false
+    note: explicit evaluation configuration for controller-computation trade-off analysis
+  paper_extended:
+    samples: 54
+    horizon: 9
+    dt: 0.55
+    lambda: 0.001
+    control_period: 0.10
+    noise_std:
+      insertion: [0.0030, 0.0030, 0.0030]
+      rotation: [0.100, 0.100, 0.100]
+    weights:
+      tip: 15000.0
+      terminal: 15000.0
+      control: 0.005
+      smoothness: 0.01
+    simulation_default: false
+    note: explicit evaluation configuration for controller-computation trade-off analysis
 
 cylindrical_lumen:
   enabled: true
