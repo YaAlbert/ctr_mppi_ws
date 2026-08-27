@@ -159,6 +159,46 @@ class PhysicalEvidenceChannelTest(unittest.TestCase):
             self.reader.read()
         self.assertLess(time.monotonic() - started, 0.10)
 
+    def test_initial_zero_generation_is_immediately_unavailable(self):
+        self.connect()
+        started = time.monotonic()
+        with self.assertRaisesRegex(
+            evidence.PhysicalEvidenceError, "physical_evidence_unavailable"
+        ):
+            self.reader.read()
+        self.assertLess(time.monotonic() - started, 0.025)
+
+    def test_post_start_zero_generation_retries_then_fails_closed(self):
+        self.connect()
+        expected = record(self.session_id, 1)
+        self.producer.write(expected)
+        self.assertEqual(expected, self.reader.read())
+        stable_generation = evidence._SEQUENCE.unpack_from(
+            self.producer._mapping, 0
+        )[0]
+        evidence._SEQUENCE.pack_into(self.producer._mapping, 0, 0)
+
+        def restore_stable_generation():
+            time.sleep(0.010)
+            evidence._SEQUENCE.pack_into(
+                self.producer._mapping, 0, stable_generation
+            )
+
+        thread = threading.Thread(target=restore_stable_generation)
+        thread.start()
+        try:
+            self.assertEqual(expected, self.reader.read())
+        finally:
+            thread.join(timeout=1.0)
+
+        evidence._SEQUENCE.pack_into(self.producer._mapping, 0, 0)
+        started = time.monotonic()
+        with self.assertRaisesRegex(
+            evidence.PhysicalEvidenceError, "physical_evidence_torn_read"
+        ):
+            self.reader.read()
+        self.assertLess(time.monotonic() - started, 0.10)
+
     def test_wrong_session_receives_no_descriptor(self):
         self.producer = evidence.PhysicalEvidenceProducer(
             self.root,

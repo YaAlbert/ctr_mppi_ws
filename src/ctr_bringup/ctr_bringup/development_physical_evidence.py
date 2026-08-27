@@ -480,7 +480,20 @@ class PhysicalEvidenceReader:
         while True:
             generation_before = _SEQUENCE.unpack_from(self._mapping, 0)[0]
             if generation_before == 0:
-                raise PhysicalEvidenceError("physical_evidence_unavailable")
+                # Zero is authoritative only before this reader has accepted
+                # its first stable record.  Once evidence has been accepted,
+                # the single writer can never legitimately return its seqlock
+                # generation to zero.  Treat a transient zero exactly like an
+                # odd/changing generation: retry inside the same bounded
+                # stable-read window, then fail closed as a torn read.  This
+                # prevents one unstable word observation from inventing a
+                # producer outage without allowing a persistent reset to pass.
+                if self._last_sequence == 0:
+                    raise PhysicalEvidenceError("physical_evidence_unavailable")
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(PHYSICAL_EVIDENCE_STABLE_READ_POLL_S)
+                continue
             if generation_before & 1:
                 if time.monotonic() >= deadline:
                     break
