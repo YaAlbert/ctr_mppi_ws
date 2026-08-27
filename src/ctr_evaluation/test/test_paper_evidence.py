@@ -1,3 +1,5 @@
+import json
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -130,6 +132,28 @@ def test_empty_aggregate_emits_complete_export_with_neutral_titles(tmp_path):
     assert forbidden_presentation_findings(root) == []
     visible = (root / "paper_results.md").read_text(encoding="utf-8").lower()
     assert not any(phrase in visible for phrase in FORBIDDEN_PRESENTATION_TEXT)
+
+
+def test_failed_rows_are_neutralized_only_at_publication_boundary(tmp_path):
+    root = tmp_path / "final_system_test"
+    root.mkdir()
+    raw = {
+        "test_id": "E1-reference",
+        "experiment": "reference",
+        "matrix_status": "failed",
+        "failure_reason": "OrchestrationError: Slice 7G tactile/safety status became stale",
+    }
+    aggregate(root, [raw], Path("unused"))
+    assert raw["failure_reason"].startswith("OrchestrationError: Slice 7G")
+    assert "Slice 7G" not in (root / "artifact_validation.md").read_text(encoding="utf-8")
+    assert "Slice 7G" not in (root / "paper_tables" / "reference_run.csv").read_text(encoding="utf-8")
+    assert forbidden_presentation_findings(root) == []
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    assert "manifest.json" not in {member["path"] for member in manifest["members"]}
+    for member in manifest["members"]:
+        path = root / member["path"]
+        assert path.stat().st_size == member["size"]
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == member["sha256"]
 
 
 def test_straight_lumen_emits_common_centerline_evidence_and_plot_names(tmp_path):

@@ -561,7 +561,10 @@ def aggregate(root: Path, rows: list[dict[str, Any]], config_path: Path) -> dict
         "lumen_geometry.csv": ("lumen_geometry",), "controller_configuration.csv": ("controller_configuration",),
     }
     for filename, experiments in table_groups.items():
-        write_csv(tables / filename, [row for row in rows if row.get("experiment") in experiments])
+        write_csv(
+            tables / filename,
+            [publication_row(row) for row in rows if row.get("experiment") in experiments],
+        )
     del config_path
     config = load_parameter_files(default_config_paths())
     tactile = build_tactile_stress_table(config)
@@ -576,14 +579,14 @@ def aggregate(root: Path, rows: list[dict[str, Any]], config_path: Path) -> dict
     (root / "artifact_validation.md").write_text(validation, encoding="utf-8")
     results = paper_results(rows, plot_index)
     (root / "paper_results.md").write_text(results, encoding="utf-8")
-    manifest = build_manifest(root)
-    write_json(root / "manifest.json", manifest)
     for name in PAPER_FIGURES:
         shutil.copy2(figures / name, export / name)
     for name in PAPER_TABLES:
         shutil.copy2(tables / name, export / name)
     shutil.copy2(root / "paper_results.md", export / "paper_results.md")
     shutil.copy2(root / "plot_index.json", export / "plot_index.json")
+    manifest = build_manifest(root)
+    write_json(root / "manifest.json", manifest)
     return {
         "completed": len(successful), "total": len(rows),
         "artifact_validation_failures": validation_failures,
@@ -739,7 +742,8 @@ def validate_artifacts(root: Path, rows: list[dict[str, Any]]) -> tuple[str, int
     failures = 0
     for row in rows:
         if row.get("matrix_status") != "completed":
-            lines.append(f"- {row.get('test_id')}: `{row.get('matrix_status')}` — {row.get('failure_reason', '')}")
+            reason = neutral_publication_text(str(row.get("failure_reason", "")))
+            lines.append(f"- {row.get('test_id')}: `{row.get('matrix_status')}` — {reason}")
             continue
         run = Path(row["candidate_dir"])
         missing = sorted(name for name in required if not (run / name).is_file() or (run / name).stat().st_size == 0)
@@ -932,13 +936,21 @@ def build_manifest(root: Path) -> dict[str, Any]:
     members = []
     for path in sorted(item for item in root.rglob("*") if item.is_file() and path_safe(item, root)):
         relative = path.relative_to(root).as_posix()
+        if relative == "manifest.json":
+            continue
         members.append({"path": relative, "size": path.stat().st_size, "sha256": sha256(path)})
     return {"schema_version": "ctr_final_system_evidence_manifest_v1", "tested_commit": git_value("rev-parse", "HEAD"), "generated_at": datetime.now(timezone.utc).isoformat(), "members": members}
 
 
 def forbidden_presentation_findings(root: Path) -> list[str]:
     findings = []
-    for path in tuple((root / "paper_results.md",)):
+    publication_paths = [root / "paper_results.md", root / "artifact_validation.md"]
+    publication_paths.extend((root / "paper_tables").glob("*.csv"))
+    publication_paths.extend(
+        path for path in (root / "overleaf_upload").iterdir()
+        if path.is_file() and path.suffix.lower() in {".md", ".csv"}
+    )
+    for path in publication_paths:
         text = path.read_text(encoding="utf-8").lower() if path.is_file() else ""
         findings.extend(f"{path.name}:{phrase}" for phrase in FORBIDDEN_PRESENTATION_TEXT if phrase in text)
     index = read_json(root / "plot_index.json") if (root / "plot_index.json").is_file() else {}
@@ -946,6 +958,29 @@ def forbidden_presentation_findings(root: Path) -> list[str]:
         visible = f"{record.get('title', '')} {record.get('caption', '')}".lower()
         findings.extend(f"{name}:{phrase}" for phrase in FORBIDDEN_PRESENTATION_TEXT if phrase in visible)
     return findings
+
+
+def neutral_publication_text(value: str) -> str:
+    """Remove internal legacy labels from publication-facing diagnostics only."""
+
+    replacements = {
+        "Slice 7G ": "",
+        "slice_7g_": "",
+        "slice-7g-": "",
+    }
+    result = value
+    for source, replacement in replacements.items():
+        result = result.replace(source, replacement)
+    return result
+
+
+def publication_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Return a publication-safe copy while retaining raw matrix provenance."""
+
+    result = dict(row)
+    if "failure_reason" in result:
+        result["failure_reason"] = neutral_publication_text(str(result["failure_reason"]))
+    return result
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
