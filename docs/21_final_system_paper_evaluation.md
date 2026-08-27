@@ -50,7 +50,7 @@ commands with diagnostics disabled and enabled.
 | Solve-time statistics | median, 95th percentile, and maximum of finite solve durations | s | unavailable for an empty solve set |
 | Deadline misses | count and percentage of solve durations above the configured control period | count, % | zero count and unavailable percentage for an empty set |
 | Cartesian path length | `sum_i ||tip_i - tip_(i-1)||_2` | m | zero for fewer than two samples |
-| Cumulative control effort | `sum_i ||u_i||_2^2 * dt_i` for aligned applied commands | mixed command units squared second | zero for an empty set |
+| Cumulative control effort | `sum_i ||u_i||_2^2 * dt_i` for valid aligned applied safe commands | mixed command units squared second | zero for an empty set |
 | Command total variation | sum of Euclidean changes, separately for insertion and rotation command groups | m/s, rad/s | zero for fewer than two commands |
 | Saturation percentage | percentage of command samples with any component at its configured group limit | % | zero for an empty set |
 | Event counts and durations | transition counts and interval duration in each tactile/safety state | count, s | zero when the event is absent |

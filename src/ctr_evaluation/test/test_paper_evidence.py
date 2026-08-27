@@ -14,6 +14,7 @@ from ctr_evaluation.paper_evidence import (
     forbidden_presentation_findings,
     matrix_specs,
     select_specs,
+    validate_matrix_contract,
 )
 from ctr_evaluation.run_evaluation import default_config_paths
 
@@ -40,6 +41,24 @@ def test_target_source_cells_use_one_controller_target():
     for row in rows:
         if row.target_source != "profile":
             assert row.target == TESTED_TARGET
+
+
+def test_matrix_contract_requires_every_cell_and_exact_target_equivalence():
+    selected = select_specs("target_source")
+    rows = [
+        {
+            "test_id": spec.test_id,
+            "experiment": spec.experiment,
+            "matrix_status": "completed",
+            "completion_status": "completed",
+            "accepted_target": "[0.021180966381970152,0.0,0.08471218663414842]",
+        }
+        for spec in selected
+    ]
+    assert validate_matrix_contract(rows, selected) == []
+    rows[0]["accepted_target"] = "[0.0,0.0,0.0]"
+    assert "differs" in validate_matrix_contract(rows, selected)[0]
+    assert "missing" in validate_matrix_contract(rows[1:], selected)[0]
 
 
 def test_controller_tradeoff_is_configuration_not_software_version():
@@ -69,6 +88,7 @@ def test_empty_aggregate_emits_complete_export_with_neutral_titles(tmp_path):
     root.mkdir()
     result = aggregate(root, [], Path("unused"))
     assert result["completed"] == 0
+    assert result["artifact_validation_failures"] == 0
     for name in PAPER_FIGURES:
         assert (root / "paper_figures" / name).stat().st_size > 0
         assert (root / "overleaf_upload" / name).stat().st_size > 0

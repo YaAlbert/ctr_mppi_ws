@@ -94,7 +94,7 @@ METRIC_DEFINITIONS = {
     },
     "cumulative_control_effort": {
         "formula": "sum_i(||u_i||_2^2*dt_i)", "units": "mixed command units squared second",
-        "window": "timestamped applied safe-command samples", "nan_policy": "zero for an empty command set",
+        "window": "valid aligned applied safe-command samples", "nan_policy": "zero for an empty command set",
     },
     "maximum_centerline_distance_m": {
         "formula": "max_i d(tip_i, analytic_centerline)", "units": "m",
@@ -452,13 +452,44 @@ def _safety_shell(config: dict[str, Any]) -> SafetySupervisorNode:
 
 def robustness_rows() -> list[dict[str, Any]]:
     return [
-        {"test_id": "E8-invalid-cli", "case": "invalid CLI target", "expected": "rejected", "test": "test_development_target_selection.py::test_cli_target_outside_lumen_is_rejected"},
-        {"test_id": "E8-invalid-rviz", "case": "invalid RViz candidate", "expected": "rejected", "test": "test_development_target_selection.py::test_rviz_candidate_outside_lumen_is_rejected"},
-        {"test_id": "E8-projection", "case": "projection beyond 0.035 m", "expected": "rejected", "test": "test_development_target_selection.py::test_excessive_projection_is_rejected"},
-        {"test_id": "E8-one-shot", "case": "target update after motion", "expected": "rejected", "test": "test_development_target_selection.py::test_post_start_update_is_rejected"},
-        {"test_id": "E8-interrupted", "case": "interrupted run", "expected": "incomplete", "test": "test_experiment_recorder.py::test_interrupted_run_is_not_successful"},
-        {"test_id": "E8-missing-artifact", "case": "missing required artifact", "expected": "not successful", "test": "test_experiment_recorder.py::test_required_artifact_failure_blocks_promotion"},
+        {"test_id": "E8-invalid-cli", "case": "invalid CLI target", "expected": "rejected", "test": "src/ctr_sim/test/test_development_target_selector.py::test_cli_point_outside_wall_is_rejected_without_projection"},
+        {"test_id": "E8-invalid-rviz", "case": "invalid RViz candidate", "expected": "rejected", "test": "src/ctr_sim/test/test_development_target_selector.py::test_excessive_projection_distance_is_rejected"},
+        {"test_id": "E8-projection", "case": "projection beyond 0.035 m", "expected": "rejected", "test": "src/ctr_sim/test/test_development_target_selector.py::test_excessive_projection_distance_is_rejected"},
+        {"test_id": "E8-one-shot", "case": "target update after motion", "expected": "rejected", "test": "src/ctr_sim/test/test_development_target_selector.py::test_target_update_policy_accepts_only_before_motion_starts"},
+        {"test_id": "E8-interrupted", "case": "interrupted run", "expected": "incomplete", "test": "src/ctr_evaluation/test/test_experiment_recorder.py::ExperimentRecorderTests::test_interrupted_run_is_explicitly_incomplete_and_not_successful"},
+        {"test_id": "E8-missing-artifact", "case": "missing required artifact", "expected": "not successful", "test": "src/ctr_evaluation/test/test_development_simulation.py::test_functional_result_rejects_incomplete_evaluation_window"},
     ]
+
+
+def validate_matrix_contract(rows: list[dict[str, Any]], expected: tuple[RunSpec, ...]) -> list[str]:
+    """Return deterministic matrix-completeness and target-equivalence failures."""
+
+    failures: list[str] = []
+    expected_ids = {spec.test_id for spec in expected}
+    actual_ids = {str(row.get("test_id")) for row in rows}
+    if actual_ids != expected_ids:
+        failures.append(
+            f"matrix IDs differ: missing={sorted(expected_ids - actual_ids)}, "
+            f"unexpected={sorted(actual_ids - expected_ids)}"
+        )
+    for row in rows:
+        if row.get("test_id") not in expected_ids:
+            continue
+        if row.get("matrix_status") != "completed" or row.get("completion_status") != "completed":
+            failures.append(f"{row.get('test_id')}: not completed")
+    for row in rows:
+        if row.get("experiment") != "target_source" or row.get("matrix_status") != "completed":
+            continue
+        try:
+            target = np.asarray(json.loads(str(row.get("accepted_target"))), dtype=np.float64)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            failures.append(f"{row.get('test_id')}: accepted target is not parseable")
+            continue
+        if target.shape != (3,) or not np.isfinite(target).all():
+            failures.append(f"{row.get('test_id')}: accepted target is not one finite 3-vector")
+        elif not np.allclose(target, np.asarray(TESTED_TARGET), rtol=0.0, atol=1.0e-12):
+            failures.append(f"{row.get('test_id')}: accepted target differs from comparison target")
+    return failures
 
 
 def aggregate(root: Path, rows: list[dict[str, Any]], config_path: Path) -> dict[str, Any]:
@@ -485,7 +516,7 @@ def aggregate(root: Path, rows: list[dict[str, Any]], config_path: Path) -> dict
     write_csv(root / "experiment_matrix.csv", [{**asdict(spec), "group": spec.group} for spec in matrix_specs()])
     plot_index = generate_figures(figures, successful, tactile)
     write_json(root / "plot_index.json", plot_index)
-    validation = validate_artifacts(root, rows)
+    validation, validation_failures = validate_artifacts(root, rows)
     (root / "artifact_validation.md").write_text(validation, encoding="utf-8")
     results = paper_results(rows, plot_index)
     (root / "paper_results.md").write_text(results, encoding="utf-8")
@@ -497,7 +528,11 @@ def aggregate(root: Path, rows: list[dict[str, Any]], config_path: Path) -> dict
         shutil.copy2(tables / name, export / name)
     shutil.copy2(root / "paper_results.md", export / "paper_results.md")
     shutil.copy2(root / "plot_index.json", export / "plot_index.json")
-    return {"completed": len(successful), "total": len(rows), "validation": validation, "export": str(export)}
+    return {
+        "completed": len(successful), "total": len(rows),
+        "artifact_validation_failures": validation_failures,
+        "validation": validation, "export": str(export),
+    }
 
 
 def generate_figures(figures: Path, rows: list[dict[str, Any]], tactile: list[dict[str, Any]]) -> dict[str, Any]:
@@ -635,7 +670,7 @@ def figure_record(filename: str, title: str, rows: list[dict[str, Any]], aggrega
     }
 
 
-def validate_artifacts(root: Path, rows: list[dict[str, Any]]) -> str:
+def validate_artifacts(root: Path, rows: list[dict[str, Any]]) -> tuple[str, int]:
     required = {
         "state.csv", "tip.csv", "reference.csv", "command.csv", "solve_timing.csv", "horizon.csv", "reference_path.csv", "backbone.csv",
         "metadata.yaml", "summary.json", "aligned_samples.csv", "tactile_safety.csv", "mppi_cost_terms.csv", "mppi_computation.csv",
@@ -665,7 +700,7 @@ def validate_artifacts(root: Path, rows: list[dict[str, Any]]) -> str:
             f"missing={missing}; recomputed={recomputed}; differences={differences}"
         )
     lines.extend(("", f"Completed rows with artifact failures: {failures}", ""))
-    return "\n".join(lines)
+    return "\n".join(lines), failures
 
 
 def independently_recompute_metrics(
@@ -677,7 +712,6 @@ def independently_recompute_metrics(
     aligned = read_csv(run_dir / "aligned_samples.csv")
     lumen = read_csv(run_dir / "lumen_evaluation.csv")
     solves = read_csv(run_dir / "solve_timing.csv")
-    commands = [row for row in read_csv(run_dir / "command.csv") if row.get("source") == "safe_command"]
     result: dict[str, float] = {}
     if aligned:
         tip = np.asarray([[float(row[key]) for key in ("tip_x", "tip_y", "tip_z")] for row in aligned])
@@ -686,6 +720,10 @@ def independently_recompute_metrics(
         result["final_target_error_m"] = float(errors[-1])
         result["tip_to_target_rmse_m"] = float(np.sqrt(np.mean(errors**2)))
         result["cartesian_path_length_m"] = float(np.sum(np.linalg.norm(np.diff(tip, axis=0), axis=1)))
+        stamps = np.asarray([float(row["timestamp"]) for row in aligned])
+        commands = np.asarray([[float(row[f"u{index}"]) for index in range(6)] for row in aligned])
+        dt = np.concatenate(([0.0], np.maximum(np.diff(stamps), 0.0)))
+        result["cumulative_control_effort"] = float(np.sum(np.sum(commands**2, axis=1) * dt))
     if lumen:
         radial = np.asarray([float(row["radial_offset_m"]) for row in lumen])
         clearance = np.asarray([float(row["physical_clearance_m"]) for row in lumen])
@@ -703,11 +741,6 @@ def independently_recompute_metrics(
         result["solve_median_s"] = float(np.median(durations))
         result["solve_p95_s"] = float(np.percentile(durations, 95.0))
         result["solve_max_s"] = float(np.max(durations))
-    if commands:
-        stamps = np.asarray([float(row["timestamp"]) for row in commands])
-        values = np.asarray([[float(row[f"u{index}"]) for index in range(6)] for row in commands])
-        dt = np.concatenate(([0.0], np.maximum(np.diff(stamps), 0.0)))
-        result["cumulative_control_effort"] = float(np.sum(np.sum(values**2, axis=1) * dt))
     differences: dict[str, float] = {}
     for key, value in result.items():
         expected = reported.get(key)
@@ -945,8 +978,9 @@ def main(argv: list[str] | None = None) -> int:
     root.mkdir(parents=True, exist_ok=True)
     rows = read_progress(root / "matrix_progress.jsonl")
     completed_ids = {row.get("test_id") for row in rows}
+    selected_specs = select_specs(args.matrix)
     if not args.aggregate_only:
-        for spec in select_specs(args.matrix):
+        for spec in selected_specs:
             if args.resume and spec.test_id in completed_ids:
                 continue
             row = run_spec(root, spec, args.duration)
@@ -954,8 +988,18 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"test_id": spec.test_id, "status": row.get("matrix_status"), "candidate_dir": row.get("candidate_dir", "")}, allow_nan=False), flush=True)
     result = aggregate(root, rows, Path.cwd() / "config" / "tactile_params.yaml")
     findings = forbidden_presentation_findings(root)
-    print(json.dumps({"output_root": str(root), **result, "forbidden_presentation_findings": findings}, indent=2, allow_nan=False))
-    return 0 if not findings and result["completed"] else 2
+    matrix_failures = validate_matrix_contract(rows, selected_specs)
+    print(json.dumps({
+        "output_root": str(root), **result,
+        "forbidden_presentation_findings": findings,
+        "matrix_contract_failures": matrix_failures,
+    }, indent=2, allow_nan=False))
+    return 0 if (
+        not findings
+        and not matrix_failures
+        and result["completed"]
+        and result["artifact_validation_failures"] == 0
+    ) else 2
 
 
 if __name__ == "__main__":
