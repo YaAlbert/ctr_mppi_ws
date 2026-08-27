@@ -31,9 +31,16 @@ from ctr_evaluation.run_evaluation import (
     default_config_paths,
     parse_args as parse_evaluation_args,
 )
+from ctr_model.approximate_model import ApproximateCTRModel
+from ctr_mppi_controller.lumen_factory import lumen_geometry_from_config
 from ctr_safety.nodes.safety_supervisor_node import (
     SafetySupervisorNode,
     TactileSnapshot as SafetyTactileSnapshot,
+)
+from ctr_sim.nodes.development_target_selector_node import (
+    build_sampled_reachability_cloud,
+    sampled_reachability_predicate,
+    select_development_target,
 )
 from ctr_tactile.tactile_processing import TactileProcessingParameters, TactileProcessor
 
@@ -245,7 +252,19 @@ def run_spec(root: Path, spec: RunSpec, duration: float) -> dict[str, Any]:
                      "--development-target-frame", "base_link", "--development-target-projection-distance", "0"))
     started = datetime.now(timezone.utc).isoformat()
     try:
-        result = EvaluationOrchestrator(parse_evaluation_args(list(argv))).run_pair()
+        orchestrator = EvaluationOrchestrator(parse_evaluation_args(list(argv)))
+        block_reason = target_source_block_reason(spec, orchestrator.project_config)
+        if block_reason is not None:
+            row = {
+                **asdict(spec),
+                "matrix_status": "blocked",
+                "failure_reason": block_reason,
+                "started_at": started,
+                "candidate_dir": "",
+            }
+            append_jsonl(root / "matrix_progress.jsonl", row)
+            return row
+        result = orchestrator.run_pair()
         candidate = Path(result["candidate_dir"])
         row = extract_run_row(spec, candidate)
         row.update({"matrix_status": "completed", "started_at": started, "candidate_dir": str(candidate)})
@@ -253,6 +272,43 @@ def run_spec(root: Path, spec: RunSpec, duration: float) -> dict[str, Any]:
         row = {**asdict(spec), "matrix_status": "failed", "failure_reason": f"{type(exc).__name__}: {exc}", "started_at": started, "candidate_dir": ""}
     append_jsonl(root / "matrix_progress.jsonl", row)
     return row
+
+
+def target_source_block_reason(
+    spec: RunSpec,
+    config: dict[str, Any],
+) -> str | None:
+    """Use the final validator to preflight coordinate-identical E3 targets."""
+
+    if spec.experiment != "target_source" or spec.target_source == "profile":
+        return None
+    geometry = lumen_geometry_from_config(config)
+    reachability = sampled_reachability_predicate(
+        build_sampled_reachability_cloud(ApproximateCTRModel(config), config),
+        float(config["goal"]["tolerance"]),
+    )
+    selection = select_development_target(
+        TESTED_TARGET,
+        input_frame="base_link",
+        target_source=spec.target_source,
+        geometry=geometry,
+        controller_frame=str(config["reference"]["frame_id"]),
+        world_frame=str(config["robot"]["frames"]["world"]),
+        projection_limit=float(
+            config["simulation"]["development_target_selection"]["projection_limit"]
+        ),
+        reachable=reachability,
+        accepted_target_timestamp=0.0,
+        seed=spec.seed,
+    )
+    if selection.accepted and selection.validated_target is not None:
+        accepted = np.asarray(selection.validated_target, dtype=np.float64)
+        if np.allclose(accepted, np.asarray(TESTED_TARGET), rtol=0.0, atol=1.0e-12):
+            return None
+    return (
+        "coordinate-identical target-source comparison blocked by final target "
+        f"validator: {selection.status}"
+    )
 
 
 def extract_run_row(spec: RunSpec, run_dir: Path) -> dict[str, Any]:

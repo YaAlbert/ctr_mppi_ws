@@ -48,6 +48,7 @@ from ctr_evaluation.run_evaluation import (  # noqa: E402
     parse_completed_result,
     parse_started_run_id,
     process_matches,
+    reference_subscription_qos_for_target_source,
     reference_target_identity,
     resolve_result_dir,
     strict_json_file,
@@ -923,6 +924,16 @@ class RunEvaluationHelpersTest(unittest.TestCase):
             ]
         )
         validate_task_options(args)
+
+    def test_target_selector_monitor_uses_late_joiner_reference_qos(self):
+        from rclpy.qos import DurabilityPolicy, ReliabilityPolicy
+
+        assert reference_subscription_qos_for_target_source("profile") == 10
+        for target_source in ("cli", "rviz"):
+            qos = reference_subscription_qos_for_target_source(target_source)
+            assert qos.durability == DurabilityPolicy.TRANSIENT_LOCAL
+            assert qos.reliability == ReliabilityPolicy.RELIABLE
+            assert qos.depth == 1
 
     def test_cylinder_cli_argument_parsing(self):
         args = parse_args(

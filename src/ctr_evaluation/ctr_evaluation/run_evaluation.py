@@ -445,6 +445,18 @@ def reference_mode_for_task(task: str) -> str:
     return "fixed_target" if is_fixed_target_task(task) else "trajectory"
 
 
+def reference_subscription_qos_for_target_source(target_source: str) -> Any:
+    if target_source not in DEVELOPMENT_TARGET_SOURCES:
+        raise OrchestrationError("development target source is invalid")
+    if target_source == "profile":
+        return 10
+    from ctr_sim.nodes.development_target_selector_node import (
+        target_selection_qos_profile,
+    )
+
+    return target_selection_qos_profile()
+
+
 def validate_task_options(args: argparse.Namespace) -> None:
     if not is_curved_lumen_task(args.task):
         if args.curved_lumen_type is not None:
@@ -702,7 +714,13 @@ class EvaluationOrchestrator:
                 ),
             )
             records.append(self.process_manager.start(role=f"{role}_base", command=base_command, env=env))
-            monitor = RosRunMonitor(domain_id=domain_id, slice_7g_governed=self.slice_7g_profile_enabled)
+            monitor = RosRunMonitor(
+                domain_id=domain_id,
+                slice_7g_governed=self.slice_7g_profile_enabled,
+                development_target_source=getattr(
+                    self, "development_target_source", "profile"
+                ),
+            )
             monitor.record_runner_event("runner_start", orchestration_id=self.orchestration_id, run_role=role)
             monitor.record_runner_event(
                 "launch_process_created",
@@ -1496,7 +1514,13 @@ class EvaluationOrchestrator:
 
 
 class RosRunMonitor:
-    def __init__(self, *, domain_id: int, slice_7g_governed: bool = False):
+    def __init__(
+        self,
+        *,
+        domain_id: int,
+        slice_7g_governed: bool = False,
+        development_target_source: str = "profile",
+    ):
         import rclpy
         from rclpy.context import Context
         from rclpy.executors import SingleThreadedExecutor
@@ -1577,9 +1601,12 @@ class RosRunMonitor:
         self._safety_fault_monitor_armed = False
         self.state_sub = self.node.create_subscription(CtrState, "/ctr/state", self._on_state, 10)
         self.tip_sub = self.node.create_subscription(PoseStamped, "/ctr/tip", self._on_tip, 10)
-        self.ref_tip_sub = self.node.create_subscription(PoseStamped, "/ctr/reference/tip", lambda msg: self._on_reference("tip", msg), 10)
+        reference_qos = reference_subscription_qos_for_target_source(
+            development_target_source
+        )
+        self.ref_tip_sub = self.node.create_subscription(PoseStamped, "/ctr/reference/tip", lambda msg: self._on_reference("tip", msg), reference_qos)
         self.ref_horizon_sub = self.node.create_subscription(NavPath, "/ctr/reference/horizon", lambda msg: self._on_reference("horizon", msg), 10)
-        self.ref_path_sub = self.node.create_subscription(NavPath, "/ctr/reference/path", lambda msg: self._on_reference("path", msg), 10)
+        self.ref_path_sub = self.node.create_subscription(NavPath, "/ctr/reference/path", lambda msg: self._on_reference("path", msg), reference_qos)
         self.command_subs = [
             self.node.create_subscription(CtrJointCommand, topic, lambda msg, topic=topic: self._on_command(topic, msg), 10)
             for topic in COMMAND_TOPICS

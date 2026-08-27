@@ -14,6 +14,7 @@ from ctr_evaluation.paper_evidence import (
     forbidden_presentation_findings,
     matrix_specs,
     select_specs,
+    target_source_block_reason,
     validate_matrix_contract,
 )
 from ctr_evaluation.run_evaluation import default_config_paths
@@ -41,6 +42,30 @@ def test_target_source_cells_use_one_controller_target():
     for row in rows:
         if row.target_source != "profile":
             assert row.target == TESTED_TARGET
+
+
+def test_target_source_preflight_uses_final_validator_and_blocks_unreachable_profile_target():
+    config = load_parameter_files(default_config_paths())
+    from ctr_bringup.slice_7g_profile import apply_slice_7g_development_simulation_profile
+    from ctr_mppi_controller.lumen_factory import config_with_lumen_overrides
+
+    for seed in (11, 22, 33):
+        effective = config_with_lumen_overrides(
+            config,
+            enable_cylindrical_lumen=False,
+            enable_curved_lumen=True,
+            curved_lumen_type="circular_arc",
+            cylinder_profile="cylinder_fast",
+            random_seed=seed,
+        )
+        effective = apply_slice_7g_development_simulation_profile(effective, enabled=True)
+        spec = next(
+            row for row in select_specs("target_source")
+            if row.target_source == "cli" and row.seed == seed
+        )
+        reason = target_source_block_reason(spec, effective)
+        assert reason is not None
+        assert "final target validator: target_unreachable" in reason
 
 
 def test_matrix_contract_requires_every_cell_and_exact_target_equivalence():
