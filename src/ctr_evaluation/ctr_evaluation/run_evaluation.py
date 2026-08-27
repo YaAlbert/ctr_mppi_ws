@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 import fcntl
 import json
@@ -57,6 +57,7 @@ FIXED_TARGET_TASKS = (TASK_CYLINDER_NAVIGATION, TASK_CURVED_LUMEN_NAVIGATION)
 DEFAULT_CURVED_LUMEN_TYPE = "circular_arc"
 DEFAULT_CURVED_SCENARIO = CENTERLINE_TARGET
 DEVELOPMENT_TARGET_SOURCES = ("profile", "cli", "rviz")
+PAPER_DIAGNOSTIC_FINALIZATION_TIMEOUT_S = 60.0
 
 CONFIG_NAMES = (
     "robot_params.yaml",
@@ -116,6 +117,26 @@ class OrchestrationSettings:
     allow_sigkill_cleanup: bool
     require_no_baseline_command: bool
     require_recording_before_candidate_command: bool
+
+
+def settings_with_paper_diagnostics(
+    settings: OrchestrationSettings,
+    *,
+    enabled: bool,
+) -> OrchestrationSettings:
+    """Allow evaluation-only plot finalization without changing normal defaults."""
+
+    if type(enabled) is not bool:
+        raise TypeError("paper diagnostics enabled must be a built-in bool")
+    if not enabled:
+        return settings
+    return replace(
+        settings,
+        finalization_timeout=max(
+            settings.finalization_timeout,
+            PAPER_DIAGNOSTIC_FINALIZATION_TIMEOUT_S,
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -555,7 +576,10 @@ class EvaluationOrchestrator:
             validate_slice_7g_runtime_binding(args, self.output_root)
         elif self.development_simulation:
             self.output_root = validate_development_output_root(self.output_root)
-        self.settings = orchestration_settings_from_config(self.project_config)
+        self.settings = settings_with_paper_diagnostics(
+            orchestration_settings_from_config(self.project_config),
+            enabled=bool(getattr(args, "paper_diagnostics", False)),
+        )
         self.orchestration_id = f"m5d1_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}"
         if self.slice_7g_governed:
             working_directory = os.environ.get(SLICE_7G_WORKING_DIRECTORY_ENV)

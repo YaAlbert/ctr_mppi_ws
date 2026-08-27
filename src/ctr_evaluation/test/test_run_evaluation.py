@@ -1,4 +1,5 @@
 import contextlib
+from dataclasses import asdict
 import io
 import json
 import math
@@ -51,6 +52,7 @@ from ctr_evaluation.run_evaluation import (  # noqa: E402
     reference_subscription_qos_for_target_source,
     reference_target_identity,
     resolve_result_dir,
+    settings_with_paper_diagnostics,
     strict_json_file,
     target_vectors_equal,
     validate_target_identity_metadata,
@@ -180,6 +182,19 @@ def write_metadata(run_dir, *, orchestration_id="orch", run_role="baseline"):
 
 
 class RunEvaluationHelpersTest(unittest.TestCase):
+    def test_paper_diagnostics_extend_only_the_finalization_timeout(self):
+        base = settings(finalization_timeout=20.0)
+        assert settings_with_paper_diagnostics(base, enabled=False) is base
+        diagnostic = settings_with_paper_diagnostics(base, enabled=True)
+        assert diagnostic.finalization_timeout == 60.0
+        assert {
+            key: value for key, value in asdict(diagnostic).items()
+            if key != "finalization_timeout"
+        } == {
+            key: value for key, value in asdict(base).items()
+            if key != "finalization_timeout"
+        }
+
     def run_one_with_fake_runtime(
         self,
         stop_actions,
