@@ -60,7 +60,7 @@ def test_low_level_development_mode_rejects_non_simulation_and_non_curved_task()
         run_evaluation.validate_task_options(args)
 
     args.runtime_mode = "simulation"
-    with pytest.raises(run_evaluation.OrchestrationError, match="curved_lumen_navigation"):
+    with pytest.raises(run_evaluation.OrchestrationError, match="fixed-target simulation task"):
         run_evaluation.validate_task_options(args)
 
 

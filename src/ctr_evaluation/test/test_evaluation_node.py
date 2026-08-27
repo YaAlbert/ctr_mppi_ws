@@ -14,7 +14,13 @@ sys.path.insert(0, str(REPO_ROOT / "src" / "ctr_mppi_controller"))
 ctr_interfaces = sys.modules.get("ctr_interfaces", types.ModuleType("ctr_interfaces"))
 ctr_interfaces_msg = sys.modules.get("ctr_interfaces.msg", types.ModuleType("ctr_interfaces.msg"))
 ctr_interfaces_srv = sys.modules.get("ctr_interfaces.srv", types.ModuleType("ctr_interfaces.srv"))
-for name in ("CtrControllerMetrics", "CtrJointCommand", "CtrState"):
+for name in (
+    "CtrControllerMetrics",
+    "CtrJointCommand",
+    "CtrSafetyStatus",
+    "CtrState",
+    "CtrTactileState",
+):
     if not hasattr(ctr_interfaces_msg, name):
         setattr(ctr_interfaces_msg, name, type(name, (), {}))
 for name in ("StartExperiment", "StopExperiment"):
