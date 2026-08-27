@@ -3,12 +3,19 @@ import sys
 import threading
 import types
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 
 try:
-    from ctr_interfaces.msg import CtrJointCommand, CtrSafetyStatus, CtrState, CtrTactileState
+    from ctr_interfaces.msg import (
+        CtrJointCommand,
+        CtrJointState,
+        CtrSafetyStatus,
+        CtrState,
+        CtrTactileState,
+    )
     from ctr_interfaces.srv import ClearFault
 except ImportError:
     from geometry_msgs.msg import Point, Vector3
@@ -26,12 +33,24 @@ except ImportError:
             self.valid = False
             self.diagnostic_status = ""
 
+    class CtrJointState:
+        def __init__(self):
+            self.header = _header()
+            self.insertion_position = []
+            self.rotation_position = []
+            self.joint_velocity = []
+            self.valid = False
+            self.diagnostic_status = ""
+
     class CtrState:
         def __init__(self):
             self.header = _header()
             self.valid = False
             self.backbone = []
-            self.tip_pose = SimpleNamespace(position=Point())
+            self.tip_pose = SimpleNamespace(
+                position=Point(),
+                orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=0.0),
+            )
 
     class CtrTactileState:
         REGION_NO_CONTACT = 0
@@ -72,6 +91,7 @@ except ImportError:
     service_module = types.ModuleType("ctr_interfaces.srv")
     for name, value in {
         "CtrJointCommand": CtrJointCommand,
+        "CtrJointState": CtrJointState,
         "CtrSafetyStatus": CtrSafetyStatus,
         "CtrState": CtrState,
         "CtrTactileState": CtrTactileState,
@@ -97,29 +117,31 @@ class FakeGeometry:
 class SafetySupervisorMainShutdownTest(unittest.TestCase):
     def test_shutdown_context_normalizes_executor_runtime_error(self):
         node = mock.Mock()
+        executor = mock.Mock()
+        executor.spin.side_effect = RuntimeError("Unable to convert call argument to Python object")
         with (
             mock.patch.object(supervisor_module.rclpy, "init"),
             mock.patch.object(supervisor_module, "SafetySupervisorNode", return_value=node),
-            mock.patch.object(
-                supervisor_module.rclpy,
-                "spin",
-                side_effect=RuntimeError("Unable to convert call argument to Python object"),
-            ),
+            mock.patch.object(supervisor_module, "MultiThreadedExecutor", return_value=executor),
             mock.patch.object(supervisor_module.rclpy, "ok", return_value=False),
             mock.patch.object(supervisor_module.rclpy, "shutdown") as shutdown,
         ):
             supervisor_module.main()
 
+        executor.add_node.assert_called_once_with(node)
+        executor.shutdown.assert_called_once_with()
         node.destroy_node.assert_called_once_with()
         shutdown.assert_not_called()
 
     def test_active_context_preserves_executor_runtime_error(self):
         node = mock.Mock()
         failure = RuntimeError("active executor failure")
+        executor = mock.Mock()
+        executor.spin.side_effect = failure
         with (
             mock.patch.object(supervisor_module.rclpy, "init"),
             mock.patch.object(supervisor_module, "SafetySupervisorNode", return_value=node),
-            mock.patch.object(supervisor_module.rclpy, "spin", side_effect=failure),
+            mock.patch.object(supervisor_module, "MultiThreadedExecutor", return_value=executor),
             mock.patch.object(supervisor_module.rclpy, "ok", return_value=True),
             mock.patch.object(supervisor_module.rclpy, "shutdown") as shutdown,
         ):
@@ -127,7 +149,61 @@ class SafetySupervisorMainShutdownTest(unittest.TestCase):
                 supervisor_module.main()
 
         node.destroy_node.assert_called_once_with()
+        executor.shutdown.assert_called_once_with()
         shutdown.assert_called_once_with()
+
+    def test_source_separates_evidence_and_watchdog_callback_groups(self):
+        source = Path(supervisor_module.__file__).read_text(encoding="utf-8")
+        self.assertIn("MultiThreadedExecutor(num_threads=4)", source)
+        self.assertIn("callback_group=self._state_callback_group", source)
+        self.assertIn("callback_group=self._tactile_callback_group", source)
+        self.assertIn("callback_group=self._command_callback_group", source)
+        self.assertIn("callback_group=self._watchdog_callback_group", source)
+
+    def test_development_state_and_tactile_use_closed_latest_evidence_qos(self):
+        source = Path(supervisor_module.__file__).read_text(encoding="utf-8")
+        self.assertIn("history=HistoryPolicy.KEEP_LAST", source)
+        self.assertIn("depth=1", source)
+        self.assertIn("reliability=ReliabilityPolicy.RELIABLE", source)
+        self.assertIn("durability=DurabilityPolicy.VOLATILE", source)
+        self.assertIn(
+            '"/ctr/safety/joint_state"',
+            source,
+        )
+        self.assertIn("latest_state_qos,", source)
+        self.assertIn("latest_tactile_qos,", source)
+
+    def test_compact_state_reconstructs_the_exact_deterministic_backbone(self):
+        node = make_node()
+        node._state_model = SimpleNamespace(
+            forward_kinematics=lambda q: SimpleNamespace(
+                backbone_points=[(q[0], q[1], q[2]), (q[3], q[4], q[5])],
+                tip_position=(q[3], q[4], q[5]),
+            )
+        )
+        captured = []
+        node._monotonic = lambda: 12.5
+        node._on_state = lambda message, **kwargs: captured.append((message, kwargs))
+        message = CtrJointState()
+        stamp(message, 2_000_000_000)
+        message.insertion_position = [0.01, 0.02, 0.03]
+        message.rotation_position = [0.1, 0.2, 0.3]
+        message.joint_velocity = [0.0] * 6
+        message.valid = True
+        message.diagnostic_status = "source"
+
+        node._on_compact_state(message)
+
+        self.assertEqual(1, len(captured))
+        reconstructed, receipt = captured[0]
+        self.assertEqual({"receipt_mono": 12.5}, receipt)
+        self.assertTrue(reconstructed.valid)
+        self.assertEqual(
+            [0.01, 0.02, 0.03, 0.1, 0.2, 0.3],
+            list(reconstructed.q),
+        )
+        self.assertEqual(2, len(reconstructed.backbone))
+        self.assertEqual(0.1, reconstructed.tip_pose.position.x)
 
 
 def stamp(message, nanoseconds):
@@ -144,6 +220,7 @@ def make_node(*, tactile_enabled=True, geometry_safe=True):
     node._tactile = None
     node._tactile_received_mono = None
     node._tactile_status = "startup_unavailable"
+    node._tactile_snapshot = (None, None, "startup_unavailable")
     node._stop_latched = False
     node._fault_latched = False
     node._latched_fault_reason = ""
@@ -153,6 +230,23 @@ def make_node(*, tactile_enabled=True, geometry_safe=True):
     node._raw_command_received_mono = None
     node._state = None
     node._state_received_mono = None
+    node._state_snapshot = None
+    node._last_tactile_source_sequence = 0
+    node._last_tactile_source_stamp_s = None
+    node._last_tactile_receipt_mono = None
+    node._tactile_timing_trace = {}
+    node.evaluation_diagnostics_enabled = False
+    node.physical_evidence_transport = supervisor_module.TRANSPORT_ROS
+    node.simulator_paper_evaluation_profile = False
+    node.physical_evidence_freshness_timeout = 0.10
+    node._physical_evidence_reader = None
+    node._last_shared_record = None
+    node._last_shared_sequence = 0
+    node._last_shared_source_stamp_ns = 0
+    node._last_shared_safety_read_mono = 0.0
+    node._last_ros_state_evidence = None
+    node._last_ros_tactile_evidence = None
+    node._shared_ros_equivalence_error = ""
     node.frame_id = "base_link"
     node.safety_enabled = True
     node.tactile_enabled = tactile_enabled
@@ -168,6 +262,49 @@ def make_node(*, tactile_enabled=True, geometry_safe=True):
     node._now_ns = lambda: node._test_now_ns
     node._monotonic = lambda: node._test_now_mono
     return node
+
+
+class FakePhysicalEvidenceReader:
+    def __init__(self, value):
+        self.value = value
+
+    def read(self):
+        if isinstance(self.value, BaseException):
+            raise self.value
+        return self.value
+
+
+def shared_record(node, sequence=1, *, age_s=0.0):
+    now_ns = node._test_now_ns
+    now_mono_ns = int(node._test_now_mono * 1_000_000_000)
+    return supervisor_module.PhysicalEvidenceRecord(
+        session_id="ab" * 32,
+        producer_pid=123,
+        producer_uid=1000,
+        generated_sequence=sequence,
+        source_monotonic_ns=now_mono_ns - int(age_s * 1_000_000_000),
+        source_stamp_ns=now_ns - int(age_s * 1_000_000_000),
+        command_sequence=1,
+        q=(0.0,) * 6,
+        q_dot=(0.0,) * 6,
+        tip_position=(0.0, 0.0, 0.08),
+        whole_backbone_physical_clearance_m=0.02,
+        whole_backbone_safety_clearance_m=0.01,
+        raw_tactile=0.0,
+        filtered_tactile=0.0,
+        tactile_force_n=0.0,
+        tactile_clearance_m=0.02,
+        tactile_region=CtrTactileState.REGION_NO_CONTACT,
+        source_valid=True,
+        simulation=True,
+        frame_valid=True,
+        physical_collision=False,
+        safety_margin_violation=False,
+        tactile_valid=True,
+        contact=False,
+        warning=False,
+        stop=False,
+    )
 
 
 def valid_state():
@@ -213,6 +350,96 @@ class SafetySupervisorLogicTest(unittest.TestCase):
         if tactile_enabled:
             node._on_tactile(tactile(CtrTactileState.REGION_NO_CONTACT))
         return node
+
+    def _shared_ready(self, *, age_s=0.0):
+        node = make_node(tactile_enabled=True)
+        node._test_now_mono = 1.0
+        node.physical_evidence_transport = (
+            supervisor_module.TRANSPORT_AUTHENTICATED_SHARED_MEMORY
+        )
+        node._physical_evidence_reader = FakePhysicalEvidenceReader(
+            shared_record(node, age_s=age_s)
+        )
+        node._raw_command = valid_command()
+        node._raw_command_received_mono = node._test_now_mono
+        return node
+
+    def test_authenticated_physical_evidence_is_the_direct_freshness_authority(self):
+        node = self._shared_ready(age_s=0.02)
+        decision = node._decision()
+        self.assertTrue(decision.allowed)
+        self.assertFalse(decision.fault)
+        self.assertEqual("ready", decision.state_name)
+        self.assertEqual(1, node._tactile_timing_trace["evidence_transport_code"])
+
+    def test_delayed_ros_delivery_does_not_replace_fresh_direct_evidence(self):
+        node = self._shared_ready(age_s=0.02)
+        node._state = valid_state()
+        node._state_received_mono = node._test_now_mono - 0.5
+        node._tactile = None
+        node._tactile_received_mono = node._test_now_mono - 0.5
+        decision = node._decision()
+        self.assertTrue(decision.allowed)
+        self.assertFalse(decision.fault)
+
+    def test_genuinely_stale_direct_evidence_stops_without_ros_fallback(self):
+        node = self._shared_ready(age_s=0.101)
+        node._state = valid_state()
+        node._state_received_mono = node._test_now_mono
+        decision = node._decision()
+        self.assertFalse(decision.allowed)
+        self.assertTrue(decision.fault)
+        self.assertIn(decision.reason, {"state_stale", "tactile_stale"})
+
+    def test_simulator_paper_profile_accepts_below_and_rejects_at_020_seconds(self):
+        below = self._shared_ready(age_s=0.199)
+        below.simulator_paper_evaluation_profile = True
+        below.physical_evidence_freshness_timeout = 0.20
+        self.assertTrue(below._decision().allowed)
+
+        boundary = self._shared_ready(age_s=0.20)
+        boundary.simulator_paper_evaluation_profile = True
+        boundary.physical_evidence_freshness_timeout = 0.20
+        decision = boundary._decision()
+        self.assertFalse(decision.allowed)
+        self.assertEqual("state_stale", decision.reason)
+
+    def test_shared_reader_samples_clocks_after_stable_record_copy(self):
+        node = self._shared_ready(age_s=0.0)
+
+        class CommitDuringRead:
+            def read(self_nonlocal):
+                node._test_now_ns += 50_000_000
+                node._test_now_mono += 0.05
+                return shared_record(node, sequence=2, age_s=0.0)
+
+        node._physical_evidence_reader = CommitDuringRead()
+        decision = node._decision()
+        self.assertTrue(decision.allowed)
+        self.assertNotEqual("physical_evidence_future_dated", decision.reason)
+
+    def test_invalid_direct_channel_never_falls_back_to_ros(self):
+        node = self._shared_ready()
+        node._physical_evidence_reader = FakePhysicalEvidenceReader(
+            supervisor_module.PhysicalEvidenceError(
+                "physical_evidence_integrity_invalid"
+            )
+        )
+        node._state = valid_state()
+        node._state_received_mono = node._test_now_mono
+        decision = node._decision()
+        self.assertFalse(decision.allowed)
+        self.assertEqual("physical_evidence_integrity_invalid", decision.reason)
+
+    def test_repeated_sequence_does_not_refresh_source_timestamp(self):
+        node = self._shared_ready(age_s=0.02)
+        self.assertTrue(node._decision().allowed)
+        node._test_now_ns += 90_000_000
+        node._test_now_mono += 0.09
+        decision = node._decision()
+        self.assertFalse(decision.allowed)
+        self.assertTrue(decision.fault)
+        self.assertIn(decision.reason, {"state_stale", "tactile_stale"})
 
     def test_disabled_tactile_preserves_safe_command(self):
         decision = self._ready(tactile_enabled=False)._decision()
@@ -315,10 +542,15 @@ class SafetySupervisorLogicTest(unittest.TestCase):
 
     def test_stale_tactile_requires_healthy_manual_clear(self):
         node = self._ready()
+        tactile = node._tactile_snapshot[0]
         self._assert_manual_clear_lifecycle(
             node,
-            lambda: setattr(node, "_tactile_received_mono", -1.0),
-            lambda: setattr(node, "_tactile_received_mono", node._test_now_mono),
+            lambda: setattr(node, "_tactile_snapshot", (tactile, -1.0, "eligible_no_contact")),
+            lambda: setattr(
+                node,
+                "_tactile_snapshot",
+                (tactile, node._test_now_mono, "eligible_no_contact"),
+            ),
         )
 
     def test_invalid_command_requires_healthy_manual_clear(self):

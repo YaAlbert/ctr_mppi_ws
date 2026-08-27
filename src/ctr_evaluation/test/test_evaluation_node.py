@@ -2,7 +2,9 @@ import inspect
 import sys
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
+from rclpy.qos import DurabilityPolicy, ReliabilityPolicy
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -10,6 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PACKAGE_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "src" / "ctr_bringup"))
 sys.path.insert(0, str(REPO_ROOT / "src" / "ctr_mppi_controller"))
+sys.path.insert(0, str(REPO_ROOT / "src" / "ctr_sim"))
 
 ctr_interfaces = sys.modules.get("ctr_interfaces", types.ModuleType("ctr_interfaces"))
 ctr_interfaces_msg = sys.modules.get("ctr_interfaces.msg", types.ModuleType("ctr_interfaces.msg"))
@@ -64,6 +67,21 @@ class EvaluationNodeStaticTest(unittest.TestCase):
         self.assertIn("enable_curved_lumen=_bool_value", source)
         self.assertIn("curved_lumen_type=str", source)
 
+    def test_simulator_freshness_profile_is_explicit_and_evaluation_only(self):
+        source = inspect.getsource(evaluation_node.EvaluationNode.__init__)
+        self.assertIn('declare_parameter("simulator_paper_evaluation_profile"', source)
+        self.assertIn("SIMULATOR_PAPER_EVALUATION_FRESHNESS_TIMEOUT_S", source)
+        self.assertIn("diagnostic_evidence_freshness_timeout_s", source)
+
+    def test_evaluator_receives_retained_one_shot_development_target(self):
+        profile = evaluation_node.reference_subscription_qos_for_target_source("cli")
+        self.assertEqual(DurabilityPolicy.TRANSIENT_LOCAL, profile.durability)
+        self.assertEqual(ReliabilityPolicy.RELIABLE, profile.reliability)
+        self.assertEqual(1, profile.depth)
+        self.assertEqual(10, evaluation_node.reference_subscription_qos_for_target_source("profile"))
+        with self.assertRaisesRegex(ValueError, "target_source"):
+            evaluation_node.reference_subscription_qos_for_target_source("unknown")
+
     def test_parse_metadata_json(self):
         self.assertEqual({"case": "circle"}, evaluation_node.parse_metadata('{"case": "circle"}'))
 
@@ -84,15 +102,51 @@ class EvaluationNodeStaticTest(unittest.TestCase):
     def test_inactive_context_message_conversion_error_is_shutdown_only(self):
         rclpy = FakeRclpy(RuntimeError("Unable to convert call argument to Python object"), ok_after_spin=False)
         node = FakeNode()
-        evaluation_node.run_evaluation_node_until_shutdown(rclpy, lambda: node)
+        with mock.patch.object(
+            evaluation_node, "MultiThreadedExecutor", return_value=FakeExecutor(rclpy)
+        ):
+            evaluation_node.run_evaluation_node_until_shutdown(rclpy, lambda: node)
         self.assertTrue(node.destroyed)
         self.assertEqual(0, rclpy.shutdown_count)
 
     def test_runtime_exception_is_re_raised(self):
         rclpy = FakeRclpy(RuntimeError("runtime failure"), ok_after_spin=True)
-        with self.assertRaisesRegex(RuntimeError, "runtime failure"):
-            evaluation_node.run_evaluation_node_until_shutdown(rclpy, FakeNode)
+        with mock.patch.object(
+            evaluation_node, "MultiThreadedExecutor", return_value=FakeExecutor(rclpy)
+        ):
+            with self.assertRaisesRegex(RuntimeError, "runtime failure"):
+                evaluation_node.run_evaluation_node_until_shutdown(rclpy, FakeNode)
         self.assertEqual(1, rclpy.shutdown_count)
+
+    def test_evidence_callbacks_have_dedicated_executor_capacity(self):
+        source = inspect.getsource(evaluation_node)
+        self.assertIn("MultiThreadedExecutor(num_threads=3)", source)
+        self.assertIn("callback_group=self._tactile_callback_group", source)
+        self.assertIn("callback_group=self._safety_callback_group", source)
+
+    def test_tactile_receipt_clock_is_captured_before_record_lock(self):
+        events = []
+
+        class DelayedLock:
+            def __enter__(self):
+                events.append("lock_enter")
+
+            def __exit__(self, *_args):
+                events.append("lock_exit")
+
+        class Node:
+            _last_tactile_receipt_monotonic = 10.0
+            _evidence_record_lock = DelayedLock()
+
+            def _record_tactile(self, _message, **kwargs):
+                events.append(("record", kwargs))
+
+        node = Node()
+        with mock.patch.object(evaluation_node.time, "monotonic", return_value=10.05):
+            evaluation_node.EvaluationNode._on_tactile(node, object())
+        self.assertEqual("lock_enter", events[0])
+        self.assertEqual(10.05, events[1][1]["receipt_monotonic"])
+        self.assertAlmostEqual(0.05, events[1][1]["receipt_gap"])
 
     def test_shutdown_auto_finalize_guard_is_recording_only(self):
         source = inspect.getsource(evaluation_node.EvaluationNode.destroy_node)
@@ -119,6 +173,7 @@ class EvaluationNodeStaticTest(unittest.TestCase):
         class Node:
             def __init__(self):
                 self.recorder = Recorder()
+                self._evidence_record_lock = __import__("threading").RLock()
 
             def _now_seconds(self):
                 return 1.0
@@ -162,6 +217,21 @@ class FakeRclpy:
 
     def shutdown(self):
         self.shutdown_count += 1
+
+
+class FakeExecutor:
+    def __init__(self, rclpy):
+        self.rclpy = rclpy
+
+    def add_node(self, _node):
+        pass
+
+    def spin(self):
+        self.rclpy._spun = True
+        raise self.rclpy.spin_exception
+
+    def shutdown(self):
+        pass
 
 
 if __name__ == "__main__":

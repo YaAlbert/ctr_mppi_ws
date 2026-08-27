@@ -138,7 +138,7 @@ def select_development_target(
     accepted_target_timestamp: float,
     seed: int,
 ) -> TargetSelectionResult:
-    source = _choice(target_source, "target_source", ("cli", "rviz"))
+    source = _choice(target_source, "target_source", ("profile", "cli", "rviz"))
     raw = _vector3(point, "target candidate")
     frame = _non_empty_string(input_frame, "target candidate frame")
     limit = _positive_number(projection_limit, "target projection limit")
@@ -158,7 +158,7 @@ def select_development_target(
             "target_unreachable", timestamp, seed,
         )
     outside_lumen = projection.radial_distance > projection.local_radius + 1.0e-12
-    if outside_lumen and source == "cli":
+    if outside_lumen and source in {"profile", "cli"}:
         return _result(
             source, raw, frame, None, controller_frame, 0.0, False, False,
             "target_outside_lumen", timestamp, seed,
@@ -508,8 +508,13 @@ class DevelopmentTargetSelectorNode(Node):
 
     def _on_timer(self) -> None:
         if self.accepted is not None:
+            # The accepted target is immutable for this run, but evaluation
+            # recording can begin after the selector and controller have
+            # started.  Keep publishing that same authoritative singleton so
+            # every recording window contains real reference samples; this
+            # does not reopen target ownership or fabricate a trajectory.
+            self._publish_reference()
             if self.reference_burst_remaining > 0:
-                self._publish_reference()
                 self.reference_burst_remaining -= 1
             return
         if self.selection_timeout > 0.0 and self._now_seconds() - self.started_at >= self.selection_timeout:

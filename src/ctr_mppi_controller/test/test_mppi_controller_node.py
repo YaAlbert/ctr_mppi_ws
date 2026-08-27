@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 from builtin_interfaces.msg import Time
+from rclpy.qos import DurabilityPolicy, ReliabilityPolicy
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -60,6 +61,7 @@ from ctr_mppi_controller.nodes.mppi_controller_node import (  # noqa: E402
     reference_type_from_config,
     should_publish_metrics,
     solve_reference_kwargs,
+    target_subscription_qos_profile,
     target_sequence_from_path,
     trajectory_metrics_diagnostic_array,
 )
@@ -357,6 +359,13 @@ class MPPIControllerNodeHelpersTest(unittest.TestCase):
         self.assertEqual("external_target", reference_mode_from_config(config, "external_target"))
         with self.assertRaises(ValueError):
             reference_mode_from_config(config, "invalid")
+
+    def test_external_target_subscription_requests_retained_one_shot_reference(self):
+        profile = target_subscription_qos_profile(EXTERNAL_TARGET)
+        self.assertEqual(DurabilityPolicy.TRANSIENT_LOCAL, profile.durability)
+        self.assertEqual(ReliabilityPolicy.RELIABLE, profile.reliability)
+        self.assertEqual(1, profile.depth)
+        self.assertEqual(10, target_subscription_qos_profile(FIXED_TARGET))
 
     def test_controller_applies_reference_override_before_config_validation(self):
         source = (PACKAGE_ROOT / "ctr_mppi_controller" / "nodes" / "mppi_controller_node.py").read_text(encoding="utf-8")

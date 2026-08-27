@@ -110,7 +110,8 @@ def test_slice_7g_topic_graph_has_one_supervised_command_path():
 
     assert 'self.create_publisher(CtrJointCommand, "/ctr/mppi_command"' in controller
     assert "slice_7g_controller_bypass" in controller
-    assert 'self.create_subscription(CtrJointCommand, "/ctr/mppi_command"' in safety
+    assert 'CtrJointCommand, "/ctr/mppi_command", self._on_command, 10,' in safety
+    assert "callback_group=self._command_callback_group" in safety
     assert 'self.create_publisher(CtrJointCommand, "/ctr/safe_command"' in safety
     assert '"/ctr/safe_command",' in simulator
     assert '"/ctr/tactile/state"' in simulator and '"/ctr/tactile/state"' in evaluator

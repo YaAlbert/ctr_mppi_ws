@@ -9,6 +9,7 @@ import rclpy
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path as NavPath
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from ctr_bringup.parameter_validation import (
     load_parameter_files,
@@ -62,6 +63,19 @@ from ctr_mppi_controller.reference_validation import (
 from ctr_mppi_controller.trajectory_metrics import TrajectoryMetricsAccumulator, TrajectoryMetricsConfig
 from rclpy.node import Node
 from rclpy.parameter import Parameter
+
+
+def target_subscription_qos_profile(reference_mode: str):
+    """Request retained one-shot targets only for the external-target contract."""
+
+    if reference_mode == EXTERNAL_TARGET:
+        return QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+    return 10
 
 
 class MPPIControllerNode(Node):
@@ -179,11 +193,27 @@ class MPPIControllerNode(Node):
         )
         self.last_trajectory_metrics_publish_s: float | None = None
 
-        self.state_sub = self.create_subscription(CtrState, "/ctr/state", self._on_state, 10)
+        state_qos = (
+            QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                durability=DurabilityPolicy.VOLATILE,
+            )
+            if development_enabled
+            else 10
+        )
+        self.state_sub = self.create_subscription(
+            CtrState, "/ctr/state", self._on_state, state_qos
+        )
         self.tactile_sub = None
         if self.tactile_cost_config.enabled:
             self.tactile_sub = self.create_subscription(CtrTactileState, "/ctr/tactile/state", self._on_tactile, 10)
-        self.target_sub = self.create_subscription(PoseStamped, "/ctr/reference/tip", self._on_target, 10)
+        self.target_sub = self.create_subscription(
+            PoseStamped,
+            "/ctr/reference/tip",
+            self._on_target,
+            target_subscription_qos_profile(self.reference_mode),
+        )
         self.horizon_sub = self.create_subscription(NavPath, "/ctr/reference/horizon", self._on_reference_horizon, 10)
         self.command_pub = self.create_publisher(CtrJointCommand, "/ctr/mppi_command", 10)
         self.metrics_pub = self.create_publisher(CtrControllerMetrics, "/ctr/controller/metrics", 10)
@@ -416,6 +446,7 @@ class MPPIControllerNode(Node):
     def _on_timer(self) -> None:
         if self.latest_state is None:
             return
+        iteration_start_monotonic_s = perf_counter()
 
         try:
             current_time_s = ros_time_seconds(self.get_clock().now())
@@ -472,6 +503,7 @@ class MPPIControllerNode(Node):
         self.metrics_pub.publish(metrics)
         evaluation_diagnostics_pub = getattr(self, "evaluation_diagnostics_pub", None)
         if evaluation_diagnostics_pub is not None:
+            iteration_end_monotonic_s = perf_counter()
             evaluation_diagnostics_pub.publish(
                 mppi_evaluation_diagnostics_array(
                     result,
@@ -479,6 +511,8 @@ class MPPIControllerNode(Node):
                     stamp=stamp,
                     ros_message_conversion_s=ros_message_conversion_s,
                     weights=self._diagnostic_weights(),
+                    iteration_start_monotonic_s=iteration_start_monotonic_s,
+                    iteration_end_monotonic_s=iteration_end_monotonic_s,
                 )
             )
 
@@ -759,6 +793,8 @@ def mppi_evaluation_diagnostics_array(
     stamp,
     ros_message_conversion_s: float,
     weights: dict[str, float],
+    iteration_start_monotonic_s: float | None = None,
+    iteration_end_monotonic_s: float | None = None,
 ) -> DiagnosticArray:
     """Build one closed evaluation-only optimizer diagnostic record."""
 
@@ -778,6 +814,13 @@ def mppi_evaluation_diagnostics_array(
         ("effective_sample_weight", result.effective_sample_weight),
         ("ros_message_conversion_s", ros_message_conversion_s),
     ]
+    if iteration_start_monotonic_s is not None and iteration_end_monotonic_s is not None:
+        fields.extend(
+            (
+                ("iteration_start_monotonic_s", iteration_start_monotonic_s),
+                ("iteration_end_monotonic_s", iteration_end_monotonic_s),
+            )
+        )
     for name in sorted(diagnostics.best_raw_terms):
         fields.append((f"raw.{name}", diagnostics.best_raw_terms[name]))
         fields.append((f"weighted.{name}", diagnostics.best_weighted_terms[name]))

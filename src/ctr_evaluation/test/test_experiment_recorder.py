@@ -177,6 +177,49 @@ def strict_json_load(path: Path):
 
 
 class ExperimentRecorderTest(unittest.TestCase):
+    def test_simulator_profile_uses_020_only_for_diagnostic_staleness(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = project_config(temp_dir)
+            config["evaluation"]["diagnostic_data_collection"] = True
+            config["evaluation"]["simulator_paper_evaluation_profile"] = True
+            config["evaluation"]["diagnostic_evidence_freshness_timeout_s"] = 0.20
+            recorder = ExperimentRecorder(
+                config=EvaluationRecorderConfig.from_project_config(config),
+                project_config=config,
+            )
+            recorder.start(experiment_name="simulator_freshness", monotonic_time=0.0)
+            add_samples(recorder)
+            for timestamp, age in ((0.1, 0.199), (0.4, 0.20)):
+                recorder.record_tactile_evidence(
+                    timestamp=timestamp,
+                    received_timestamp=timestamp + age,
+                    frame_id="base_link",
+                    source="simulated",
+                    raw_values=[0.0],
+                    filtered_values=[0.0],
+                    force_magnitude=0.0,
+                    clearance_m=0.02,
+                    contact=False,
+                    warning=False,
+                    stop=False,
+                    valid=True,
+                    region=0,
+                )
+            result = recorder.stop(monotonic_time=1.0)
+            self.assertEqual(0, result.summary["paper_metrics"]["tactile_stale_event_count"])
+            self.assertEqual(
+                1,
+                result.summary["paper_metrics"][
+                    "ros_tactile_delivery_stale_event_count"
+                ],
+            )
+            self.assertEqual(
+                0.20,
+                result.metadata["configuration"][
+                    "diagnostic_evidence_freshness_timeout_s"
+                ],
+            )
+
     def test_evaluation_diagnostics_are_preserved_as_raw_csv_and_plots(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config = project_config(temp_dir)

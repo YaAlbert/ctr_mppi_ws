@@ -1,8 +1,15 @@
 import copy
+from dataclasses import FrozenInstanceError
+import inspect
+import json
+import os
 import sys
+import threading
 import types
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -50,8 +57,22 @@ from ctr_sim.lumen_diagnostics import STATUS_COLLISION, STATUS_MARGIN  # noqa: E
 import ctr_sim.nodes.simulator_node as simulator_node_module  # noqa: E402
 from ctr_sim.nodes.simulator_node import (  # noqa: E402
     CTRSimulatorNode,
+    _BoundedProcessTimingTrace,
+    _LatestPhysicalSampleMailbox,
+    _LatestProcessCommandMailbox,
+    _LatestProcessPhysicalSampleMailbox,
+    _PhysicalSample,
+    _PhysicalTactileSample,
+    _PHYSICAL_SOURCE_TRACE_FIELDS,
+    _PUBLICATION_TRACE_FIELDS,
+    _apply_development_publication_affinity,
+    _apply_development_source_affinity,
+    _next_physical_deadline,
     _point_from_array,
+    _retain_eval007_timing_trace,
+    _wait_for_physical_deadline,
     development_marker_qos_profile,
+    source_evidence_qos_profile,
 )
 from rclpy.qos import DurabilityPolicy, ReliabilityPolicy  # noqa: E402
 from visualization_msgs.msg import Marker  # noqa: E402
@@ -140,17 +161,392 @@ def sample_backbone():
     )
 
 
+def physical_sample(sequence=7):
+    return _PhysicalSample(
+        sequence=sequence,
+        stamp_sec=12,
+        stamp_nanosec=34,
+        expected_monotonic_s=10.01,
+        source_start_monotonic_s=10.012,
+        source_complete_monotonic_s=10.013,
+        source_lateness_s=0.002,
+        source_duration_s=0.001,
+        q=(0.0,) * 6,
+        q_dot=(0.0,) * 6,
+        tip_position=(0.01, 0.0, 0.08),
+        backbone_points=((0.0, 0.0, 0.0), (0.01, 0.0, 0.08)),
+        command_age_s=0.02,
+        command_saturated=False,
+        command_valid=True,
+        diagnostic_status="safe command accepted",
+        model_status="model valid",
+        tactile=_PhysicalTactileSample(
+            raw_signal=0.0,
+            filtered_signal=0.0,
+            force_n=0.0,
+            clearance_m=0.02,
+            contact=False,
+            warning=False,
+            stop=False,
+            valid=True,
+            diagnostic_status="simulated tactile valid",
+            region=0,
+        ),
+        source_timing=(("callback_wall_s", 0.001), ("source_thread_id", 42)),
+    )
+
+
 class SimulatorNodeLumenRuntimeTest(unittest.TestCase):
-    def test_paper_diagnostics_rate_limit_only_visualization_work(self):
+    def test_tactile_sampling_is_bound_to_new_physical_state_and_records_source_timing(self):
+        node = simulator_shell(curved_config("circular_arc"))
+        node.dt = 0.01
+        node.tactile_source_state_timeout = 0.10
+        node._state_lock = __import__("threading").RLock()
+        node._latest_tactile_tip = np.array([0.01, 0.0, 0.08])
+        node._latest_state_source_mono = 10.0
+        node._physics_sequence = 7
+        node._physics_callback_start_mono = 10.0
+        node._physics_callback_lateness_s = 0.002
+        node._physics_callback_duration_s = 0.004
+        node._tactile_sequence = 0
+        node._tactile_previous_callback_duration_s = 0.0
+        node.evaluation_diagnostics_enabled = True
+        published = []
+        node.tactile_pub = SimpleNamespace(publish=published.append)
+
+        with patch.object(
+            simulator_node_module.time,
+            "monotonic",
+            side_effect=(10.014, 10.015),
+        ), patch.object(
+            simulator_node_module,
+            "_tactile_message_from_sample",
+            return_value=SimpleNamespace(
+                valid=True, diagnostic_status="eligible_no_contact"
+            ),
+        ):
+            node._publish_tactile_for_physical_state(
+                physical_sample(),
+                mailbox_version=1,
+            )
+
+        self.assertEqual(1, len(published))
+        status = published[0].diagnostic_status
+        self.assertIn("|ctr_tactile_timing_v1|", status)
+        self.assertIn("sequence=7", status)
+        self.assertIn("physics_sequence=7", status)
+        self.assertIn("mailbox_overwrites=0", status)
+        self.assertTrue(published[0].valid)
+
+    def test_latest_sample_mailbox_is_single_slot_and_sample_is_deeply_immutable(self):
+        mailbox = _LatestPhysicalSampleMailbox()
+        first = physical_sample(1)
+        second = physical_sample(2)
+        self.assertEqual(1, mailbox.put(first))
+        self.assertEqual(2, mailbox.put(second))
+        delivery = mailbox.take_after(0, threading.Event())
+        self.assertEqual((2, second), delivery)
+        with self.assertRaises(FrozenInstanceError):
+            second.sequence = 3
+        with self.assertRaises(TypeError):
+            second.q[0] = 1.0
+        mailbox.close()
+        self.assertIsNone(mailbox.take_after(2, threading.Event()))
+
+    def test_process_mailbox_is_single_slot_and_preserves_exact_immutable_sample(self):
+        context = __import__("multiprocessing").get_context("spawn")
+        mailbox = _LatestProcessPhysicalSampleMailbox(context)
+        stop_event = context.Event()
+        self.assertEqual(1, mailbox.put(physical_sample(1)))
+        self.assertEqual(2, mailbox.put(physical_sample(2)))
+        self.assertEqual((2, physical_sample(2)), mailbox.take_after(0, stop_event))
+        self.assertEqual((2, physical_sample(2)), mailbox.take_after(1, stop_event))
+        mailbox.close()
+        self.assertIsNone(mailbox.take_after(2, stop_event))
+
+    def test_bounded_process_timing_trace_preserves_exact_numeric_layers(self):
+        context = __import__("multiprocessing").get_context("spawn")
+        trace = _BoundedProcessTimingTrace(context, _PHYSICAL_SOURCE_TRACE_FIELDS)
+        first = tuple(range(len(_PHYSICAL_SOURCE_TRACE_FIELDS)))
+        second = tuple(value + 100 for value in first)
+        trace.append(first)
+        trace.append(second)
+
+        snapshot = trace.snapshot()
+
+        self.assertEqual(
+            "ctr-eval007-bounded-process-timing-trace-1", snapshot["schema"]
+        )
+        self.assertEqual(list(_PHYSICAL_SOURCE_TRACE_FIELDS), snapshot["fields"])
+        self.assertEqual([list(first), list(second)], snapshot["rows"])
+        self.assertEqual(2, snapshot["write_count"])
+        self.assertEqual(0, snapshot["overwritten_count"])
+        with self.assertRaises(TypeError):
+            trace.append(tuple(False for _field in _PHYSICAL_SOURCE_TRACE_FIELDS))
+
+    def test_eval007_trace_retention_requires_owned_0700_root_and_is_closed(self):
+        context = __import__("multiprocessing").get_context("spawn")
+        source = _BoundedProcessTimingTrace(context, _PHYSICAL_SOURCE_TRACE_FIELDS)
+        publication = _BoundedProcessTimingTrace(context, _PUBLICATION_TRACE_FIELDS)
+        source.append(tuple(range(len(_PHYSICAL_SOURCE_TRACE_FIELDS))))
+        publication.append(tuple(range(len(_PUBLICATION_TRACE_FIELDS))))
+        with __import__("tempfile").TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            root.chmod(0o700)
+            retained = _retain_eval007_timing_trace(
+                root,
+                source,
+                {"tactile": publication},
+            )
+            document = json.loads(retained.read_text(encoding="utf-8"))
+            self.assertEqual("ctr-eval007-simulator-timing-bundle-1", document["schema"])
+            self.assertEqual(1, document["physical_source"]["write_count"])
+            self.assertEqual(1, document["publication_workers"]["tactile"]["write_count"])
+            self.assertEqual(0o600, retained.stat().st_mode & 0o777)
+            root.chmod(0o755)
+            with self.assertRaises(PermissionError):
+                _retain_eval007_timing_trace(root, source, {})
+
+    def test_development_process_publishers_share_one_source_handoff(self):
+        source = inspect.getsource(CTRSimulatorNode.__init__)
+        timer_source = inspect.getsource(CTRSimulatorNode._on_timer)
+        self.assertIn("shared_mailbox = _LatestProcessPhysicalSampleMailbox", source)
+        self.assertIn("self._state_mailbox = shared_mailbox", source)
+        self.assertIn("self._tactile_mailbox = shared_mailbox", source)
+        self.assertIn("self._auxiliary_mailbox = shared_mailbox", source)
+        self.assertNotIn('(\"safety_state\", self._state_mailbox)', source)
+        self.assertEqual(1, timer_source.count("_mailbox.put(sample)"))
+
+    def test_tactile_worker_emits_coherent_compact_safety_state(self):
+        source = inspect.getsource(simulator_node_module._publication_process_main)
+        self.assertIn('"/ctr/safety/joint_state"', source)
+        self.assertIn("CtrJointState", source)
+        self.assertIn("source_evidence_qos_profile()", source)
+        self.assertIn('publishers["safety_state"].publish(', source)
+        self.assertLess(
+            source.index('publishers["safety_state"].publish('),
+            source.index('publishers["tactile"].publish(message)'),
+        )
+
+    def test_process_command_mailbox_returns_one_exact_latest_snapshot(self):
+        context = __import__("multiprocessing").get_context("spawn")
+        mailbox = _LatestProcessCommandMailbox(context)
+        command = (0.1, 0.2, 0.3, -0.1, -0.2, -0.3)
+        self.assertEqual(1, mailbox.put(command, valid=True, stamp_ns=1234))
+        self.assertEqual((1, command, True, 1234), mailbox.snapshot())
+        with self.assertRaises(TypeError):
+            mailbox.put(command, valid=1, stamp_ns=1234)
+
+    def test_physical_deadline_wait_is_absolute_and_stop_bounded(self):
+        stop_event = threading.Event()
+        started = __import__("time").monotonic()
+        self.assertTrue(_wait_for_physical_deadline(started + 0.005, stop_event))
+        elapsed = __import__("time").monotonic() - started
+        self.assertGreaterEqual(elapsed, 0.004)
+        stop_event.set()
+        self.assertFalse(
+            _wait_for_physical_deadline(__import__("time").monotonic() + 1.0, stop_event)
+        )
+
+    def test_late_physical_deadline_catches_up_once_without_backlog_or_extra_wait(self):
+        self.assertEqual(10.01, _next_physical_deadline(10.0, 0.01, 10.005))
+        self.assertEqual(10.2, _next_physical_deadline(10.0, 0.01, 10.2))
+        with self.assertRaises(ValueError):
+            _next_physical_deadline(10.0, 0.0, 10.0)
+
+    def test_publication_affinity_separates_state_and_tactile_physical_cores(self):
+        with __import__("tempfile").TemporaryDirectory() as tmp:
+            topology = Path(tmp)
+            for cpu, core in ((2, 2), (6, 2), (3, 3), (7, 3)):
+                root = topology / f"cpu{cpu}" / "topology"
+                root.mkdir(parents=True)
+                (root / "physical_package_id").write_text("0", encoding="utf-8")
+                (root / "core_id").write_text(str(core), encoding="utf-8")
+            observed = []
+            current = {2, 3, 6, 7}
+
+            def set_affinity(_pid, cpus):
+                current.clear()
+                current.update(cpus)
+                observed.append(tuple(sorted(cpus)))
+
+            environment = {"CTR_DEVELOPMENT_EVALUATION_CPU_PARTITION": "1"}
+            with patch.object(os, "sched_getaffinity", side_effect=lambda _pid: set(current)), patch.object(
+                os, "sched_setaffinity", side_effect=set_affinity
+            ):
+                self.assertEqual(
+                    (3,),
+                    _apply_development_publication_affinity(
+                        "tactile", environment, topology
+                    ),
+                )
+            self.assertEqual([(3,)], observed)
+
+    def test_state_publication_block_cannot_delay_tactile_worker_or_source_handoff(self):
+        node = object.__new__(CTRSimulatorNode)
+        node._source_stop_event = threading.Event()
+        node._publication_failures = {}
+        node._state_mailbox = _LatestPhysicalSampleMailbox()
+        node._tactile_mailbox = _LatestPhysicalSampleMailbox()
+        node._auxiliary_mailbox = _LatestPhysicalSampleMailbox()
+        node.get_logger = lambda: SimpleNamespace(error=lambda _message: None)
+        state_entered = threading.Event()
+        state_release = threading.Event()
+        tactile_sequences = []
+
+        def blocked_state(_sample, _version, _previous):
+            state_entered.set()
+            state_release.wait(timeout=1.0)
+
+        state_worker = threading.Thread(
+            target=node._run_publication_worker,
+            args=("state", node._state_mailbox, blocked_state),
+        )
+        tactile_worker = threading.Thread(
+            target=node._run_publication_worker,
+            args=(
+                "tactile",
+                node._tactile_mailbox,
+                lambda sample, _version, _previous: tactile_sequences.append(sample.sequence),
+            ),
+        )
+        state_worker.start()
+        tactile_worker.start()
+        node._state_mailbox.put(physical_sample(1))
+        node._tactile_mailbox.put(physical_sample(1))
+        self.assertTrue(state_entered.wait(timeout=1.0))
+        node._state_mailbox.put(physical_sample(2))
+        node._tactile_mailbox.put(physical_sample(2))
+        for _ in range(100):
+            if tactile_sequences and tactile_sequences[-1] == 2:
+                break
+            threading.Event().wait(0.005)
+        self.assertEqual(2, tactile_sequences[-1])
+        state_release.set()
+        node._source_stop_event.set()
+        node._close_publication_mailboxes()
+        state_worker.join(timeout=1.0)
+        tactile_worker.join(timeout=1.0)
+        self.assertFalse(state_worker.is_alive())
+        self.assertFalse(tactile_worker.is_alive())
+        self.assertEqual({}, node._publication_failures)
+
+    def test_console_keeps_visualization_off_the_physical_state_callback(self):
+        source = (PACKAGE_ROOT / "ctr_sim" / "nodes" / "simulator_node.py").read_text(encoding="utf-8")
+        self.assertIn("MutuallyExclusiveCallbackGroup", source)
+        self.assertIn("SingleThreadedExecutor()", source)
+        self.assertIn("target=_physical_source_process_main", source)
+        self.assertIn("target=_publication_process_main", source)
+        self.assertIn('multiprocessing.get_context("spawn")', source)
+        self.assertIn("self._publish_tactile_for_physical_state(", source)
+        self.assertIn("callback_group=self._visualization_callback_group", source)
+        self.assertIn("self.tactile_timer = None", source)
+        self.assertIn("stamp = self.get_clock().now().to_msg()", source)
+        timer_body = source[source.index("    def _on_timer"):source.index("    def _publish_sample_synchronously")]
+        self.assertNotIn(".publish(", timer_body)
+
+    def test_source_evidence_qos_is_reliable_latest_sample(self):
+        qos = source_evidence_qos_profile()
+        self.assertEqual(1, qos.depth)
+        self.assertEqual(ReliabilityPolicy.RELIABLE, qos.reliability)
+        self.assertEqual(DurabilityPolicy.VOLATILE, qos.durability)
+        development_state = source_evidence_qos_profile(reliable=False)
+        self.assertEqual(ReliabilityPolicy.BEST_EFFORT, development_state.reliability)
+
+    def test_development_source_affinity_is_exact_and_reconciled(self):
+        observed = []
+        current = {1, 5}
+
+        def set_affinity(pid, cpus):
+            current.clear()
+            current.update(cpus)
+            observed.append((pid, set(cpus)))
+
+        with patch.object(simulator_node_module.os, "sched_setaffinity", side_effect=set_affinity), patch.object(
+            simulator_node_module.os, "sched_getaffinity", side_effect=lambda _pid: set(current)
+        ):
+            result = _apply_development_source_affinity(
+                {
+                    "CTR_DEVELOPMENT_EVALUATION_CPU_PARTITION": "1",
+                    "CTR_DEVELOPMENT_SIMULATOR_CPU_LIST": "1,5",
+                }
+            )
+        self.assertEqual((1,), result)
+        self.assertEqual([(0, {1})], observed)
+
+    def test_bounded_source_loop_integrates_on_its_own_thread_until_stopped(self):
+        node = object.__new__(CTRSimulatorNode)
+        node._source_stop_event = threading.Event()
+        node._source_failure = None
+        node._source_affinity = ()
+        node._publication_processes = []
+        node._physics_expected_mono = 0.0
+        callbacks = []
+
+        def source_callback():
+            callbacks.append(threading.current_thread().name)
+            node._source_stop_event.set()
+
+        node._on_timer = source_callback
+        node.get_logger = lambda: SimpleNamespace(error=lambda _message: None)
+        with patch.object(simulator_node_module, "_apply_development_source_affinity", return_value=(1, 5)):
+            worker = threading.Thread(
+                target=node._run_bounded_source,
+                name="test-bounded-source",
+            )
+            worker.start()
+            worker.join(timeout=1.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(["test-bounded-source"], callbacks)
+        self.assertEqual((1, 5), node._source_affinity)
+        self.assertIsNone(node._source_failure)
+
+    def test_visualization_work_is_skipped_without_a_marker_consumer(self):
+        node = simulator_shell(curved_config("circular_arc"))
+        node.marker_pub = SimpleNamespace(get_subscription_count=lambda: 0)
+        node.development_marker_pubs = {
+            "ctr_backbone": SimpleNamespace(get_subscription_count=lambda: 0)
+        }
+        self.assertFalse(node._visualization_consumers_present())
+        node.development_marker_pubs["ctr_backbone"] = SimpleNamespace(
+            get_subscription_count=lambda: 1
+        )
+        self.assertTrue(node._visualization_consumers_present())
+
+    def test_auxiliary_publishers_skip_serialization_without_consumers(self):
+        publisher = SimpleNamespace(get_subscription_count=lambda: 0)
+        self.assertFalse(simulator_node_module.CTRSimulatorNode._publisher_has_consumers(publisher))
+        publisher.get_subscription_count = lambda: 1
+        self.assertTrue(simulator_node_module.CTRSimulatorNode._publisher_has_consumers(publisher))
+
+        source = (PACKAGE_ROOT / "ctr_sim" / "nodes" / "simulator_node.py").read_text(encoding="utf-8")
+        state_index = source.index("self.state_pub.publish")
+        tip_index = source.index("self.tip_pub.publish", state_index)
+        self.assertLess(state_index, tip_index)
+        self.assertIn("self._diagnostics_publish_period_s = 0.10", source)
+
+    def test_high_rate_state_message_storage_is_reused_without_geometry_changes(self):
+        node = simulator_shell(curved_config("circular_arc"))
+        node._backbone_point_cache = []
+        node._tip_pose_cache = None
+        node._state_message_cache = None
+        first = node._backbone_points_for_publish(np.asarray([[1.0, 2.0, 3.0]]))
+        second = node._backbone_points_for_publish(np.asarray([[4.0, 5.0, 6.0]]))
+        self.assertIs(first, second)
+        self.assertEqual((4.0, 5.0, 6.0), (second[0].x, second[0].y, second[0].z))
+
+    def test_configured_marker_rate_is_independent_of_diagnostics_mode(self):
         node = simulator_shell(curved_config("circular_arc"))
         node.evaluation_diagnostics_enabled = True
         self.assertTrue(node._runtime_marker_publication_due(_time_msg(1.0)))
         self.assertFalse(node._runtime_marker_publication_due(_time_msg(1.1)))
         self.assertTrue(node._runtime_marker_publication_due(_time_msg(1.2)))
 
+        node._last_runtime_marker_publish_time_s = None
         node.evaluation_diagnostics_enabled = False
-        self.assertTrue(node._runtime_marker_publication_due(_time_msg(1.21)))
-        self.assertTrue(node._runtime_marker_publication_due(_time_msg(1.22)))
+        self.assertTrue(node._runtime_marker_publication_due(_time_msg(1.0)))
+        self.assertFalse(node._runtime_marker_publication_due(_time_msg(1.1)))
+        self.assertTrue(node._runtime_marker_publication_due(_time_msg(1.2)))
 
     def test_simulator_source_uses_shared_lumen_factory(self):
         source = (PACKAGE_ROOT / "ctr_sim" / "nodes" / "simulator_node.py").read_text(encoding="utf-8")

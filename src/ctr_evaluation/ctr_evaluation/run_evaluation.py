@@ -11,10 +11,12 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -25,6 +27,17 @@ import numpy as np
 import yaml
 
 from ctr_bringup.parameter_validation import load_parameter_files, validate_config_paths, validate_or_raise
+from ctr_bringup.development_physical_evidence import (
+    ROOT_ENV as PHYSICAL_EVIDENCE_ROOT_ENV,
+    SESSION_ENV as PHYSICAL_EVIDENCE_SESSION_ENV,
+    SOCKET_FILENAME as PHYSICAL_EVIDENCE_SOCKET_FILENAME,
+    PRODUCTION_HARDWARE_FRESHNESS_TIMEOUT_S,
+    SIMULATOR_PAPER_EVALUATION_FRESHNESS_TIMEOUT_S,
+    TRANSPORT_AUTHENTICATED_SHARED_MEMORY,
+    TRANSPORT_ENV as PHYSICAL_EVIDENCE_TRANSPORT_ENV,
+    TRANSPORT_ROS,
+    TRANSPORT_VALUES as PHYSICAL_EVIDENCE_TRANSPORT_VALUES,
+)
 from ctr_bringup.slice_7g_profile import (
     apply_slice_7g_development_simulation_profile,
     apply_slice_7g_simulation_profile,
@@ -57,7 +70,9 @@ FIXED_TARGET_TASKS = (TASK_CYLINDER_NAVIGATION, TASK_CURVED_LUMEN_NAVIGATION)
 DEFAULT_CURVED_LUMEN_TYPE = "circular_arc"
 DEFAULT_CURVED_SCENARIO = CENTERLINE_TARGET
 DEVELOPMENT_TARGET_SOURCES = ("profile", "cli", "rviz")
-PAPER_DIAGNOSTIC_FINALIZATION_TIMEOUT_S = 60.0
+PAPER_DIAGNOSTIC_FINALIZATION_TIMEOUT_S = 120.0
+DEVELOPMENT_EVALUATION_CPU_PARTITION_ENV = "CTR_DEVELOPMENT_EVALUATION_CPU_PARTITION"
+DEVELOPMENT_SIMULATOR_CPU_LIST_ENV = "CTR_DEVELOPMENT_SIMULATOR_CPU_LIST"
 
 CONFIG_NAMES = (
     "robot_params.yaml",
@@ -95,6 +110,26 @@ DEVELOPMENT_SIMULATION_DISCLAIMER = (
 DEVELOPMENT_DOMAIN_ROOT = Path("/tmp/ctr_mppi_slice_7g_development_domains")
 RUN_STARTED_RE = re.compile(r"started evaluation run (?P<run_id>[A-Za-z0-9_-]+)")
 RUN_COMPLETED_RE = re.compile(r"completed evaluation run (?P<run_id>[A-Za-z0-9_-]+): (?P<path>.+)$")
+
+
+def simulator_freshness_profile_metadata(args: argparse.Namespace) -> dict[str, Any]:
+    """Describe the opt-in simulation watchdog without changing production."""
+
+    enabled = bool(getattr(args, "simulator_paper_evaluation_profile", False))
+    return {
+        "simulator_paper_evaluation_profile": enabled,
+        "physical_evidence_freshness_timeout_s": (
+            SIMULATOR_PAPER_EVALUATION_FRESHNESS_TIMEOUT_S
+            if enabled
+            else PRODUCTION_HARDWARE_FRESHNESS_TIMEOUT_S
+        ),
+        "production_hardware_freshness_timeout_s": (
+            PRODUCTION_HARDWARE_FRESHNESS_TIMEOUT_S
+        ),
+        "host_realtime_scheduling": False if enabled else None,
+        "controller_realtime_claim": False,
+        "simulator_watchdog_is_production_validation": False,
+    }
 
 
 @dataclass(frozen=True)
@@ -216,6 +251,7 @@ class ProcessRecord:
     process: subprocess.Popen
     identity: ProcessIdentity
     start_wall_time: str
+    leader_only_sigint: bool = False
     exit_code: int | None = None
     shutdown_events: list[dict[str, Any]] = field(default_factory=list)
 
@@ -228,6 +264,7 @@ class ProcessRecord:
             "command_line": self.identity.command_line,
             "start_time_ticks": self.identity.start_time_ticks,
             "started_at": self.start_wall_time,
+            "leader_only_sigint": self.leader_only_sigint,
             "exit_code": self.exit_code,
             "shutdown_events": self.shutdown_events,
         }
@@ -266,6 +303,98 @@ class DevelopmentDomainLease:
             os.close(descriptor)
 
 
+@dataclass
+class DevelopmentPhysicalEvidenceSession:
+    """Runner-owned authenticated root for one non-production memfd channel."""
+
+    root: Path
+    device: int
+    inode: int
+
+    def close(self) -> None:
+        try:
+            member = os.lstat(self.root)
+        except FileNotFoundError:
+            return
+        if (
+            not stat.S_ISDIR(member.st_mode)
+            or stat.S_ISLNK(member.st_mode)
+            or member.st_uid != os.getuid()
+            or stat.S_IMODE(member.st_mode) != 0o700
+            or (member.st_dev, member.st_ino) != (self.device, self.inode)
+        ):
+            raise OrchestrationError(
+                "development physical evidence session root identity changed"
+            )
+        socket_path = self.root / PHYSICAL_EVIDENCE_SOCKET_FILENAME
+        try:
+            socket_member = os.lstat(socket_path)
+        except FileNotFoundError:
+            pass
+        else:
+            if (
+                not stat.S_ISSOCK(socket_member.st_mode)
+                or socket_member.st_uid != os.getuid()
+                or stat.S_IMODE(socket_member.st_mode) != 0o600
+            ):
+                raise OrchestrationError(
+                    "development physical evidence socket identity changed"
+                )
+            os.unlink(socket_path)
+        if os.listdir(self.root):
+            raise OrchestrationError(
+                "development physical evidence session root contains unexpected members"
+            )
+        os.rmdir(self.root)
+
+
+def development_physical_evidence_environment(
+    environment: dict[str, str],
+    transport: str,
+) -> tuple[dict[str, str], DevelopmentPhysicalEvidenceSession | None]:
+    """Create one explicit same-user channel root without changing defaults."""
+
+    result = dict(environment)
+    if transport == TRANSPORT_ROS:
+        result[PHYSICAL_EVIDENCE_TRANSPORT_ENV] = TRANSPORT_ROS
+        result.pop(PHYSICAL_EVIDENCE_ROOT_ENV, None)
+        result.pop(PHYSICAL_EVIDENCE_SESSION_ENV, None)
+        return result, None
+    if transport != TRANSPORT_AUTHENTICATED_SHARED_MEMORY:
+        raise OrchestrationError("physical evidence transport is invalid")
+    session_id = secrets.token_hex(32)
+    temporary_parent = Path(result.get("TMPDIR", "/tmp")).resolve(strict=True)
+    root = Path(
+        tempfile.mkdtemp(
+            prefix=f"ctr-pe-{session_id[:8]}-",
+            dir=temporary_parent,
+        )
+    )
+    os.chmod(root, 0o700)
+    if len(os.fsencode(root / PHYSICAL_EVIDENCE_SOCKET_FILENAME)) >= 104:
+        os.rmdir(root)
+        raise OrchestrationError(
+            "development physical evidence socket path exceeds the AF_UNIX limit"
+        )
+    member = os.lstat(root)
+    if (
+        not stat.S_ISDIR(member.st_mode)
+        or member.st_uid != os.getuid()
+        or stat.S_IMODE(member.st_mode) != 0o700
+    ):
+        raise OrchestrationError(
+            "development physical evidence session root could not be authenticated"
+        )
+    result[PHYSICAL_EVIDENCE_TRANSPORT_ENV] = transport
+    result[PHYSICAL_EVIDENCE_ROOT_ENV] = str(root)
+    result[PHYSICAL_EVIDENCE_SESSION_ENV] = session_id
+    return result, DevelopmentPhysicalEvidenceSession(
+        root=root,
+        device=member.st_dev,
+        inode=member.st_ino,
+    )
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description="Run a deterministic zero-command baseline and MPPI candidate evaluation pair.")
@@ -296,6 +425,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--paper-diagnostics",
         action="store_true",
         help="Record evaluation-only MPPI cost/timing and tactile/safety evidence.",
+    )
+    parser.add_argument(
+        "--physical-evidence-transport",
+        choices=PHYSICAL_EVIDENCE_TRANSPORT_VALUES,
+        default=TRANSPORT_ROS,
+        help=(
+            "Explicit development-evaluation freshness transport; production "
+            "and ordinary simulation default to ros."
+        ),
+    )
+    parser.add_argument(
+        "--simulator-paper-evaluation-profile",
+        action="store_true",
+        help=(
+            "Use the explicit non-real-time simulator paper profile: the "
+            "authenticated physical-evidence watchdog is 0.20 s while the "
+            "production/hardware contract remains 0.10 s."
+        ),
     )
     parser.add_argument("--config-path", action="append", default=[])
     parser.add_argument(
@@ -479,6 +626,30 @@ def reference_subscription_qos_for_target_source(target_source: str) -> Any:
 
 
 def validate_task_options(args: argparse.Namespace) -> None:
+    physical_transport = str(
+        getattr(args, "physical_evidence_transport", TRANSPORT_ROS)
+    )
+    if physical_transport not in PHYSICAL_EVIDENCE_TRANSPORT_VALUES:
+        raise OrchestrationError("physical evidence transport is invalid")
+    if physical_transport == TRANSPORT_AUTHENTICATED_SHARED_MEMORY and (
+        not bool(getattr(args, "development_simulation", False))
+        or not bool(getattr(args, "paper_diagnostics", False))
+    ):
+        raise OrchestrationError(
+            "authenticated shared physical evidence requires explicit development paper diagnostics"
+        )
+    simulator_paper_profile = bool(
+        getattr(args, "simulator_paper_evaluation_profile", False)
+    )
+    if simulator_paper_profile and (
+        not bool(getattr(args, "development_simulation", False))
+        or not bool(getattr(args, "paper_diagnostics", False))
+        or physical_transport != TRANSPORT_AUTHENTICATED_SHARED_MEMORY
+    ):
+        raise OrchestrationError(
+            "simulator paper evaluation profile requires development simulation, "
+            "paper diagnostics, and authenticated shared physical evidence"
+        )
     if not is_curved_lumen_task(args.task):
         if args.curved_lumen_type is not None:
             raise OrchestrationError("--curved-lumen-type is only valid with --task curved_lumen_navigation")
@@ -677,6 +848,7 @@ class EvaluationOrchestrator:
                     DEVELOPMENT_SIMULATION_DISCLAIMER if self.development_simulation else None
                 ),
                 "ros_domain_id": domain_id,
+                **simulator_freshness_profile_metadata(self.args),
             }
         finally:
             if domain_lease is not None:
@@ -707,8 +879,21 @@ class EvaluationOrchestrator:
         stability: StabilityStats | None = None
         cleanup_state: dict[str, Any] = {"attempted": False, "audit": None}
         stop_attempted = False
+        physical_evidence_session: DevelopmentPhysicalEvidenceSession | None = None
         try:
             env = run_environment(domain_id)
+            if bool(getattr(self, "development_simulation", False)):
+                env = development_evaluation_environment(env)
+            env, physical_evidence_session = development_physical_evidence_environment(
+                env,
+                str(
+                    getattr(
+                        self.args,
+                        "physical_evidence_transport",
+                        TRANSPORT_ROS,
+                    )
+                ),
+            )
             base_command = build_base_simulation_command(
                 experiment_group=self.experiment_group,
                 controller_label=controller_label,
@@ -736,11 +921,28 @@ class EvaluationOrchestrator:
                 evaluation_diagnostics_enabled=bool(
                     getattr(self.args, "paper_diagnostics", False)
                 ),
+                physical_evidence_transport=str(
+                    getattr(
+                        self.args,
+                        "physical_evidence_transport",
+                        TRANSPORT_ROS,
+                    )
+                ),
+                simulator_paper_evaluation_profile=bool(
+                    getattr(
+                        self.args,
+                        "simulator_paper_evaluation_profile",
+                        False,
+                    )
+                ),
             )
             records.append(self.process_manager.start(role=f"{role}_base", command=base_command, env=env))
             monitor = RosRunMonitor(
                 domain_id=domain_id,
                 slice_7g_governed=self.slice_7g_profile_enabled,
+                development_simulation=bool(
+                    getattr(self, "development_simulation", False)
+                ),
                 development_target_source=getattr(
                     self, "development_target_source", "profile"
                 ),
@@ -799,6 +1001,7 @@ class EvaluationOrchestrator:
             if self.slice_7g_profile_enabled:
                 monitor.require_slice_7g_ready()
                 monitor.arm_safety_fault_monitor()
+            monitor.retire_readiness_subscriptions()
             monitor.record_runner_event("readiness_completed", evaluated_sample_count=len(samples))
             if audit.nonzero_count(self.settings.command_zero_tolerance) > 0:
                 raise OrchestrationError("nonzero command received before recording")
@@ -942,6 +1145,8 @@ class EvaluationOrchestrator:
         finally:
             if monitor is not None:
                 monitor.close()
+            if physical_evidence_session is not None:
+                physical_evidence_session.close()
 
     def _finalize_run(
         self,
@@ -1141,6 +1346,7 @@ class EvaluationOrchestrator:
                 if bool(getattr(self, "development_simulation", False))
                 else None
             ),
+            **simulator_freshness_profile_metadata(self.args),
             "orchestration_id": self.orchestration_id,
             "run_role": role,
             "experiment_group": self.experiment_group,
@@ -1504,6 +1710,7 @@ class EvaluationOrchestrator:
                 if bool(getattr(self, "development_simulation", False))
                 else None
             ),
+            **simulator_freshness_profile_metadata(self.args),
             "orchestration_id": self.orchestration_id,
             "run_id": run_id,
             "run_role": role,
@@ -1548,11 +1755,14 @@ class RosRunMonitor:
         *,
         domain_id: int,
         slice_7g_governed: bool = False,
+        development_simulation: bool = False,
         development_target_source: str = "profile",
     ):
         import rclpy
         from rclpy.context import Context
-        from rclpy.executors import SingleThreadedExecutor
+        from rclpy.callback_groups import ReentrantCallbackGroup
+        from rclpy.executors import MultiThreadedExecutor
+        from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
         from ctr_interfaces.msg import CtrJointCommand, CtrSafetyStatus, CtrState, CtrTactileState
         from ctr_interfaces.srv import StartExperiment, StopExperiment
         from geometry_msgs.msg import PointStamped, PoseStamped
@@ -1569,8 +1779,9 @@ class RosRunMonitor:
             os.environ["ROS_DOMAIN_ID"] = str(domain_id)
             rclpy.init(args=None, context=self.context)
         self.node = rclpy.create_node("ctr_run_evaluation_monitor", context=self.context)
-        self.executor = SingleThreadedExecutor(context=self.context)
+        self.executor = MultiThreadedExecutor(num_threads=2, context=self.context)
         self.executor.add_node(self.node)
+        self._subscription_callback_group = ReentrantCallbackGroup()
         self._diagnostics: dict[str, Any] = {
             "monitor_created_monotonic": monitor_created,
             "node_created_monotonic": time.monotonic(),
@@ -1601,6 +1812,7 @@ class RosRunMonitor:
             "runner_events": [],
         }
         self._readiness_collection_active = False
+        self._readiness_subscriptions_retired = False
         self._state_callbacks_during_collection = 0
         self._tip_callbacks_during_collection = 0
         self._state_callback_sequence = 0
@@ -1628,30 +1840,65 @@ class RosRunMonitor:
         self.latest_safety_fault = True
         self.safety_fault_count = 0
         self._safety_fault_monitor_armed = False
-        self.state_sub = self.node.create_subscription(CtrState, "/ctr/state", self._on_state, 10)
-        self.tip_sub = self.node.create_subscription(PoseStamped, "/ctr/tip", self._on_tip, 10)
+        callback_group = self._subscription_callback_group
+        state_qos = (
+            10
+            if slice_7g_governed and not development_simulation
+            else QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                durability=DurabilityPolicy.VOLATILE,
+            )
+        )
+        self.state_sub = self.node.create_subscription(
+            CtrState,
+            "/ctr/state",
+            self._on_state,
+            state_qos,
+            callback_group=callback_group,
+        )
+        self.tip_sub = self.node.create_subscription(
+            PoseStamped, "/ctr/tip", self._on_tip, 10, callback_group=callback_group
+        )
         reference_qos = reference_subscription_qos_for_target_source(
             development_target_source
         )
-        self.ref_tip_sub = self.node.create_subscription(PoseStamped, "/ctr/reference/tip", lambda msg: self._on_reference("tip", msg), reference_qos)
-        self.ref_horizon_sub = self.node.create_subscription(NavPath, "/ctr/reference/horizon", lambda msg: self._on_reference("horizon", msg), 10)
-        self.ref_path_sub = self.node.create_subscription(NavPath, "/ctr/reference/path", lambda msg: self._on_reference("path", msg), reference_qos)
+        self.ref_tip_sub = self.node.create_subscription(PoseStamped, "/ctr/reference/tip", lambda msg: self._on_reference("tip", msg), reference_qos, callback_group=callback_group)
+        self.ref_horizon_sub = self.node.create_subscription(NavPath, "/ctr/reference/horizon", lambda msg: self._on_reference("horizon", msg), 10, callback_group=callback_group)
+        self.ref_path_sub = self.node.create_subscription(NavPath, "/ctr/reference/path", lambda msg: self._on_reference("path", msg), reference_qos, callback_group=callback_group)
         self.command_subs = [
-            self.node.create_subscription(CtrJointCommand, topic, lambda msg, topic=topic: self._on_command(topic, msg), 10)
+            self.node.create_subscription(CtrJointCommand, topic, lambda msg, topic=topic: self._on_command(topic, msg), 10, callback_group=callback_group)
             for topic in COMMAND_TOPICS
         ]
-        self.tactile_sub = self.node.create_subscription(CtrTactileState, "/ctr/tactile/state", self._on_tactile, 10)
-        self.safety_sub = self.node.create_subscription(CtrSafetyStatus, "/ctr/safety/status", self._on_safety, 10)
+        self.tactile_sub = self.node.create_subscription(CtrTactileState, "/ctr/tactile/state", self._on_tactile, 10, callback_group=callback_group)
+        self.safety_sub = self.node.create_subscription(CtrSafetyStatus, "/ctr/safety/status", self._on_safety, 10, callback_group=callback_group)
         self.start_client = self.node.create_client(StartExperiment, "/ctr/start_experiment")
         self.stop_client = self.node.create_client(StopExperiment, "/ctr/stop_experiment")
         self._diagnostics["subscription_created_monotonic"] = time.monotonic()
+        # Keep the monitor's high-rate state, tip, tactile, safety, reference,
+        # and command subscriptions draining continuously.  Calling
+        # ``spin_once`` from the orchestration loop processed at most one
+        # callback per 50 ms iteration, so its own reliable subscription
+        # queues could retain startup fault samples for nearly a second even
+        # while the source publishers were on time.  A dedicated executor
+        # thread makes receipt freshness independent of orchestration waits.
+        self._diagnostics["executor_spin_start_monotonic"] = time.monotonic()
+        self._executor_thread = threading.Thread(
+            target=self.executor.spin,
+            name="ctr-evaluation-monitor-executor",
+            daemon=True,
+        )
+        self._executor_thread.start()
 
     def close(self) -> None:
         try:
+            self.executor.shutdown()
+            self._executor_thread.join(timeout=2.0)
+            if self._executor_thread.is_alive():
+                raise OrchestrationError("evaluation monitor executor did not stop")
             self.executor.remove_node(self.node)
             self.node.destroy_node()
         finally:
-            self.executor.shutdown()
             if self.rclpy.ok(context=self.context):
                 self.rclpy.shutdown(context=self.context)
 
@@ -1710,6 +1957,19 @@ class RosRunMonitor:
             raise OrchestrationError("Slice 7G safety monitor cannot arm before fault-free readiness")
         self.safety_fault_count = 0
         self._safety_fault_monitor_armed = True
+
+    def retire_readiness_subscriptions(self) -> None:
+        """Stop processing duplicate high-rate state/tip data after readiness.
+
+        The evaluator remains the authoritative raw-data recorder.  This
+        orchestration monitor needs state and tip only for initial stability;
+        after that point the callbacks drain without retaining or converting
+        messages.  Destroying live subscriptions while a background executor
+        is inside ``take`` races the rclpy handle lifetime and can terminate
+        the executor before the StartExperiment response is received.
+        """
+
+        self._readiness_subscriptions_retired = True
 
     def wait_for_reference(self, timeout_s: float, *, require_horizon: bool = True) -> None:
         self._spin_until(
@@ -1948,9 +2208,10 @@ class RosRunMonitor:
             self.spin_once(0.05)
 
     def spin_once(self, timeout_s: float) -> None:
-        if self._diagnostics["executor_spin_start_monotonic"] is None:
-            self._diagnostics["executor_spin_start_monotonic"] = time.monotonic()
-        self.executor.spin_once(timeout_sec=timeout_s)
+        # Callbacks are serviced by ``_executor_thread``.  This method remains
+        # the orchestration pacing point and intentionally performs no second
+        # concurrent executor spin.
+        time.sleep(max(0.0, timeout_s))
 
     def _spin_until(self, predicate: Callable[[], bool], timeout_s: float, label: str) -> None:
         deadline = time.monotonic() + timeout_s
@@ -2011,6 +2272,8 @@ class RosRunMonitor:
         raise OrchestrationError(f"{label} timed out")
 
     def _on_state(self, msg) -> None:
+        if self._readiness_subscriptions_retired:
+            return
         receive_time = time.monotonic()
         self._diagnostics["state_callback_count"] += 1
         self._diagnostics["first_state_callback_monotonic"] = self._diagnostics["first_state_callback_monotonic"] or receive_time
@@ -2034,6 +2297,8 @@ class RosRunMonitor:
             return
 
     def _on_tip(self, msg) -> None:
+        if self._readiness_subscriptions_retired:
+            return
         receive_time = time.monotonic()
         self._diagnostics["tip_callback_count"] += 1
         self._diagnostics["first_tip_callback_monotonic"] = self._diagnostics["first_tip_callback_monotonic"] or receive_time
@@ -2096,10 +2361,25 @@ class ProcessManager:
         self.workspace = workspace
 
     def start(self, *, role: str, command: list[str], env: dict[str, str]) -> ProcessRecord:
+        execution_command = list(command)
+        child_env = dict(env)
+        source_affinity = development_simulator_affinity(environment=env)
+        if source_affinity:
+            child_env[DEVELOPMENT_SIMULATOR_CPU_LIST_ENV] = ",".join(
+                str(cpu) for cpu in source_affinity
+            )
+        affinity = development_process_affinity(role=role, environment=env)
+        if affinity:
+            execution_command = [
+                "taskset",
+                "--cpu-list",
+                ",".join(str(cpu) for cpu in affinity),
+                *execution_command,
+            ]
         process = subprocess.Popen(
-            command,
+            execution_command,
             cwd=self.workspace,
-            env=env,
+            env=child_env,
             start_new_session=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
@@ -2109,10 +2389,14 @@ class ProcessManager:
         identity = process_identity(process.pid)
         return ProcessRecord(
             role=role,
-            command=list(command),
+            command=execution_command,
             process=process,
             identity=identity,
             start_wall_time=datetime.now(timezone.utc).isoformat(),
+            leader_only_sigint=(
+                child_env.get(PHYSICAL_EVIDENCE_TRANSPORT_ENV)
+                == TRANSPORT_AUTHENTICATED_SHARED_MEMORY
+            ),
         )
 
     def shutdown_all(self, records: list[ProcessRecord], settings: OrchestrationSettings) -> None:
@@ -2146,8 +2430,14 @@ class ProcessManager:
             record.shutdown_events.append({"signal": label, "sent": False, "reason": "identity mismatch"})
             return
         try:
-            os.killpg(record.identity.pgid, sig)
-            record.shutdown_events.append({"signal": label, "sent": True, "pgid": record.identity.pgid})
+            if sig == signal.SIGINT and record.leader_only_sigint:
+                os.kill(record.identity.pid, sig)
+                record.shutdown_events.append(
+                    {"signal": label, "sent": True, "pid": record.identity.pid}
+                )
+            else:
+                os.killpg(record.identity.pgid, sig)
+                record.shutdown_events.append({"signal": label, "sent": True, "pgid": record.identity.pgid})
         except ProcessLookupError:
             record.exit_code = record.process.poll()
             return
@@ -2721,7 +3011,26 @@ def build_base_simulation_command(
     development_raw_target: list[float] | None = None,
     development_target_frame: str = "base_link",
     evaluation_diagnostics_enabled: bool = False,
+    physical_evidence_transport: str = TRANSPORT_ROS,
+    simulator_paper_evaluation_profile: bool = False,
 ) -> list[str]:
+    if physical_evidence_transport not in PHYSICAL_EVIDENCE_TRANSPORT_VALUES:
+        raise OrchestrationError("physical evidence transport is invalid")
+    if physical_evidence_transport == TRANSPORT_AUTHENTICATED_SHARED_MEMORY and (
+        not development_simulation or not evaluation_diagnostics_enabled
+    ):
+        raise OrchestrationError(
+            "authenticated shared physical evidence requires explicit development paper diagnostics"
+        )
+    if simulator_paper_evaluation_profile and (
+        not development_simulation
+        or not evaluation_diagnostics_enabled
+        or physical_evidence_transport != TRANSPORT_AUTHENTICATED_SHARED_MEMORY
+    ):
+        raise OrchestrationError(
+            "simulator paper evaluation profile requires development simulation, "
+            "paper diagnostics, and authenticated shared physical evidence"
+        )
     command = [
         "ros2",
         "launch",
@@ -2735,6 +3044,12 @@ def build_base_simulation_command(
         "mppi_publish_safe_for_simulation:=false",
         f"evaluation_experiment_group:={experiment_group}",
         f"evaluation_controller_label:={controller_label}",
+        f"physical_evidence_transport:={physical_evidence_transport}",
+        (
+            "simulator_paper_evaluation_profile:=true"
+            if simulator_paper_evaluation_profile
+            else "simulator_paper_evaluation_profile:=false"
+        ),
     ]
     if slice_7g_profile:
         command.extend(
@@ -3032,6 +3347,105 @@ def run_environment(domain_id: int) -> dict[str, str]:
     log_dir.mkdir(parents=True, exist_ok=True)
     env["ROS_LOG_DIR"] = str(log_dir)
     return env
+
+
+def development_evaluation_environment(environment: dict[str, str]) -> dict[str, str]:
+    """Bound numerical worker pools for isolated development evaluation.
+
+    Each ROS node is already a separate process.  Letting one MPPI NumPy
+    process create a library worker pool per logical CPU oversubscribed the
+    four physical cores and delayed otherwise-on-time simulator evidence.
+    These variables affect only explicitly selected development evaluation;
+    the governed/production child environment remains unchanged.
+    """
+
+    result = dict(environment)
+    for name in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ):
+        result[name] = "1"
+    result[DEVELOPMENT_EVALUATION_CPU_PARTITION_ENV] = "1"
+    return result
+
+
+def development_process_affinity(
+    *,
+    role: str,
+    environment: dict[str, str],
+    allowed_cpus: set[int] | None = None,
+    topology_root: Path = Path("/sys/devices/system/cpu"),
+) -> tuple[int, ...]:
+    """Partition evaluation controller load from simulation/safety processes.
+
+    Linux exposes SMT siblings through a stable core/package identity.  The
+    evaluation runner assigns whole physical-core groups, rather than splitting
+    logical siblings, so MPPI NumPy work cannot occupy the same physical cores
+    as the source/safety/evaluator launch group.  The policy is selected only
+    by :func:`development_evaluation_environment`; governed/production launches
+    never set the selector.
+    """
+
+    if environment.get(DEVELOPMENT_EVALUATION_CPU_PARTITION_ENV) != "1":
+        return ()
+    if allowed_cpus is None:
+        try:
+            allowed_cpus = set(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            return ()
+    cpus = sorted(int(cpu) for cpu in allowed_cpus)
+    if len(cpus) < 2:
+        return ()
+    core_groups = _development_physical_core_groups(cpus, topology_root)
+    if len(core_groups) < 2:
+        midpoint = max(1, len(cpus) // 2)
+        core_groups = [tuple(cpus[:midpoint]), tuple(cpus[midpoint:])]
+    controller_groups = core_groups[:1]
+    # With at least three physical cores, reserve the second complete core for
+    # the simulator's bounded physical-state/tactile source thread.  The base
+    # launch and all of its other children inherit only the remaining cores;
+    # the simulator source thread explicitly expands onto the reserved core.
+    base_groups = core_groups[2:] if len(core_groups) >= 3 else core_groups[1:]
+    selected = controller_groups if role.endswith("_controller") else base_groups
+    return tuple(cpu for group in selected for cpu in group)
+
+
+def development_simulator_affinity(
+    *,
+    environment: dict[str, str],
+    allowed_cpus: set[int] | None = None,
+    topology_root: Path = Path("/sys/devices/system/cpu"),
+) -> tuple[int, ...]:
+    """Return the exclusive development-evaluation physical source core."""
+
+    if environment.get(DEVELOPMENT_EVALUATION_CPU_PARTITION_ENV) != "1":
+        return ()
+    if allowed_cpus is None:
+        try:
+            allowed_cpus = set(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            return ()
+    cpus = sorted(int(cpu) for cpu in allowed_cpus)
+    core_groups = _development_physical_core_groups(cpus, topology_root)
+    return core_groups[1] if len(core_groups) >= 3 else ()
+
+
+def _development_physical_core_groups(
+    cpus: list[int], topology_root: Path
+) -> list[tuple[int, ...]]:
+    cores: dict[tuple[int, int], list[int]] = {}
+    for cpu in cpus:
+        topology = topology_root / f"cpu{cpu}" / "topology"
+        try:
+            package = int((topology / "physical_package_id").read_text(encoding="ascii").strip())
+            core = int((topology / "core_id").read_text(encoding="ascii").strip())
+        except (OSError, ValueError):
+            package, core = 0, cpu
+        cores.setdefault((package, core), []).append(cpu)
+    return [tuple(sorted(cores[key])) for key in sorted(cores)]
 
 
 def simulator_command_timeout() -> float:

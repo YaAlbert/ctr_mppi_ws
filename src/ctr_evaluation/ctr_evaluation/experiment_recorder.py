@@ -146,6 +146,8 @@ MPPI_COST_CSV_FIELDS = [
 ]
 MPPI_TIMING_CSV_FIELDS = [
     "timestamp_s",
+    "iteration_start_monotonic_s",
+    "iteration_end_monotonic_s",
     "timing.sampling_s",
     "timing.rollout_propagation_s",
     "timing.target_control_cost_s",
@@ -180,6 +182,38 @@ TACTILE_SAFETY_CSV_FIELDS = [
     "warning_off_n",
     "stop_on_n",
     "stop_off_n",
+    "source_diagnostic_status",
+    "source_sequence",
+    "source_expected_monotonic_s",
+    "source_callback_start_monotonic_s",
+    "source_publish_monotonic_s",
+    "source_callback_lateness_s",
+    "source_skipped_periods",
+    "source_previous_callback_duration_s",
+    "source_state_monotonic_s",
+    "source_state_age_s",
+    "physics_sequence",
+    "physics_callback_start_monotonic_s",
+    "physics_callback_lateness_s",
+    "physics_callback_duration_s",
+    "source_mailbox_version",
+    "source_mailbox_overwrites",
+    "source_pid",
+    "source_thread_id",
+    "publisher_thread_id",
+    "evaluator_receipt_monotonic_s",
+    "evaluator_receipt_gap_s",
+    "safety_source_sequence",
+    "safety_source_stamp_s",
+    "safety_receipt_monotonic_s",
+    "safety_receipt_gap_s",
+    "safety_source_stamp_gap_s",
+    "safety_sequence_gap",
+    "safety_duplicate_sequence",
+    "safety_out_of_order_sequence",
+    "safety_queued_age_s",
+    "safety_pid",
+    "safety_thread_id",
     *[f"commanded_u{index}" for index in range(6)],
     *[f"safe_u{index}" for index in range(6)],
     "commanded_norm",
@@ -1741,8 +1775,10 @@ class ExperimentRecorder:
             if raw.ndim != 1 or filtered.ndim != 1 or not np.all(np.isfinite(raw)) or not np.all(np.isfinite(filtered)):
                 raise ValueError("tactile arrays must be finite one-dimensional values")
             thresholds = self.project_config["tactile"]["thresholds"]
-            self.tactile_evidence_records.append(
-                {
+            source_timing = values.get("source_timing", {})
+            if not isinstance(source_timing, dict):
+                raise ValueError("tactile source timing must be a dict")
+            record = {
                     "timestamp_s": timestamp,
                     "received_timestamp_s": received,
                     "data_age_s": max(0.0, received - timestamp),
@@ -1765,8 +1801,35 @@ class ExperimentRecorder:
                     "warning_off_n": float(thresholds["warning_off"]),
                     "stop_on_n": float(thresholds["stop"]),
                     "stop_off_n": float(thresholds["stop_off"]),
+                    "source_diagnostic_status": str(values.get("diagnostic_status", "")),
+                    "source_sequence": source_timing.get("sequence", ""),
+                    "source_expected_monotonic_s": source_timing.get("expected_monotonic_s", ""),
+                    "source_callback_start_monotonic_s": source_timing.get("callback_start_monotonic_s", ""),
+                    "source_publish_monotonic_s": source_timing.get("publish_monotonic_s", ""),
+                    "source_callback_lateness_s": source_timing.get("callback_lateness_s", ""),
+                    "source_skipped_periods": source_timing.get("skipped_periods", ""),
+                    "source_previous_callback_duration_s": source_timing.get("previous_callback_duration_s", ""),
+                    "source_state_monotonic_s": source_timing.get("state_source_monotonic_s", ""),
+                    "source_state_age_s": source_timing.get("state_age_s", ""),
+                    "physics_sequence": source_timing.get("physics_sequence", ""),
+                    "physics_callback_start_monotonic_s": source_timing.get("physics_callback_start_monotonic_s", ""),
+                    "physics_callback_lateness_s": source_timing.get("physics_callback_lateness_s", ""),
+                    "physics_callback_duration_s": source_timing.get("physics_callback_duration_s", ""),
+                    "source_mailbox_version": source_timing.get("mailbox_version", ""),
+                    "source_mailbox_overwrites": source_timing.get("mailbox_overwrites", ""),
+                    "source_pid": source_timing.get("pid", ""),
+                    "source_thread_id": source_timing.get("thread_id", ""),
+                    "publisher_thread_id": source_timing.get("publisher_thread_id", ""),
+                    "evaluator_receipt_monotonic_s": _number(
+                        values.get("evaluator_receipt_monotonic_s", 0.0),
+                        "evaluator tactile receipt monotonic time",
+                    ),
+                    "evaluator_receipt_gap_s": _number(
+                        values.get("evaluator_receipt_gap_s", 0.0),
+                        "evaluator tactile receipt gap",
+                    ),
                 }
-            )
+            self.tactile_evidence_records.append(record)
         except (KeyError, TypeError, ValueError):
             self.slice_7g_tactile_invalid_count += 1
 
@@ -1774,6 +1837,9 @@ class ExperimentRecorder:
         if not self.config.diagnostic_data_collection or self.lifecycle_state != STATE_RECORDING:
             return
         try:
+            source_timing = values.get("source_timing", {})
+            if not isinstance(source_timing, dict):
+                raise ValueError("safety source timing must be a dict")
             self.safety_evidence_records.append(
                 {
                     "timestamp_s": _number(values["timestamp"], "safety timestamp"),
@@ -1784,6 +1850,17 @@ class ExperimentRecorder:
                     "fault": bool(values["fault"]),
                     "valid": bool(values["valid"]),
                     "diagnostic_status": str(values["diagnostic_status"]),
+                    "safety_source_sequence": source_timing.get("source_sequence", ""),
+                    "safety_source_stamp_s": source_timing.get("source_stamp_s", ""),
+                    "safety_receipt_monotonic_s": source_timing.get("safety_receipt_monotonic_s", ""),
+                    "safety_receipt_gap_s": source_timing.get("safety_receipt_gap_s", ""),
+                    "safety_source_stamp_gap_s": source_timing.get("source_stamp_gap_s", ""),
+                    "safety_sequence_gap": source_timing.get("sequence_gap", ""),
+                    "safety_duplicate_sequence": source_timing.get("duplicate_sequence", ""),
+                    "safety_out_of_order_sequence": source_timing.get("out_of_order_sequence", ""),
+                    "safety_queued_age_s": source_timing.get("queued_age_s", ""),
+                    "safety_pid": source_timing.get("pid", ""),
+                    "safety_thread_id": source_timing.get("thread_id", ""),
                 }
             )
         except (KeyError, TypeError, ValueError):
@@ -1875,6 +1952,17 @@ class ExperimentRecorder:
                 "reference_sample_period": self.config.reference_sample_period,
                 "software_mode": self.config.software_mode,
                 "diagnostic_data_collection": self.config.diagnostic_data_collection,
+                "simulator_paper_evaluation_profile": bool(
+                    self.project_config.get("evaluation", {}).get(
+                        "simulator_paper_evaluation_profile", False
+                    )
+                ),
+                "diagnostic_evidence_freshness_timeout_s": float(
+                    self.project_config.get("evaluation", {}).get(
+                        "diagnostic_evidence_freshness_timeout_s",
+                        self.project_config["safety"]["tactile_timeout"],
+                    )
+                ),
             },
             "metadata_override": self.metadata_override,
             "timestamp_limitations": [
@@ -2277,14 +2365,65 @@ class ExperimentRecorder:
                 stamps = np.asarray([float(row["timestamp_s"]) for row in tactile_rows])
                 result[f"tactile_{name}_event_count"] = _transition_count(flags)
                 result[f"tactile_{name}_duration_s"] = _flag_duration(stamps, flags)
-            for name, predicate in (
-                ("invalid", lambda row: not bool(row["valid"])),
-                ("stale", lambda row: float(row["data_age_s"]) > float(self.project_config["safety"]["tactile_timeout"])),
-            ):
-                flags = np.asarray([predicate(row) for row in tactile_rows])
-                stamps = np.asarray([float(row["timestamp_s"]) for row in tactile_rows])
+            freshness_timeout = float(
+                self.project_config.get("evaluation", {}).get(
+                    "diagnostic_evidence_freshness_timeout_s",
+                    self.project_config["safety"]["tactile_timeout"],
+                )
+            )
+            ros_invalid = np.asarray([not bool(row["valid"]) for row in tactile_rows])
+            ros_stale = np.asarray(
+                [float(row["data_age_s"]) >= freshness_timeout for row in tactile_rows]
+            )
+            tactile_stamps = np.asarray(
+                [float(row["timestamp_s"]) for row in tactile_rows]
+            )
+            result["ros_tactile_delivery_invalid_event_count"] = _transition_count(
+                ros_invalid
+            )
+            result["ros_tactile_delivery_invalid_duration_s"] = _flag_duration(
+                tactile_stamps, ros_invalid
+            )
+            result["ros_tactile_delivery_stale_event_count"] = _transition_count(
+                ros_stale
+            )
+            result["ros_tactile_delivery_stale_duration_s"] = _flag_duration(
+                tactile_stamps, ros_stale
+            )
+            if self.project_config.get("evaluation", {}).get(
+                "simulator_paper_evaluation_profile"
+            ) is True:
+                reasons = [
+                    str(row.get("diagnostic_status", "")).split("|", 1)[0]
+                    for row in safety_rows
+                ]
+                stale_flags = np.asarray(
+                    [reason in {"state_stale", "tactile_stale"} for reason in reasons]
+                )
+                invalid_flags = np.asarray(
+                    [
+                        "invalid" in reason
+                        or reason in {
+                            "physical_evidence_torn_read",
+                            "physical_evidence_future_dated",
+                            "physical_evidence_sequence_rollback",
+                            "physical_evidence_timestamp_rollback",
+                        }
+                        for reason in reasons
+                    ]
+                )
+                authoritative_stamps = np.asarray(
+                    [float(row["timestamp_s"]) for row in safety_rows]
+                )
+            else:
+                stale_flags = ros_stale
+                invalid_flags = ros_invalid
+                authoritative_stamps = tactile_stamps
+            for name, flags in (("invalid", invalid_flags), ("stale", stale_flags)):
                 result[f"tactile_{name}_event_count"] = _transition_count(flags)
-                result[f"tactile_{name}_duration_s"] = _flag_duration(stamps, flags)
+                result[f"tactile_{name}_duration_s"] = _flag_duration(
+                    authoritative_stamps, flags
+                )
             safety_stamps = np.asarray([float(row["timestamp_s"]) for row in safety_rows])
             for name, predicate in (
                 ("scaling", lambda row: row["state_name"] == "warning"),
@@ -2683,6 +2822,17 @@ class ExperimentRecorder:
                 "safety_fault": safety.get("fault", ""),
                 "safety_valid": safety.get("valid", ""),
                 "safety_reason": safety.get("diagnostic_status", ""),
+                "safety_source_sequence": safety.get("safety_source_sequence", ""),
+                "safety_source_stamp_s": safety.get("safety_source_stamp_s", ""),
+                "safety_receipt_monotonic_s": safety.get("safety_receipt_monotonic_s", ""),
+                "safety_receipt_gap_s": safety.get("safety_receipt_gap_s", ""),
+                "safety_source_stamp_gap_s": safety.get("safety_source_stamp_gap_s", ""),
+                "safety_sequence_gap": safety.get("safety_sequence_gap", ""),
+                "safety_duplicate_sequence": safety.get("safety_duplicate_sequence", ""),
+                "safety_out_of_order_sequence": safety.get("safety_out_of_order_sequence", ""),
+                "safety_queued_age_s": safety.get("safety_queued_age_s", ""),
+                "safety_pid": safety.get("safety_pid", ""),
+                "safety_thread_id": safety.get("safety_thread_id", ""),
             }
             rows.append(row)
         return rows

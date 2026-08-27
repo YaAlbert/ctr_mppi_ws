@@ -45,7 +45,9 @@ from ctr_sim.nodes.development_target_selector_node import (
 from ctr_tactile.tactile_processing import TactileProcessingParameters, TactileProcessor
 
 
-TESTED_TARGET = (0.021180966381970152, 0.0, 0.08471218663414842)
+LEGACY_COMPARISON_TARGET = (0.021180966381970152, 0.0, 0.08471218663414842)
+TESTED_TARGET = (0.0166457424, 0.00397477634, 0.102231139)
+TARGET_IDENTITY_TOLERANCE_M = 1.0e-12
 SEEDS = (11, 22, 33)
 PAPER_FIGURES = (
     "repeatability_metrics.png",
@@ -207,7 +209,7 @@ def matrix_specs() -> tuple[RunSpec, ...]:
     )
     for source in ("profile", "cli", "rviz"):
         for seed in SEEDS:
-            specs.append(RunSpec(f"E3-{source}-{seed}", "target_source", "circular_arc", "nominal", source, "cylinder_fast", seed, "centerline_target", TESTED_TARGET if source != "profile" else None))
+            specs.append(RunSpec(f"E3-{source}-{seed}", "target_source", "circular_arc", "nominal", source, "cylinder_fast", seed, "centerline_target", TESTED_TARGET))
     for case, scenario in (
         ("nominal", "centerline_target"),
         ("lateral_offset", "lateral_offset_target"),
@@ -235,7 +237,10 @@ def select_specs(name: str) -> tuple[RunSpec, ...]:
 
 def run_spec(root: Path, spec: RunSpec, duration: float) -> dict[str, Any]:
     argv = [
-        "--development-simulation", "--paper-diagnostics", "--experiment-group", spec.group,
+        "--development-simulation", "--paper-diagnostics",
+        "--physical-evidence-transport", "authenticated_shared_memory",
+        "--simulator-paper-evaluation-profile",
+        "--experiment-group", spec.group,
         "--mppi-profile", spec.controller_profile, "--seed", str(spec.seed), "--duration", format(duration, ".17g"),
         "--runtime-mode", "simulation", "--output-root", str(root),
     ]
@@ -280,15 +285,16 @@ def target_source_block_reason(
 ) -> str | None:
     """Use the final validator to preflight coordinate-identical E3 targets."""
 
-    if spec.experiment != "target_source" or spec.target_source == "profile":
+    if spec.experiment != "target_source":
         return None
+    target = spec.target or TESTED_TARGET
     geometry = lumen_geometry_from_config(config)
     reachability = sampled_reachability_predicate(
         build_sampled_reachability_cloud(ApproximateCTRModel(config), config),
         float(config["goal"]["tolerance"]),
     )
     selection = select_development_target(
-        TESTED_TARGET,
+        target,
         input_frame="base_link",
         target_source=spec.target_source,
         geometry=geometry,
@@ -303,7 +309,12 @@ def target_source_block_reason(
     )
     if selection.accepted and selection.validated_target is not None:
         accepted = np.asarray(selection.validated_target, dtype=np.float64)
-        if np.allclose(accepted, np.asarray(TESTED_TARGET), rtol=0.0, atol=1.0e-12):
+        if np.allclose(
+            accepted,
+            np.asarray(target),
+            rtol=0.0,
+            atol=TARGET_IDENTITY_TOLERANCE_M,
+        ):
             return None
     return (
         "coordinate-identical target-source comparison blocked by final target "
@@ -726,6 +737,11 @@ def figure_record(filename: str, title: str, rows: list[dict[str, Any]], aggrega
         "configuration_hashes": sorted({str(row.get("configuration_hash")) for row in rows if row.get("configuration_hash")}),
         "generated_at": datetime.now(timezone.utc).isoformat(), "plotting_script": "src/ctr_evaluation/ctr_evaluation/paper_evidence.py",
         "plotting_script_commit": commit, "evidence_class": evidence_class,
+        "runtime_scheduling": "non-real-time Ubuntu host",
+        "controller_realtime_claim": False,
+        "simulator_physical_evidence_freshness_timeout_s": 0.20,
+        "production_hardware_freshness_timeout_s": 0.10,
+        "simulator_watchdog_is_production_validation": False,
     }
 
 
@@ -856,7 +872,17 @@ def paper_results(rows: list[dict[str, Any]], plot_index: dict[str, Any]) -> str
     lines.extend(("## Metric Semantics", ""))
     for name, definition in METRIC_DEFINITIONS.items():
         lines.append(f"- `{name}` [{definition['units']}]: {definition['formula']}; window: {definition['window']}; missing data: {definition['nan_policy']}.")
-    lines.extend(("", "## Limitations", "", "- All evidence is simulator-only.", "- Five seeds do not justify statistical-significance claims.", "- Timing is host- and load-dependent and is not hardware certification.", "- Tactile stress evidence uses simulated force and production-equivalent thresholds; it is not physical sensor validation.", ""))
+    lines.extend((
+        "", "## Runtime and Limitations", "",
+        "- All evidence is simulator-only and was collected on a non-real-time Ubuntu host.",
+        "- The evaluated simulator physical-evidence watchdog is 0.20 s and remains fail-closed at that boundary.",
+        "- The production/hardware freshness contract remains 0.10 s; the simulator watchdog is not production validation.",
+        "- The controller and host are not claimed to provide real-time execution.",
+        "- Five seeds do not justify statistical-significance claims.",
+        "- Timing is host- and load-dependent and is not hardware certification.",
+        "- Tactile stress evidence uses simulated force and production-equivalent thresholds; it is not physical sensor validation.",
+        "",
+    ))
     return "\n".join(lines)
 
 
@@ -939,7 +965,17 @@ def build_manifest(root: Path) -> dict[str, Any]:
         if relative == "manifest.json":
             continue
         members.append({"path": relative, "size": path.stat().st_size, "sha256": sha256(path)})
-    return {"schema_version": "ctr_final_system_evidence_manifest_v1", "tested_commit": git_value("rev-parse", "HEAD"), "generated_at": datetime.now(timezone.utc).isoformat(), "members": members}
+    return {
+        "schema_version": "ctr_final_system_evidence_manifest_v1",
+        "tested_commit": git_value("rev-parse", "HEAD"),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "runtime_scheduling": "non-real-time Ubuntu host",
+        "controller_realtime_claim": False,
+        "simulator_physical_evidence_freshness_timeout_s": 0.20,
+        "production_hardware_freshness_timeout_s": 0.10,
+        "simulator_watchdog_is_production_validation": False,
+        "members": members,
+    }
 
 
 def forbidden_presentation_findings(root: Path) -> list[str]:

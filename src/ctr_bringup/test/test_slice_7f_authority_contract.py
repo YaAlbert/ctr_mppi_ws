@@ -20,7 +20,8 @@ class Slice7FAuthorityContractTest(unittest.TestCase):
 
     def test_safety_mediates_raw_command_to_safe_command(self):
         source = SAFETY_SOURCE.read_text(encoding="utf-8")
-        self.assertIn('self.create_subscription(CtrJointCommand, "/ctr/mppi_command", self._on_command, 10)', source)
+        self.assertIn('CtrJointCommand, "/ctr/mppi_command", self._on_command, 10,', source)
+        self.assertIn("callback_group=self._command_callback_group", source)
         self.assertIn('self.create_publisher(CtrJointCommand, "/ctr/safe_command", 10)', source)
 
     def test_simulator_consumes_safe_command_only(self):

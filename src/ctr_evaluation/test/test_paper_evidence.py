@@ -42,11 +42,10 @@ def test_target_source_cells_use_one_controller_target():
     assert len(rows) == 9
     assert {row.target_source for row in rows} == {"profile", "cli", "rviz"}
     for row in rows:
-        if row.target_source != "profile":
-            assert row.target == TESTED_TARGET
+        assert row.target == TESTED_TARGET
 
 
-def test_target_source_preflight_uses_final_validator_and_blocks_unreachable_profile_target():
+def test_target_source_preflight_uses_final_validator_for_all_three_sources():
     config = load_parameter_files(default_config_paths())
     from ctr_bringup.slice_7g_profile import apply_slice_7g_development_simulation_profile
     from ctr_mppi_controller.lumen_factory import config_with_lumen_overrides
@@ -61,13 +60,12 @@ def test_target_source_preflight_uses_final_validator_and_blocks_unreachable_pro
             random_seed=seed,
         )
         effective = apply_slice_7g_development_simulation_profile(effective, enabled=True)
-        spec = next(
-            row for row in select_specs("target_source")
-            if row.target_source == "cli" and row.seed == seed
-        )
-        reason = target_source_block_reason(spec, effective)
-        assert reason is not None
-        assert "final target validator: target_unreachable" in reason
+        for source in ("profile", "cli", "rviz"):
+            spec = next(
+                row for row in select_specs("target_source")
+                if row.target_source == source and row.seed == seed
+            )
+            assert target_source_block_reason(spec, effective) is None
 
 
 def test_matrix_contract_requires_every_cell_and_exact_target_equivalence():
@@ -78,7 +76,7 @@ def test_matrix_contract_requires_every_cell_and_exact_target_equivalence():
             "experiment": spec.experiment,
             "matrix_status": "completed",
             "completion_status": "completed",
-            "accepted_target": "[0.021180966381970152,0.0,0.08471218663414842]",
+            "accepted_target": json.dumps(TESTED_TARGET, separators=(",", ":")),
         }
         for spec in selected
     ]
@@ -132,6 +130,9 @@ def test_empty_aggregate_emits_complete_export_with_neutral_titles(tmp_path):
     assert forbidden_presentation_findings(root) == []
     visible = (root / "paper_results.md").read_text(encoding="utf-8").lower()
     assert not any(phrase in visible for phrase in FORBIDDEN_PRESENTATION_TEXT)
+    assert "non-real-time ubuntu host" in visible
+    assert "0.20 s" in visible
+    assert "production/hardware freshness contract remains 0.10 s" in visible
 
 
 def test_failed_rows_are_neutralized_only_at_publication_boundary(tmp_path):

@@ -181,6 +181,76 @@ def test_real_approximate_model_reachability_path_accepts_tested_cli_coordinate(
     assert result.accepted
 
 
+def test_profile_cli_and_rviz_share_one_exact_canonical_validation_result():
+    config = config_with_lumen_overrides(
+        load_parameter_files(CONFIG_FILES),
+        enable_cylindrical_lumen=False,
+        enable_curved_lumen=True,
+        curved_lumen_type="circular_arc",
+        cylinder_profile="cylinder_fast",
+        random_seed=11,
+    )
+    config = apply_slice_7g_development_simulation_profile(config, enabled=True)
+    point = np.asarray([0.0166457424, 0.00397477634, 0.102231139])
+    predicate = sampled_reachability_predicate(
+        build_sampled_reachability_cloud(ApproximateCTRModel(config), config),
+        config["goal"]["tolerance"],
+    )
+    results = [
+        select_development_target(
+            point,
+            input_frame="base_link",
+            target_source=source,
+            geometry=lumen_geometry_from_config(config),
+            controller_frame="base_link",
+            world_frame="world",
+            projection_limit=0.035,
+            reachable=predicate,
+            accepted_target_timestamp=12.5,
+            seed=11,
+        )
+        for source in ("profile", "cli", "rviz")
+    ]
+    assert all(result.accepted for result in results)
+    assert all(result.status == "target_accepted" for result in results)
+    assert all(result.projected is False for result in results)
+    assert all(result.projection_distance == 0.0 for result in results)
+    assert all(np.allclose(result.validated_target, point, rtol=0.0, atol=1.0e-12) for result in results)
+
+
+def test_legacy_profile_point_is_rejected_consistently_by_all_sources():
+    config = config_with_lumen_overrides(
+        load_parameter_files(CONFIG_FILES),
+        enable_cylindrical_lumen=False,
+        enable_curved_lumen=True,
+        curved_lumen_type="circular_arc",
+        cylinder_profile="cylinder_fast",
+        random_seed=11,
+    )
+    config = apply_slice_7g_development_simulation_profile(config, enabled=True)
+    predicate = sampled_reachability_predicate(
+        build_sampled_reachability_cloud(ApproximateCTRModel(config), config),
+        config["goal"]["tolerance"],
+    )
+    point = [0.021180966381970152, 0.0, 0.08471218663414842]
+    statuses = {
+        select_development_target(
+            point,
+            input_frame="base_link",
+            target_source=source,
+            geometry=lumen_geometry_from_config(config),
+            controller_frame="base_link",
+            world_frame="world",
+            projection_limit=0.035,
+            reachable=predicate,
+            accepted_target_timestamp=0.0,
+            seed=11,
+        ).status
+        for source in ("profile", "cli", "rviz")
+    }
+    assert statuses == {"target_unreachable"}
+
+
 def test_timestamp_policy_accepts_zero_and_rejects_stale_or_future_values():
     validate_candidate_timestamp(stamp_seconds=0.0, now_seconds=10.0, maximum_age=5.0, future_tolerance=0.5)
     validate_candidate_timestamp(stamp_seconds=9.0, now_seconds=10.0, maximum_age=5.0, future_tolerance=0.5)
@@ -217,6 +287,24 @@ def test_target_update_policy_accepts_only_before_motion_starts():
     assert target_update_status(True) == "target_update_rejected_motion_started"
     with pytest.raises(ValueError):
         target_update_status(1)
+
+
+def test_accepted_singleton_reference_remains_observable_during_late_recording_window():
+    class SelectorShell:
+        accepted = object()
+        reference_burst_remaining = 0
+
+        def __init__(self):
+            self.publish_count = 0
+
+        def _publish_reference(self):
+            self.publish_count += 1
+
+    node = SelectorShell()
+    selector_module.DevelopmentTargetSelectorNode._on_timer(node)
+    selector_module.DevelopmentTargetSelectorNode._on_timer(node)
+    assert node.publish_count == 2
+    assert node.reference_burst_remaining == 0
 
 
 def test_console_entrypoint_uses_shared_owned_node_shutdown_contract(monkeypatch):

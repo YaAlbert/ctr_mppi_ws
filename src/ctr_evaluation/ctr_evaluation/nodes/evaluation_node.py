@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import math
+import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -14,6 +16,12 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path as NavPath
 
 from ctr_bringup.parameter_validation import load_parameter_files, validate_config_paths, validate_or_raise
+from ctr_bringup.development_physical_evidence import (
+    PRODUCTION_HARDWARE_FRESHNESS_TIMEOUT_S,
+    SIMULATOR_PAPER_EVALUATION_FRESHNESS_TIMEOUT_S,
+    TRANSPORT_AUTHENTICATED_SHARED_MEMORY,
+    TRANSPORT_ROS,
+)
 from ctr_bringup.slice_7g_profile import (
     apply_slice_7g_development_simulation_profile,
     apply_slice_7g_simulation_profile,
@@ -28,12 +36,27 @@ from ctr_interfaces.msg import (
 )
 from ctr_interfaces.srv import StartExperiment, StopExperiment
 from ctr_mppi_controller.lumen_factory import config_with_lumen_overrides
+from ctr_sim.nodes.development_target_selector_node import (
+    TARGET_SOURCE_MODES,
+    target_selection_qos_profile,
+)
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
 
 ACTUATOR_COMMAND_TOPICS = ("/ctr/mppi_command", "/ctr/safe_command")
 EVALUATION_COMMAND_PUBLISHERS: tuple[str, ...] = ()
+
+
+def reference_subscription_qos_for_target_source(target_source: str):
+    """Receive retained one-shot CLI/RViz targets without changing profile QoS."""
+
+    if target_source not in TARGET_SOURCE_MODES:
+        raise ValueError("target_source is invalid")
+    return 10 if target_source == "profile" else target_selection_qos_profile()
 
 
 class EvaluationNode(Node):
@@ -41,6 +64,10 @@ class EvaluationNode(Node):
 
     def __init__(self):
         super().__init__("evaluation_node")
+        self._last_tactile_receipt_monotonic: float | None = None
+        self._tactile_callback_group = MutuallyExclusiveCallbackGroup()
+        self._safety_callback_group = MutuallyExclusiveCallbackGroup()
+        self._evidence_record_lock = threading.RLock()
         self.declare_parameter("config_paths", Parameter.Type.STRING_ARRAY)
         self.declare_parameter("runtime_mode", "simulation")
         self.declare_parameter("experiment_group", "")
@@ -57,6 +84,9 @@ class EvaluationNode(Node):
         self.declare_parameter("slice_7g_profile", False)
         self.declare_parameter("development_simulation", False)
         self.declare_parameter("evaluation_diagnostics_enabled", False)
+        self.declare_parameter("physical_evidence_transport", TRANSPORT_ROS)
+        self.declare_parameter("simulator_paper_evaluation_profile", False)
+        self.declare_parameter("target_source", "profile")
 
         config_paths = validate_config_paths(self.get_parameter("config_paths").value)
         raw_config = load_parameter_files(config_paths)
@@ -77,8 +107,28 @@ class EvaluationNode(Node):
         diagnostics_enabled = _bool_value(
             self.get_parameter("evaluation_diagnostics_enabled").value
         )
+        target_source = str(self.get_parameter("target_source").value)
+        if target_source not in TARGET_SOURCE_MODES:
+            raise ValueError("target_source is invalid")
+        if target_source != "profile" and not development_enabled:
+            raise ValueError("target overrides require explicit development_simulation mode")
         if diagnostics_enabled and not development_enabled:
             raise ValueError("evaluation diagnostics require explicit development_simulation mode")
+        simulator_paper_profile = _bool_value(
+            self.get_parameter("simulator_paper_evaluation_profile").value
+        )
+        physical_transport = str(
+            self.get_parameter("physical_evidence_transport").value
+        )
+        if simulator_paper_profile and (
+            not development_enabled
+            or not diagnostics_enabled
+            or physical_transport != TRANSPORT_AUTHENTICATED_SHARED_MEMORY
+        ):
+            raise ValueError(
+                "simulator paper evaluation profile requires development diagnostics "
+                "and authenticated shared physical evidence"
+            )
         self.project_config = (
             apply_slice_7g_development_simulation_profile(
                 self.project_config, enabled=True
@@ -96,6 +146,16 @@ class EvaluationNode(Node):
             "diagnostic_data_collection"
         ] = diagnostics_enabled
         validate_or_raise(self.project_config)
+        self.project_config.setdefault("evaluation", {})[
+            "diagnostic_evidence_freshness_timeout_s"
+        ] = (
+            SIMULATOR_PAPER_EVALUATION_FRESHNESS_TIMEOUT_S
+            if simulator_paper_profile
+            else PRODUCTION_HARDWARE_FRESHNESS_TIMEOUT_S
+        )
+        self.project_config["evaluation"][
+            "simulator_paper_evaluation_profile"
+        ] = simulator_paper_profile
 
         self.recorder = ExperimentRecorder(
             config=EvaluationRecorderConfig.from_project_config(
@@ -111,11 +171,27 @@ class EvaluationNode(Node):
         if not self.recorder.config.enabled:
             self.get_logger().warn("Evaluation node started with evaluation.enabled=false; services remain available.")
 
-        self.state_sub = self.create_subscription(CtrState, "/ctr/state", self._on_state, 10)
+        state_qos = (
+            QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                durability=DurabilityPolicy.VOLATILE,
+            )
+            if development_enabled
+            else 10
+        )
+        self.state_sub = self.create_subscription(
+            CtrState, "/ctr/state", self._on_state, state_qos
+        )
         self.tip_sub = self.create_subscription(PoseStamped, "/ctr/tip", self._on_tip, 10)
-        self.reference_tip_sub = self.create_subscription(PoseStamped, "/ctr/reference/tip", self._on_reference_tip, 10)
+        reference_qos = reference_subscription_qos_for_target_source(target_source)
+        self.reference_tip_sub = self.create_subscription(
+            PoseStamped, "/ctr/reference/tip", self._on_reference_tip, reference_qos
+        )
         self.reference_horizon_sub = self.create_subscription(NavPath, "/ctr/reference/horizon", self._on_horizon, 10)
-        self.reference_path_sub = self.create_subscription(NavPath, "/ctr/reference/path", self._on_path, 10)
+        self.reference_path_sub = self.create_subscription(
+            NavPath, "/ctr/reference/path", self._on_path, reference_qos
+        )
         self.mppi_command_sub = self.create_subscription(
             CtrJointCommand,
             "/ctr/mppi_command",
@@ -157,12 +233,14 @@ class EvaluationNode(Node):
             "/ctr/tactile/state",
             self._on_tactile,
             10,
+            callback_group=self._tactile_callback_group,
         )
         self.safety_status_sub = self.create_subscription(
             CtrSafetyStatus,
             "/ctr/safety/status",
             self._on_safety_status,
             10,
+            callback_group=self._safety_callback_group,
         )
 
         self.start_srv = self.create_service(StartExperiment, "/ctr/start_experiment", self._start_experiment)
@@ -176,11 +254,12 @@ class EvaluationNode(Node):
             return response
         try:
             metadata = parse_metadata(request.metadata)
-            run_id = self.recorder.start(
-                experiment_name=request.experiment_name,
-                metadata=metadata,
-                monotonic_time=self._now_seconds(),
-            )
+            with self._evidence_record_lock:
+                run_id = self.recorder.start(
+                    experiment_name=request.experiment_name,
+                    metadata=metadata,
+                    monotonic_time=self._now_seconds(),
+                )
         except Exception as exc:
             response.accepted = False
             response.message = f"failed to start experiment: {exc}"
@@ -199,7 +278,8 @@ class EvaluationNode(Node):
             return response
         try:
             self.recorder.record_diagnostic_event("recorder_finalization", phase="start", status="started")
-            result = self.recorder.stop(monotonic_time=self._now_seconds(), interrupted=False)
+            with self._evidence_record_lock:
+                result = self.recorder.stop(monotonic_time=self._now_seconds(), interrupted=False)
             self.recorder.record_diagnostic_event("recorder_finalization", phase="end", status="ok")
         except Exception as exc:
             self.recorder.record_diagnostic_event(
@@ -291,6 +371,40 @@ class EvaluationNode(Node):
         )
 
     def _on_tactile(self, msg: CtrTactileState) -> None:
+        # The receipt clock belongs at callback entry.  Sampling it after the
+        # recorder lock measured unrelated evidence-serialization contention
+        # as if it were DDS delivery latency and produced false inter-arrival
+        # gaps in paper diagnostics.
+        receipt_monotonic = time.monotonic()
+        receipt_gap = (
+            0.0
+            if self._last_tactile_receipt_monotonic is None
+            else receipt_monotonic - self._last_tactile_receipt_monotonic
+        )
+        self._last_tactile_receipt_monotonic = receipt_monotonic
+        with self._evidence_record_lock:
+            self._record_tactile(
+                msg,
+                receipt_monotonic=receipt_monotonic,
+                receipt_gap=receipt_gap,
+            )
+
+    def _record_tactile(
+        self,
+        msg: CtrTactileState,
+        *,
+        receipt_monotonic: float | None = None,
+        receipt_gap: float | None = None,
+    ) -> None:
+        if receipt_monotonic is None:
+            receipt_monotonic = time.monotonic()
+        if receipt_gap is None:
+            receipt_gap = (
+                0.0
+                if self._last_tactile_receipt_monotonic is None
+                else receipt_monotonic - self._last_tactile_receipt_monotonic
+            )
+            self._last_tactile_receipt_monotonic = receipt_monotonic
         self.recorder.record_slice_7g_tactile(valid=bool(msg.valid), source=str(msg.source))
         self.recorder.record_tactile_evidence(
             timestamp=stamp_seconds(msg.header.stamp),
@@ -306,9 +420,19 @@ class EvaluationNode(Node):
             stop=bool(msg.stop),
             valid=bool(msg.valid),
             region=int(msg.region),
+            diagnostic_status=str(msg.diagnostic_status),
+            evaluator_receipt_monotonic_s=receipt_monotonic,
+            evaluator_receipt_gap_s=receipt_gap,
+            source_timing=_parse_evaluation_timing(
+                str(msg.diagnostic_status), "ctr_tactile_timing_v1"
+            ),
         )
 
     def _on_safety_status(self, msg: CtrSafetyStatus) -> None:
+        with self._evidence_record_lock:
+            self._record_safety_status(msg)
+
+    def _record_safety_status(self, msg: CtrSafetyStatus) -> None:
         self.recorder.record_slice_7g_safety(
             valid=bool(msg.valid),
             fault=bool(msg.fault),
@@ -323,11 +447,13 @@ class EvaluationNode(Node):
             fault=bool(msg.fault),
             valid=bool(msg.valid),
             diagnostic_status=str(msg.diagnostic_status),
+            source_timing=_parse_evaluation_timing(
+                str(msg.diagnostic_status), "ctr_safety_timing_v1"
+            ),
         )
 
     def _now_seconds(self) -> float:
         return float(self.get_clock().now().nanoseconds) * 1.0e-9
-
     def destroy_node(self) -> bool:
         if (
             getattr(self, "recorder", None) is not None
@@ -342,6 +468,22 @@ class EvaluationNode(Node):
             except Exception as exc:
                 self.get_logger().error(f"Evaluation auto-finalization failed: {exc}")
         return super().destroy_node()
+
+
+def _parse_evaluation_timing(status: str, schema: str) -> dict[str, float]:
+    marker = f"|{schema}|"
+    if marker not in status:
+        return {}
+    result: dict[str, float] = {}
+    for field in status.rsplit(marker, 1)[1].split(";"):
+        if "=" not in field:
+            continue
+        key, value = field.split("=", 1)
+        try:
+            result[key] = float(value)
+        except ValueError:
+            continue
+    return result
 
 
 def parse_metadata(text: str) -> dict[str, Any]:
@@ -394,17 +536,22 @@ def run_evaluation_node_until_shutdown(rclpy_module, node_factory, *, args=None)
     """Run the evaluator and tolerate one known rclpy inactive-context shutdown race."""
 
     node = None
+    executor = None
     rclpy_module.init(args=args)
     try:
         node = node_factory()
+        executor = MultiThreadedExecutor(num_threads=3)
+        executor.add_node(node)
         try:
-            rclpy_module.spin(node)
+            executor.spin()
         except KeyboardInterrupt:
             pass
         except RuntimeError as exc:
             if not _is_inactive_context_message_conversion_error(rclpy_module, exc):
                 raise
     finally:
+        if executor is not None:
+            executor.shutdown()
         if node is not None:
             try:
                 node.destroy_node()

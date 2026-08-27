@@ -100,6 +100,30 @@ def _validate_reference_launch_arguments(context, *args, **kwargs):
     if development and LaunchConfiguration("runtime_mode").perform(context) != "simulation":
         raise RuntimeError("development_simulation=true requires runtime_mode=simulation")
     try:
+        simulator_paper_profile = parse_launch_bool(
+            LaunchConfiguration("simulator_paper_evaluation_profile").perform(context),
+            "simulator_paper_evaluation_profile",
+        )
+    except Exception:
+        simulator_paper_profile = False
+    if simulator_paper_profile:
+        diagnostics = parse_launch_bool(
+            LaunchConfiguration("evaluation_diagnostics_enabled").perform(context),
+            "evaluation_diagnostics_enabled",
+        )
+        physical_transport = LaunchConfiguration(
+            "physical_evidence_transport"
+        ).perform(context)
+        if (
+            not development
+            or not diagnostics
+            or physical_transport != "authenticated_shared_memory"
+        ):
+            raise RuntimeError(
+                "simulator_paper_evaluation_profile=true requires development "
+                "diagnostics and authenticated shared physical evidence"
+            )
+    try:
         target_source = LaunchConfiguration("target_source").perform(context)
     except Exception:
         target_source = "profile"
@@ -142,6 +166,10 @@ def generate_launch_description():
     slice_7g_profile = LaunchConfiguration("slice_7g_profile")
     development_simulation = LaunchConfiguration("development_simulation")
     evaluation_diagnostics_enabled = LaunchConfiguration("evaluation_diagnostics_enabled")
+    physical_evidence_transport = LaunchConfiguration("physical_evidence_transport")
+    simulator_paper_evaluation_profile = LaunchConfiguration(
+        "simulator_paper_evaluation_profile"
+    )
     enable_development_visualization = LaunchConfiguration("enable_development_visualization")
     target_source = LaunchConfiguration("target_source")
     target_x = LaunchConfiguration("target_x")
@@ -326,6 +354,23 @@ def generate_launch_description():
                 description="Enable evaluation-only synchronized diagnostic evidence.",
             ),
             DeclareLaunchArgument(
+                "physical_evidence_transport",
+                default_value="ros",
+                description=(
+                    "Physical freshness authority: ros (default) or explicit "
+                    "development-evaluation authenticated_shared_memory."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "simulator_paper_evaluation_profile",
+                default_value="false",
+                description=(
+                    "Explicit simulator-only paper profile: authenticated physical "
+                    "evidence remains fail-closed at 0.20 s; production/hardware "
+                    "freshness remains 0.10 s."
+                ),
+            ),
+            DeclareLaunchArgument(
                 "enable_development_visualization",
                 default_value="false",
                 description=(
@@ -419,6 +464,9 @@ def generate_launch_description():
                         "evaluation_diagnostics_enabled": ParameterValue(
                             evaluation_diagnostics_enabled, value_type=bool
                         ),
+                        "physical_evidence_transport": ParameterValue(
+                            physical_evidence_transport, value_type=str
+                        ),
                     }
                 ],
             ),
@@ -460,6 +508,13 @@ def generate_launch_description():
                                 ),
                                 "evaluation_diagnostics_enabled": ParameterValue(
                                     evaluation_diagnostics_enabled, value_type=bool
+                                ),
+                                "physical_evidence_transport": ParameterValue(
+                                    physical_evidence_transport, value_type=str
+                                ),
+                                "simulator_paper_evaluation_profile": ParameterValue(
+                                    simulator_paper_evaluation_profile,
+                                    value_type=bool,
                                 ),
                             }
                         ],
@@ -572,6 +627,13 @@ def generate_launch_description():
                         "evaluation_diagnostics_enabled": ParameterValue(
                             evaluation_diagnostics_enabled, value_type=bool
                         ),
+                        "physical_evidence_transport": ParameterValue(
+                            physical_evidence_transport, value_type=str
+                        ),
+                        "simulator_paper_evaluation_profile": ParameterValue(
+                            simulator_paper_evaluation_profile, value_type=bool
+                        ),
+                        "target_source": ParameterValue(target_source, value_type=str),
                     }
                 ],
             ),

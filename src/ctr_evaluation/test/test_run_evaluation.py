@@ -42,6 +42,10 @@ from ctr_evaluation.run_evaluation import (  # noqa: E402
     command_event_from_message,
     compute_initial_stability,
     default_config_paths,
+    development_evaluation_environment,
+    development_physical_evidence_environment,
+    development_process_affinity,
+    development_simulator_affinity,
     main,
     model_reachability_sanity,
     output_root_from_config,
@@ -61,6 +65,13 @@ from ctr_evaluation.run_evaluation import (  # noqa: E402
     unexpected_command_publishers,
     validate_experiment_group,
     write_orchestration_failure,
+)
+from ctr_bringup.development_physical_evidence import (  # noqa: E402
+    ROOT_ENV as PHYSICAL_EVIDENCE_ROOT_ENV,
+    SESSION_ENV as PHYSICAL_EVIDENCE_SESSION_ENV,
+    TRANSPORT_AUTHENTICATED_SHARED_MEMORY,
+    TRANSPORT_ROS,
+    TRANSPORT_ENV as PHYSICAL_EVIDENCE_TRANSPORT_ENV,
 )
 from ctr_bringup.parameter_validation import load_parameter_files  # noqa: E402
 
@@ -183,11 +194,197 @@ def write_metadata(run_dir, *, orchestration_id="orch", run_role="baseline"):
 
 
 class RunEvaluationHelpersTest(unittest.TestCase):
+    def test_authenticated_physical_evidence_is_explicit_development_diagnostics_only(self):
+        args = parse_args(
+            [
+                "--experiment-group", "physical_evidence",
+                "--task", "curved_lumen_navigation",
+                "--duration", "5",
+                "--runtime-mode", "simulation",
+                "--development-simulation",
+                "--paper-diagnostics",
+                "--physical-evidence-transport",
+                TRANSPORT_AUTHENTICATED_SHARED_MEMORY,
+            ]
+        )
+        validate_task_options(args)
+        args.paper_diagnostics = False
+        with self.assertRaisesRegex(OrchestrationError, "paper diagnostics"):
+            validate_task_options(args)
+
+    def test_authenticated_physical_evidence_session_is_private_and_ephemeral(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            os.chmod(root, 0o700)
+            environment, session = development_physical_evidence_environment(
+                {"ROS_LOG_DIR": str(root), "TMPDIR": str(root)},
+                TRANSPORT_AUTHENTICATED_SHARED_MEMORY,
+            )
+            self.assertIsNotNone(session)
+            channel_root = Path(environment[PHYSICAL_EVIDENCE_ROOT_ENV])
+            self.assertEqual(0o700, channel_root.stat().st_mode & 0o777)
+            self.assertRegex(environment[PHYSICAL_EVIDENCE_SESSION_ENV], r"^[0-9a-f]{64}$")
+            self.assertEqual(
+                TRANSPORT_AUTHENTICATED_SHARED_MEMORY,
+                environment[PHYSICAL_EVIDENCE_TRANSPORT_ENV],
+            )
+            session.close()
+            self.assertFalse(channel_root.exists())
+
+    def test_base_command_binds_authenticated_physical_evidence_without_changing_default(self):
+        ordinary = build_base_simulation_command(
+            experiment_group="ordinary",
+            controller_label="mppi",
+            baseline_dir=None,
+        )
+        self.assertIn("physical_evidence_transport:=ros", ordinary)
+        shared = build_base_simulation_command(
+            experiment_group="shared",
+            controller_label="mppi",
+            baseline_dir=None,
+            slice_7g_profile=True,
+            development_simulation=True,
+            evaluation_diagnostics_enabled=True,
+            physical_evidence_transport=TRANSPORT_AUTHENTICATED_SHARED_MEMORY,
+        )
+        self.assertIn(
+            "physical_evidence_transport:=authenticated_shared_memory",
+            shared,
+        )
+        self.assertIn("simulator_paper_evaluation_profile:=false", shared)
+        paper = build_base_simulation_command(
+            experiment_group="paper",
+            controller_label="mppi",
+            baseline_dir=None,
+            slice_7g_profile=True,
+            development_simulation=True,
+            evaluation_diagnostics_enabled=True,
+            physical_evidence_transport=TRANSPORT_AUTHENTICATED_SHARED_MEMORY,
+            simulator_paper_evaluation_profile=True,
+        )
+        self.assertIn("simulator_paper_evaluation_profile:=true", paper)
+        with self.assertRaisesRegex(OrchestrationError, "paper diagnostics"):
+            build_base_simulation_command(
+                experiment_group="invalid",
+                controller_label="mppi",
+                baseline_dir=None,
+                development_simulation=True,
+                physical_evidence_transport=TRANSPORT_AUTHENTICATED_SHARED_MEMORY,
+            )
+
+    def test_simulator_paper_profile_is_explicit_and_isolated_from_production(self):
+        args = parse_args(
+            [
+                "--experiment-group", "paper_profile",
+                "--task", "curved_lumen_navigation",
+                "--duration", "5",
+                "--runtime-mode", "simulation",
+                "--development-simulation",
+                "--paper-diagnostics",
+                "--physical-evidence-transport",
+                TRANSPORT_AUTHENTICATED_SHARED_MEMORY,
+                "--simulator-paper-evaluation-profile",
+            ]
+        )
+        validate_task_options(args)
+        args.physical_evidence_transport = TRANSPORT_ROS
+        with self.assertRaisesRegex(OrchestrationError, "authenticated shared"):
+            validate_task_options(args)
+
+    def test_development_evaluation_bounds_numeric_workers_without_mutating_input(self):
+        original = {"PATH": "/bin", "OPENBLAS_NUM_THREADS": "8"}
+        bounded = development_evaluation_environment(original)
+        self.assertEqual("8", original["OPENBLAS_NUM_THREADS"])
+        for name in (
+            "OMP_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+            "VECLIB_MAXIMUM_THREADS",
+        ):
+            self.assertEqual("1", bounded[name])
+        self.assertEqual("1", bounded["CTR_DEVELOPMENT_EVALUATION_CPU_PARTITION"])
+
+    def test_development_evaluation_partitions_whole_physical_cores(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            topology_root = Path(temporary)
+            for cpu in range(8):
+                topology = topology_root / f"cpu{cpu}" / "topology"
+                topology.mkdir(parents=True)
+                (topology / "physical_package_id").write_text("0", encoding="ascii")
+                (topology / "core_id").write_text(str(cpu % 4), encoding="ascii")
+            environment = {"CTR_DEVELOPMENT_EVALUATION_CPU_PARTITION": "1"}
+            controller = development_process_affinity(
+                role="candidate_controller",
+                environment=environment,
+                allowed_cpus=set(range(8)),
+                topology_root=topology_root,
+            )
+            base = development_process_affinity(
+                role="candidate_base",
+                environment=environment,
+                allowed_cpus=set(range(8)),
+                topology_root=topology_root,
+            )
+        self.assertEqual((0, 4), controller)
+        self.assertEqual((2, 6, 3, 7), base)
+        with tempfile.TemporaryDirectory() as temporary:
+            topology_root = Path(temporary)
+            for cpu in range(8):
+                topology = topology_root / f"cpu{cpu}" / "topology"
+                topology.mkdir(parents=True)
+                (topology / "physical_package_id").write_text("0", encoding="ascii")
+                (topology / "core_id").write_text(str(cpu % 4), encoding="ascii")
+            source = development_simulator_affinity(
+                environment=environment,
+                allowed_cpus=set(range(8)),
+                topology_root=topology_root,
+            )
+        self.assertEqual((1, 5), source)
+        self.assertFalse(set(controller) & set(base))
+        self.assertFalse(set(controller) & set(source))
+        self.assertFalse(set(source) & set(base))
+
+    def test_cpu_partition_is_absent_without_development_selector(self):
+        self.assertEqual(
+            (),
+            development_process_affinity(
+                role="candidate_controller",
+                environment={},
+                allowed_cpus={0, 1},
+            ),
+        )
+
+    def test_process_manager_injects_source_core_while_base_uses_disjoint_cores(self):
+        import ctr_evaluation.run_evaluation as module
+
+        manager = ProcessManager(REPO_ROOT)
+        process = SimpleNamespace(pid=1234)
+        environment = {"CTR_DEVELOPMENT_EVALUATION_CPU_PARTITION": "1"}
+        with mock.patch.object(
+            module, "development_simulator_affinity", return_value=(1, 5)
+        ), mock.patch.object(
+            module, "development_process_affinity", return_value=(2, 6, 3, 7)
+        ), mock.patch.object(
+            module.subprocess, "Popen", return_value=process
+        ) as popen, mock.patch.object(
+            module, "process_identity", return_value=SimpleNamespace(pid=1234)
+        ), mock.patch.object(module.time, "sleep"):
+            manager.start(role="candidate_base", command=["ros2", "launch"], env=environment)
+
+        args, kwargs = popen.call_args
+        self.assertEqual(
+            ["taskset", "--cpu-list", "2,6,3,7", "ros2", "launch"],
+            args[0],
+        )
+        self.assertEqual("1,5", kwargs["env"]["CTR_DEVELOPMENT_SIMULATOR_CPU_LIST"])
+        self.assertNotIn("CTR_DEVELOPMENT_SIMULATOR_CPU_LIST", environment)
+
     def test_paper_diagnostics_extend_only_the_finalization_timeout(self):
         base = settings(finalization_timeout=20.0)
         assert settings_with_paper_diagnostics(base, enabled=False) is base
         diagnostic = settings_with_paper_diagnostics(base, enabled=True)
-        assert diagnostic.finalization_timeout == 60.0
+        assert diagnostic.finalization_timeout == 120.0
         assert {
             key: value for key, value in asdict(diagnostic).items()
             if key != "finalization_timeout"
@@ -263,6 +460,9 @@ class RunEvaluationHelpersTest(unittest.TestCase):
                 return stable_samples(minimum_samples)
 
             def record_stability_result(self, samples, stability, entry_time):
+                pass
+
+            def retire_readiness_subscriptions(self):
                 pass
 
             def command_events_since(self, receive_time):
@@ -410,7 +610,18 @@ class RunEvaluationHelpersTest(unittest.TestCase):
         monitor._state_callback_sequence = 0
         monitor._readiness_state_queue = []
         monitor._readiness_collection_active = False
+        monitor._readiness_subscriptions_retired = False
         return monitor
+
+    def test_retiring_readiness_callbacks_does_not_destroy_live_executor_handles(self):
+        monitor = object.__new__(RosRunMonitor)
+        monitor._readiness_subscriptions_retired = False
+        monitor.node = mock.Mock()
+
+        monitor.retire_readiness_subscriptions()
+
+        self.assertTrue(monitor._readiness_subscriptions_retired)
+        monitor.node.destroy_subscription.assert_not_called()
 
     def collect_with_batches(self, batches, *, pre_window=False, duration=0.5, minimum_samples=10):
         monitor = self.diagnostic_monitor()
