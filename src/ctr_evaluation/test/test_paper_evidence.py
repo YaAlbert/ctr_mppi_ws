@@ -69,6 +69,13 @@ def test_controller_tradeoff_is_configuration_not_software_version():
     assert {row.seed for row in rows} == {11, 22, 33}
 
 
+def test_straight_geometry_uses_fixed_profile_target_without_curved_selector():
+    straight = [spec for spec in select_specs("geometry") if spec.geometry == "straight"]
+    assert len(straight) == 3
+    assert {spec.target_source for spec in straight} == {"profile"}
+    assert all(spec.target == (0.0192, 0.0, 0.084) for spec in straight)
+
+
 def test_tactile_stress_uses_real_processor_threshold_states():
     config = load_parameter_files(default_config_paths())
     rows = build_tactile_stress_table(config)

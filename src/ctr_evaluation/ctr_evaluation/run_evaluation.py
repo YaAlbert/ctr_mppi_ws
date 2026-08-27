@@ -454,9 +454,9 @@ def validate_task_options(args: argparse.Namespace) -> None:
     if args.development_simulation:
         if args.runtime_mode != "simulation":
             raise OrchestrationError("--development-simulation requires --runtime-mode simulation")
-        if args.task != TASK_CURVED_LUMEN_NAVIGATION:
+        if args.task not in FIXED_TARGET_TASKS:
             raise OrchestrationError(
-                "--development-simulation requires --task curved_lumen_navigation"
+                "--development-simulation requires a fixed-target simulation task"
             )
     target_source = getattr(args, "development_target_source", "profile")
     raw_target = getattr(args, "development_raw_target", None)
@@ -783,13 +783,10 @@ class EvaluationOrchestrator:
                 raise OrchestrationError(f"evaluator started unexpected run ID {started_run_id}; expected {run_id}")
 
             if self._uses_rviz_target_transport():
-                reference_command = self._rviz_candidate_command()
-                records.append(
-                    self.process_manager.start(
-                        role=f"{role}_rviz_target_candidate",
-                        command=reference_command,
-                        env=env,
-                    )
+                monitor.publish_rviz_target_candidate(
+                    self.development_raw_target,
+                    self.development_target_frame,
+                    self.settings.reference_ready_timeout,
                 )
             elif not self._uses_target_selector_transport():
                 reference_command = self._reference_command(reference_epoch)
@@ -1505,7 +1502,7 @@ class RosRunMonitor:
         from rclpy.executors import SingleThreadedExecutor
         from ctr_interfaces.msg import CtrJointCommand, CtrSafetyStatus, CtrState, CtrTactileState
         from ctr_interfaces.srv import StartExperiment, StopExperiment
-        from geometry_msgs.msg import PoseStamped
+        from geometry_msgs.msg import PointStamped, PoseStamped
         from nav_msgs.msg import Path as NavPath
 
         self.rclpy = rclpy
@@ -1558,6 +1555,7 @@ class RosRunMonitor:
         self._diagnostic_settings: OrchestrationSettings | None = None
         self.StartExperiment = StartExperiment
         self.StopExperiment = StopExperiment
+        self.PointStamped = PointStamped
         self.latest_state: StateTipSample | None = None
         self.latest_tip: tuple[float, list[float], float] | None = None
         self.reference_tip_seen = False
@@ -1667,6 +1665,39 @@ class RosRunMonitor:
             timeout_s,
             "reference readiness",
         )
+
+    def publish_rviz_target_candidate(
+        self,
+        point: Any,
+        frame_id: str,
+        timeout_s: float,
+    ) -> None:
+        """Publish one deterministic PointStamped through the real selector contract."""
+
+        values = np.asarray(point, dtype=np.float64)
+        if values.shape != (3,) or not np.isfinite(values).all():
+            raise OrchestrationError("RViz target candidate must be one finite 3-vector")
+        if frame_id not in {"world", "base_link"}:
+            raise OrchestrationError("RViz target candidate frame is invalid")
+        publisher = self.node.create_publisher(
+            self.PointStamped,
+            "/ctr/target_point_candidate",
+            10,
+        )
+        try:
+            self._spin_until(
+                lambda: self.node.count_subscribers("/ctr/target_point_candidate") > 0,
+                timeout_s,
+                "RViz target-selector subscription",
+            )
+            message = self.PointStamped()
+            message.header.frame_id = frame_id
+            message.header.stamp = self.node.get_clock().now().to_msg()
+            message.point.x, message.point.y, message.point.z = map(float, values)
+            publisher.publish(message)
+            self.spin_for(0.25)
+        finally:
+            self.node.destroy_publisher(publisher)
 
     def verify_pre_epoch_reference(self, reference_epoch: float, timeout_s: float, *, expected_first_point: list[float]) -> None:
         deadline = min(time.monotonic() + timeout_s, time.monotonic() + max(0.0, reference_epoch - self.now()))
@@ -2722,7 +2753,10 @@ def build_base_simulation_command(
                 f"cylinder_target_z:={float(target[2]):.17g}",
             ]
         )
-        if not (development_simulation and development_target_source == "rviz"):
+        if not (
+            development_simulation
+            and development_target_source in {"cli", "rviz"}
+        ):
             command.append("reference_mode:=fixed_target")
         if mppi_profile:
             command.append(f"cylinder_profile:={mppi_profile}")

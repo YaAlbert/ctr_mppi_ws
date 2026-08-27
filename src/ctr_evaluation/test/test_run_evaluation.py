@@ -896,6 +896,34 @@ class RunEvaluationHelpersTest(unittest.TestCase):
         self.assertEqual("geometry_msgs/msg/PointStamped", candidate[5])
         self.assertIn("frame_id: 'world'", candidate[6])
 
+    def test_automated_cli_base_command_has_one_external_reference_mode(self):
+        command = build_base_simulation_command(
+            experiment_group="cli_evaluation",
+            controller_label="mppi",
+            baseline_dir=None,
+            task="curved_lumen_navigation",
+            target_position=[0.021180966381970152, 0.0, 0.08471218663414842],
+            slice_7g_profile=True,
+            development_simulation=True,
+            development_target_source="cli",
+        )
+        assert [value for value in command if value.startswith("reference_mode:=")] == [
+            "reference_mode:=external_target"
+        ]
+
+    def test_development_straight_fixed_target_task_is_valid(self):
+        args = parse_args(
+            [
+                "--development-simulation",
+                "--experiment-group", "straight_evaluation",
+                "--duration", "5",
+                "--runtime-mode", "simulation",
+                "--task", "cylinder_navigation",
+                "--target", "0.0192", "0", "0.084",
+            ]
+        )
+        validate_task_options(args)
+
     def test_cylinder_cli_argument_parsing(self):
         args = parse_args(
             [

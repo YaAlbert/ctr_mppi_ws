@@ -209,7 +209,7 @@ def matrix_specs() -> tuple[RunSpec, ...]:
         for seed in SEEDS:
             specs.append(RunSpec(f"E4-{case}-{seed}", "target_difficulty", "circular_arc", case, "profile", "cylinder_fast", seed, scenario))
     for seed in SEEDS:
-        specs.append(RunSpec(f"E5-straight-{seed}", "lumen_geometry", "straight", "normalized_nominal", "cli", "cylinder_fast", seed, "", (0.0192, 0.0, 0.084)))
+        specs.append(RunSpec(f"E5-straight-{seed}", "lumen_geometry", "straight", "normalized_nominal", "profile", "cylinder_fast", seed, "", (0.0192, 0.0, 0.084)))
         specs.append(RunSpec(f"E5-circular-{seed}", "lumen_geometry", "circular_arc", "normalized_nominal", "profile", "cylinder_fast", seed, "centerline_target"))
         specs.append(RunSpec(f"E5-s_curve-{seed}", "lumen_geometry", "s_curve", "normalized_nominal", "profile", "cylinder_fast", seed, "s_curve_middle_target"))
     for profile in ("paper_economy", "cylinder_fast", "paper_extended"):
