@@ -52,6 +52,7 @@ from ctr_evaluation.run_evaluation import (  # noqa: E402
     reference_subscription_qos_for_target_source,
     reference_target_identity,
     resolve_result_dir,
+    baseline_process_guard_required,
     settings_with_paper_diagnostics,
     strict_json_file,
     target_vectors_equal,
@@ -1283,6 +1284,17 @@ class RunEvaluationHelpersTest(unittest.TestCase):
         self.assertEqual(
             {"/ctr/safe_command": 1},
             unexpected_command_publishers({"/ctr/mppi_command": 0, "/ctr/safe_command": 1}),
+        )
+
+    def test_development_baseline_uses_domain_publisher_audit_not_host_process_names(self):
+        self.assertFalse(
+            baseline_process_guard_required(role="baseline", development_simulation=True)
+        )
+        self.assertTrue(
+            baseline_process_guard_required(role="baseline", development_simulation=False)
+        )
+        self.assertFalse(
+            baseline_process_guard_required(role="candidate", development_simulation=False)
         )
 
     def test_valid_experiment_group_names(self):

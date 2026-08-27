@@ -767,7 +767,12 @@ class EvaluationOrchestrator:
             )
             if self.slice_7g_profile_enabled:
                 monitor.wait_for_slice_7g_readiness(readiness_remaining())
-            if role == "baseline" and process_name_running("mppi_controller_node"):
+            if baseline_process_guard_required(
+                role=role,
+                development_simulation=bool(
+                    getattr(self, "development_simulation", False)
+                ),
+            ) and process_name_running("mppi_controller_node"):
                 raise OrchestrationError("MPPI controller process is running during baseline startup")
             publisher_counts = monitor.command_publisher_counts()
             audit = monitor.command_audit_since_now(publisher_counts)
@@ -2437,6 +2442,18 @@ def unexpected_command_publishers(
         "/ctr/mppi_command": 0, "/ctr/safe_command": 0,
     }
     return {topic: count for topic, count in publisher_counts.items() if count != expected.get(topic, 0)}
+
+
+def baseline_process_guard_required(*, role: str, development_simulation: bool) -> bool:
+    """Keep the host-global process guard on governed runs only.
+
+    Development simulations are isolated by ROS domain, so their authoritative
+    startup check is the current-domain publisher audit performed immediately
+    after this guard.  A host-global process-name match can otherwise reject a
+    clean domain because an unrelated development run exists on the host.
+    """
+
+    return role == "baseline" and not development_simulation
 
 
 def audit_start_receive_time(audit: CommandAudit) -> float:
