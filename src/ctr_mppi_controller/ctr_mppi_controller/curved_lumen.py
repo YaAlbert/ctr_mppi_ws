@@ -216,6 +216,60 @@ class CurvedLumen:
             outlet_penetration=outlet_penetration,
         )
 
+    def cost_clearance_components(
+        self, backbone_points: Any
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return only the arrays used by the MPPI lumen objective.
+
+        This evaluation-selectable path deliberately omits summary percentiles,
+        masks, and closest-point evidence that do not contribute to cost.  The
+        safety/evidence path continues to use :meth:`backbone_clearance`.
+        """
+
+        points = points_array(backbone_points, "backbone_points")
+        radial_distance, local_radius = self._project_points_for_cost(points)
+        inlet_signed = (points - self.centerline_points[0]) @ self.inlet_tangent
+        outlet_signed = (points - self.centerline_points[-1]) @ self.outlet_tangent
+        physical_clearances = local_radius - self.ctr_outer_radius - radial_distance
+        return (
+            physical_clearances,
+            np.maximum(-physical_clearances, 0.0),
+            np.maximum(-inlet_signed, 0.0),
+            np.maximum(outlet_signed, 0.0),
+        )
+
+    def _project_points_for_cost(self, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Vectorized projection preserving the sequential tolerance tie rule."""
+
+        starts = self.centerline_points[:-1]
+        vectors = self.segment_vectors
+        squared_lengths = self.segment_lengths * self.segment_lengths
+        offsets = points[:, None, :] - starts[None, :, :]
+        raw_parameters = np.einsum("nsi,si->ns", offsets, vectors) / squared_lengths[None, :]
+        parameters = np.clip(raw_parameters, 0.0, 1.0)
+        closest_points = starts[None, :, :] + parameters[:, :, None] * vectors[None, :, :]
+        deltas = points[:, None, :] - closest_points
+        distance_squared = np.einsum("nsi,nsi->ns", deltas, deltas)
+
+        global_minimum = np.min(distance_squared, axis=1)
+        # With monotonically increasing segment indices, the reference loop
+        # retains the earliest distance that the global minimum cannot improve
+        # by more than PROJECTION_TIE_TOLERANCE.  Express the same comparison
+        # in one NumPy batch using the reference subtraction order.
+        retained = ~(
+            global_minimum[:, None]
+            < distance_squared - PROJECTION_TIE_TOLERANCE
+        )
+        best_indices = np.argmax(retained, axis=1)
+        rows = np.arange(points.shape[0])
+        best_parameters = parameters[rows, best_indices]
+        best_distance_squared = distance_squared[rows, best_indices]
+        radii = (
+            (1.0 - best_parameters) * self.radius_profile[best_indices]
+            + best_parameters * self.radius_profile[best_indices + 1]
+        )
+        return np.sqrt(best_distance_squared), radii
+
     def _project_points(
         self, points: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:

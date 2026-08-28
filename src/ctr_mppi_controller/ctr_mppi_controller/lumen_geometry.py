@@ -263,17 +263,34 @@ def compute_lumen_cost_breakdown(
     weights: LumenCostWeights,
     backbone_points: Any,
     terminal: bool = False,
+    optimized: bool = False,
 ) -> LumenCostBreakdown:
     """Return the exact component values used by :func:`compute_lumen_cost`."""
 
-    clearance = lumen.backbone_clearance(backbone_points)
-    _validate_clearance_arrays(clearance)
+    components_method = getattr(lumen, "cost_clearance_components", None)
+    if optimized and callable(components_method):
+        physical_clearances, wall_penetrations, inlet_penetrations, outlet_penetrations = (
+            components_method(backbone_points)
+        )
+        _validate_cost_clearance_components(
+            physical_clearances,
+            wall_penetrations,
+            inlet_penetrations,
+            outlet_penetrations,
+        )
+    else:
+        clearance = lumen.backbone_clearance(backbone_points)
+        _validate_clearance_arrays(clearance)
+        physical_clearances = clearance.physical_clearances
+        wall_penetrations = clearance.wall_penetrations
+        inlet_penetrations = clearance.inlet_penetrations
+        outlet_penetrations = clearance.outlet_penetrations
     denominator = max(float(lumen.safety_margin), 1.0e-12)
-    soft = np.maximum(0.0, float(lumen.safety_margin) - clearance.physical_clearances) / denominator
-    wall = clearance.wall_penetrations / denominator
-    inlet = clearance.inlet_penetrations / denominator
-    outlet = clearance.outlet_penetrations / denominator
-    end_cap = clearance.end_cap_penetrations / denominator
+    soft = np.maximum(0.0, float(lumen.safety_margin) - physical_clearances) / denominator
+    wall = wall_penetrations / denominator
+    inlet = inlet_penetrations / denominator
+    outlet = outlet_penetrations / denominator
+    end_cap = np.maximum(inlet_penetrations, outlet_penetrations) / denominator
     safety_margin_raw = float(np.mean(soft**2))
     wall_collision_raw = float(np.mean(wall**2))
     end_cap_collision_raw = float(np.mean(end_cap**2))
@@ -283,7 +300,7 @@ def compute_lumen_cost_breakdown(
         + weights.radial_collision_weight * wall_collision_raw
         + weights.end_cap_weight * end_cap_collision_raw
     )
-    if terminal and clearance.points.shape[0] > 0:
+    if terminal and physical_clearances.shape[0] > 0:
         terminal_violation = max(float(np.max(wall)), float(np.max(inlet)), float(np.max(outlet)))
         if terminal_violation > 0.0:
             terminal_collision_raw = terminal_violation**2
@@ -311,6 +328,18 @@ def _validate_clearance_arrays(clearance: BackboneClearance) -> None:
     for array in arrays:
         if array.shape != expected_shape or not np.all(np.isfinite(array)):
             raise ValueError("lumen clearance output contains non-finite or inconsistent arrays")
+
+
+def _validate_cost_clearance_components(*arrays: np.ndarray) -> None:
+    if not arrays:
+        raise ValueError("lumen cost clearance components are missing")
+    expected_shape = np.asarray(arrays[0]).shape
+    if len(expected_shape) != 1 or expected_shape[0] == 0:
+        raise ValueError("lumen cost clearance components must be non-empty vectors")
+    for array in arrays:
+        value = np.asarray(array)
+        if value.shape != expected_shape or not np.all(np.isfinite(value)):
+            raise ValueError("lumen cost clearance components contain non-finite or inconsistent arrays")
 
 
 def points_array(values: Any, label: str) -> np.ndarray:

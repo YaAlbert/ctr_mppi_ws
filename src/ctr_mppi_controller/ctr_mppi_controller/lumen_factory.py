@@ -85,6 +85,17 @@ def config_with_mppi_profile(config: Mapping[str, Any], profile_name: str | None
         result["mppi"]["noise_std"] = deepcopy(profile["noise_std"])
     if "weights" in profile:
         result["mppi"].setdefault("weights", {}).update(deepcopy(profile["weights"]))
+    if "behavior_preserving_optimization_enabled" in profile:
+        value = profile["behavior_preserving_optimization_enabled"]
+        if type(value) is not bool:
+            raise ValueError(
+                f"mppi_profiles.{name}.behavior_preserving_optimization_enabled must be boolean"
+            )
+        result["mppi"]["behavior_preserving_optimization_enabled"] = value
+    if "cost_normalization" in profile:
+        if not isinstance(profile["cost_normalization"], Mapping):
+            raise ValueError(f"mppi_profiles.{name}.cost_normalization must be a map")
+        result["mppi"]["cost_normalization"] = deepcopy(profile["cost_normalization"])
     if "control_frequency" in profile:
         result["mppi"]["control_frequency"] = _positive_number(
             profile["control_frequency"],

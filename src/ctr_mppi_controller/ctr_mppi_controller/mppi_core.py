@@ -46,6 +46,13 @@ REQUIRED_WEIGHT_KEYS = (
     "stability",
 )
 
+NORMALIZED_TUNABLE_WEIGHT_KEYS = (
+    "tip",
+    "terminal",
+    "control",
+    "smoothness",
+)
+
 
 @dataclass(frozen=True)
 class MPPIConfig:
@@ -197,7 +204,12 @@ class MPPICore:
         self.temperature = self.mppi_config.temperature
         self.warm_start = self.mppi_config.warm_start
         self.shift_previous_solution = self.mppi_config.shift_previous_solution
-        self.weights = self.mppi_config.weights
+        self.base_weights = self.mppi_config.weights
+        self.cost_normalization = _cost_normalization_from_config(config)
+        self.weights = _effective_tuning_weights(
+            self.base_weights,
+            self.cost_normalization,
+        )
         self.noise_std = self.mppi_config.noise_std
         self.q_min = self.mppi_config.q_min
         self.q_max = self.mppi_config.q_max
@@ -213,6 +225,12 @@ class MPPICore:
         self.lumen = lumen_geometry
         self.lumen_cost_weights = None
         self.evaluation_diagnostics_enabled = bool(evaluation_diagnostics_enabled)
+        optimization_value = config.get("mppi", {}).get(
+            "behavior_preserving_optimization_enabled", False
+        )
+        if type(optimization_value) is not bool:
+            raise ValueError("mppi.behavior_preserving_optimization_enabled must be boolean")
+        self.behavior_preserving_optimization_enabled = optimization_value
         if self.lumen is not None:
             self.lumen_cost_weights = lumen_cost_weights or LumenCostWeights.from_config(config)
         self.tactile_cost_config = TactileCostConfig.from_project_config(config)
@@ -220,6 +238,7 @@ class MPPICore:
         self.last_tactile_snapshot_reason = "disabled"
         self.last_tactile_cost = 0.0
         self.last_tactile_minimum_predicted_clearance_m = float("nan")
+        self._validated_reference_sequence_cache: np.ndarray | None = None
         self._validate_disabled_costs()
 
     def reset(self) -> None:
@@ -264,7 +283,9 @@ class MPPICore:
         q = _array_shape(q0, "q0", (self.control_dimension,)).copy()
         sequence_array = _array_shape(sequence, "sequence", (self.horizon, self.control_dimension))
         previous = _array_shape(previous_command, "previous_command", (self.control_dimension,)).copy()
-        reference_sequence = self._reference_sequence(target_tip=target_tip, target_tip_sequence=target_tip_sequence)
+        reference_sequence = self._reference_sequence(
+            target_tip=target_tip, target_tip_sequence=target_tip_sequence
+        )
 
         total = 0.0
         tactile_total = 0.0
@@ -559,8 +580,15 @@ class MPPICore:
             target = _array_shape(target_tip, "target_tip", (3,))
             sequence = np.tile(target, (self.horizon, 1))
         else:
+            if (
+                self.behavior_preserving_optimization_enabled
+                and target_tip_sequence is self._validated_reference_sequence_cache
+            ):
+                return self._validated_reference_sequence_cache
             sequence = _array_shape(target_tip_sequence, "target_tip_sequence", (self.horizon, 3)).copy()
         self._validate_reference_inside_lumen(sequence)
+        if self.behavior_preserving_optimization_enabled:
+            self._validated_reference_sequence_cache = sequence
         return sequence
 
     def _validate_disabled_costs(self) -> None:
@@ -615,6 +643,7 @@ class MPPICore:
             weights=self.lumen_cost_weights,
             backbone_points=backbone_points,
             terminal=terminal,
+            optimized=self.behavior_preserving_optimization_enabled,
         )
 
     def _accumulate_lumen_terms(
@@ -655,6 +684,69 @@ class MPPICore:
 
 def _array(values: Any, label: str, size: int) -> np.ndarray:
     return _array_shape(values, label, (size,))
+
+
+def _cost_normalization_from_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Validate the evaluation-only normalized-weight parameterization.
+
+    If raw term ``c_i`` has reference scale ``s_i``, the documented normalized
+    form is ``(base_weight_i * s_i * multiplier_i) * (c_i / s_i)``.  The core
+    resolves this algebraically to ``base_weight_i * multiplier_i * c_i`` so
+    the baseline multiplier remains bitwise identical and the hot path does
+    not add divide/multiply roundoff.
+    """
+
+    raw = config.get("mppi", {}).get("cost_normalization", {"enabled": False})
+    if not isinstance(raw, dict):
+        raise ValueError("mppi.cost_normalization must be a map")
+    enabled = raw.get("enabled", False)
+    if type(enabled) is not bool:
+        raise ValueError("mppi.cost_normalization.enabled must be boolean")
+    if not enabled:
+        return {"enabled": False, "reference_scales": {}, "multipliers": {}}
+
+    scales = raw.get("reference_scales")
+    multipliers = raw.get("multipliers")
+    if not isinstance(scales, dict):
+        raise ValueError("mppi.cost_normalization.reference_scales must be a map")
+    if not isinstance(multipliers, dict):
+        raise ValueError("mppi.cost_normalization.multipliers must be a map")
+    expected = set(NORMALIZED_TUNABLE_WEIGHT_KEYS)
+    if set(scales) != expected:
+        raise ValueError(
+            "mppi.cost_normalization.reference_scales must contain exactly "
+            f"{sorted(expected)}"
+        )
+    if set(multipliers) != expected:
+        raise ValueError(
+            "mppi.cost_normalization.multipliers must contain exactly "
+            f"{sorted(expected)}"
+        )
+    validated_scales = {
+        key: _positive_number(scales[key], f"mppi.cost_normalization.reference_scales.{key}")
+        for key in NORMALIZED_TUNABLE_WEIGHT_KEYS
+    }
+    validated_multipliers = {
+        key: _positive_number(multipliers[key], f"mppi.cost_normalization.multipliers.{key}")
+        for key in NORMALIZED_TUNABLE_WEIGHT_KEYS
+    }
+    return {
+        "enabled": True,
+        "reference_scales": validated_scales,
+        "multipliers": validated_multipliers,
+    }
+
+
+def _effective_tuning_weights(
+    base_weights: dict[str, float],
+    normalization: dict[str, Any],
+) -> dict[str, float]:
+    weights = dict(base_weights)
+    if not normalization["enabled"]:
+        return weights
+    for key in NORMALIZED_TUNABLE_WEIGHT_KEYS:
+        weights[key] = float(base_weights[key]) * float(normalization["multipliers"][key])
+    return weights
 
 
 def _empty_cost_terms() -> dict[str, float]:

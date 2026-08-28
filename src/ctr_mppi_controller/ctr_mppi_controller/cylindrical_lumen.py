@@ -159,6 +159,23 @@ class CylindricalLumen:
             raise RuntimeError("cylindrical lumen shared clearance conversion changed collision semantics")
         return result
 
+    def cost_clearance_components(
+        self, backbone_points: Any
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return only physical and penetration arrays used by MPPI cost."""
+
+        points = _points(backbone_points, "backbone_points")
+        offsets = points - self.axis_origin
+        axial = offsets @ self.axis_direction
+        radial_vectors = offsets - axial[:, None] * self.axis_direction[None, :]
+        physical_clearances = self.usable_radius - np.linalg.norm(radial_vectors, axis=1)
+        return (
+            physical_clearances,
+            np.maximum(-physical_clearances, 0.0),
+            np.maximum(-axial, 0.0),
+            np.maximum(axial - self.length, 0.0),
+        )
+
     def validate_target(
         self,
         target: Any,

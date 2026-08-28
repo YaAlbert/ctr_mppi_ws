@@ -278,6 +278,15 @@ def _apply_mppi_profile(config: dict[str, Any], profile_name: Any) -> None:
         if not isinstance(profile["weights"], dict):
             raise ParameterValidationError(f"`mppi_profiles.{name}.weights` must be a map.")
         mppi.setdefault("weights", {}).update(deepcopy(profile["weights"]))
+    if "behavior_preserving_optimization_enabled" in profile:
+        value = profile["behavior_preserving_optimization_enabled"]
+        if type(value) is not bool:
+            raise ParameterValidationError(
+                f"`mppi_profiles.{name}.behavior_preserving_optimization_enabled` must be a boolean."
+            )
+        mppi["behavior_preserving_optimization_enabled"] = value
+    if "cost_normalization" in profile:
+        mppi["cost_normalization"] = deepcopy(profile["cost_normalization"])
     if "control_frequency" in profile:
         mppi["control_frequency"] = _positive_number_value(
             profile["control_frequency"],
@@ -441,6 +450,12 @@ def _validate_mppi(mppi: Any) -> list[str]:
     weights = mppi.get("weights", {})
     for key in ("tip", "shape", "control", "smoothness", "obstacle", "terminal", "force", "joint_limit", "stability"):
         errors.extend(_require_number(weights, key, "mppi.weights", nonnegative=True))
+    if "behavior_preserving_optimization_enabled" in mppi and type(
+        mppi["behavior_preserving_optimization_enabled"]
+    ) is not bool:
+        errors.append("`mppi.behavior_preserving_optimization_enabled` must be a boolean.")
+    if "cost_normalization" in mppi:
+        errors.extend(_validate_cost_normalization(mppi["cost_normalization"], "mppi.cost_normalization"))
     return errors
 
 
@@ -501,6 +516,19 @@ def _validate_mppi_profiles(profiles: Any) -> list[str]:
                 for weight_name in ("tip", "shape", "control", "smoothness", "obstacle", "terminal", "force", "joint_limit", "stability"):
                     if weight_name in weights:
                         errors.extend(_require_number(weights, weight_name, f"{label}.weights", nonnegative=True))
+        if "behavior_preserving_optimization_enabled" in profile and type(
+            profile["behavior_preserving_optimization_enabled"]
+        ) is not bool:
+            errors.append(
+                f"`{label}.behavior_preserving_optimization_enabled` must be a boolean."
+            )
+        if "cost_normalization" in profile:
+            errors.extend(
+                _validate_cost_normalization(
+                    profile["cost_normalization"],
+                    f"{label}.cost_normalization",
+                )
+            )
         if "noise_std" in profile:
             noise = profile["noise_std"]
             if not isinstance(noise, dict):
@@ -509,6 +537,30 @@ def _validate_mppi_profiles(profiles: Any) -> list[str]:
                 for key in ("insertion", "rotation"):
                     if key in noise:
                         errors.extend(_require_numeric_list(noise, key, 3, f"{label}.noise_std", positive=True))
+    return errors
+
+
+def _validate_cost_normalization(values: Any, label: str) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(values, dict):
+        return [f"`{label}` must be a map."]
+    enabled = values.get("enabled", False)
+    if type(enabled) is not bool:
+        errors.append(f"`{label}.enabled` must be a boolean.")
+        return errors
+    if not enabled:
+        return errors
+    keys = ("tip", "terminal", "control", "smoothness")
+    for section in ("reference_scales", "multipliers"):
+        mapping = values.get(section)
+        if not isinstance(mapping, dict):
+            errors.append(f"`{label}.{section}` must be a map.")
+            continue
+        if set(mapping) != set(keys):
+            errors.append(f"`{label}.{section}` must contain exactly {list(keys)}.")
+            continue
+        for key in keys:
+            errors.extend(_require_positive_number(mapping, key, f"{label}.{section}"))
     return errors
 
 

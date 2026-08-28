@@ -11,6 +11,15 @@ mppi:
   command_type: joint_velocity
   warm_start: true
   shift_previous_solution: true
+  # Evaluation-configurable behavior-preserving fast path. Production and
+  # hardware defaults remain on the reference implementation until a
+  # separately approved validation promotes it.
+  behavior_preserving_optimization_enabled: false
+  # Evaluation-only unit normalization. When enabled by an explicit profile,
+  # raw_i/scale_i is weighted by base_weight_i*scale_i*multiplier_i. The core
+  # algebraically resolves this to base_weight_i*multiplier_i*raw_i.
+  cost_normalization:
+    enabled: false
 
   noise_std:
     insertion: [0.0005, 0.0005, 0.0005]
@@ -97,6 +106,188 @@ mppi_profiles:
       smoothness: 0.01
     simulation_default: false
     note: explicit evaluation configuration for controller-computation trade-off analysis
+  optimization_baseline:
+    samples: 36
+    horizon: 7
+    dt: 0.55
+    control_period: 0.10
+    noise_std: &optimization_noise
+      insertion: [0.0030, 0.0030, 0.0030]
+      rotation: [0.100, 0.100, 0.100]
+    weights: &optimization_base_weights
+      tip: 15000.0
+      terminal: 15000.0
+      control: 0.005
+      smoothness: 0.01
+    behavior_preserving_optimization_enabled: true
+    cost_normalization:
+      enabled: true
+      reference_scales: &optimization_reference_scales
+        tip: 0.00001078549037381875
+        terminal: 0.0000009846810831579434
+        control: 0.11857924774155915
+        smoothness: 0.22958280573589357
+      multipliers: &optimization_baseline_multipliers
+        tip: 1.0
+        terminal: 1.0
+        control: 1.0
+        smoothness: 1.0
+    simulation_default: false
+    note: evaluation-only optimized computation path with exact baseline-equivalent normalized weights
+  optimization_c01:
+    samples: 36
+    horizon: 7
+    dt: 0.55
+    control_period: 0.10
+    noise_std: *optimization_noise
+    weights: *optimization_base_weights
+    behavior_preserving_optimization_enabled: true
+    cost_normalization:
+      enabled: true
+      reference_scales: *optimization_reference_scales
+      multipliers: {tip: 1.0, terminal: 2.0, control: 1.0, smoothness: 1.0}
+    simulation_default: false
+    note: deterministic optimization screening candidate C01
+  optimization_c02:
+    samples: 36
+    horizon: 7
+    dt: 0.55
+    control_period: 0.10
+    noise_std: *optimization_noise
+    weights: *optimization_base_weights
+    behavior_preserving_optimization_enabled: true
+    cost_normalization:
+      enabled: true
+      reference_scales: *optimization_reference_scales
+      multipliers: {tip: 1.0, terminal: 4.0, control: 1.0, smoothness: 1.0}
+    simulation_default: false
+    note: deterministic optimization screening candidate C02
+  optimization_c03:
+    samples: 36
+    horizon: 7
+    dt: 0.55
+    control_period: 0.10
+    noise_std: *optimization_noise
+    weights: *optimization_base_weights
+    behavior_preserving_optimization_enabled: true
+    cost_normalization:
+      enabled: true
+      reference_scales: *optimization_reference_scales
+      multipliers: {tip: 1.0, terminal: 8.0, control: 1.0, smoothness: 1.0}
+    simulation_default: false
+    note: deterministic optimization screening candidate C03
+  optimization_c04:
+    samples: 36
+    horizon: 7
+    dt: 0.55
+    control_period: 0.10
+    noise_std: *optimization_noise
+    weights: *optimization_base_weights
+    behavior_preserving_optimization_enabled: true
+    cost_normalization:
+      enabled: true
+      reference_scales: *optimization_reference_scales
+      multipliers: {tip: 0.75, terminal: 2.0, control: 1.0, smoothness: 1.0}
+    simulation_default: false
+    note: deterministic optimization screening candidate C04
+  optimization_c05:
+    samples: 36
+    horizon: 7
+    dt: 0.55
+    control_period: 0.10
+    noise_std: *optimization_noise
+    weights: *optimization_base_weights
+    behavior_preserving_optimization_enabled: true
+    cost_normalization:
+      enabled: true
+      reference_scales: *optimization_reference_scales
+      multipliers: {tip: 0.75, terminal: 4.0, control: 1.0, smoothness: 1.0}
+    simulation_default: false
+    note: deterministic optimization screening candidate C05
+  optimization_c06:
+    samples: 36
+    horizon: 7
+    dt: 0.55
+    control_period: 0.10
+    noise_std: *optimization_noise
+    weights: *optimization_base_weights
+    behavior_preserving_optimization_enabled: true
+    cost_normalization:
+      enabled: true
+      reference_scales: *optimization_reference_scales
+      multipliers: {tip: 0.75, terminal: 8.0, control: 1.0, smoothness: 1.0}
+    simulation_default: false
+    note: deterministic optimization screening candidate C06
+  optimization_c07:
+    samples: 36
+    horizon: 7
+    dt: 0.55
+    control_period: 0.10
+    noise_std: *optimization_noise
+    weights: *optimization_base_weights
+    behavior_preserving_optimization_enabled: true
+    cost_normalization:
+      enabled: true
+      reference_scales: *optimization_reference_scales
+      multipliers: {tip: 0.5, terminal: 4.0, control: 1.0, smoothness: 1.0}
+    simulation_default: false
+    note: deterministic optimization screening candidate C07
+  optimization_c08:
+    samples: 36
+    horizon: 7
+    dt: 0.55
+    control_period: 0.10
+    noise_std: *optimization_noise
+    weights: *optimization_base_weights
+    behavior_preserving_optimization_enabled: true
+    cost_normalization:
+      enabled: true
+      reference_scales: *optimization_reference_scales
+      multipliers: {tip: 0.5, terminal: 8.0, control: 1.0, smoothness: 1.0}
+    simulation_default: false
+    note: deterministic optimization screening candidate C08
+  optimization_c09:
+    samples: 36
+    horizon: 7
+    dt: 0.55
+    control_period: 0.10
+    noise_std: *optimization_noise
+    weights: *optimization_base_weights
+    behavior_preserving_optimization_enabled: true
+    cost_normalization:
+      enabled: true
+      reference_scales: *optimization_reference_scales
+      multipliers: {tip: 1.0, terminal: 4.0, control: 0.25, smoothness: 0.25}
+    simulation_default: false
+    note: deterministic optimization screening candidate C09
+  optimization_c10:
+    samples: 36
+    horizon: 7
+    dt: 0.55
+    control_period: 0.10
+    noise_std: *optimization_noise
+    weights: *optimization_base_weights
+    behavior_preserving_optimization_enabled: true
+    cost_normalization:
+      enabled: true
+      reference_scales: *optimization_reference_scales
+      multipliers: {tip: 0.75, terminal: 4.0, control: 0.25, smoothness: 0.25}
+    simulation_default: false
+    note: deterministic optimization screening candidate C10
+  optimization_c11:
+    samples: 36
+    horizon: 7
+    dt: 0.55
+    control_period: 0.10
+    noise_std: *optimization_noise
+    weights: *optimization_base_weights
+    behavior_preserving_optimization_enabled: true
+    cost_normalization:
+      enabled: true
+      reference_scales: *optimization_reference_scales
+      multipliers: {tip: 0.5, terminal: 8.0, control: 0.25, smoothness: 0.25}
+    simulation_default: false
+    note: deterministic optimization screening candidate C11
 
 cylindrical_lumen:
   enabled: true
