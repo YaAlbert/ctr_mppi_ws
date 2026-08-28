@@ -25,6 +25,9 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import yaml  # noqa: E402
 
+from ctr_bringup.development_physical_evidence import (
+    SIMULATOR_PAPER_EVALUATION_FRESHNESS_TIMEOUT_S,
+)
 from ctr_bringup.parameter_validation import load_parameter_files
 from ctr_evaluation.run_evaluation import (
     EvaluationOrchestrator,
@@ -75,6 +78,58 @@ PAPER_TABLES = (
 FORBIDDEN_PRESENTATION_TEXT = (
     "slice 7g", "slice_7g", "feature/", "pre-merge", "post-merge",
     "not production evidence", "development stage", "development-stage",
+)
+FORMAL_WINDOW_EVIDENCE_VALIDATOR_SCHEMA = (
+    "ctr-formal-window-evidence-validation-v1"
+)
+FORMAL_WINDOW_BOUNDARY_CONVENTION = "inclusive_start_inclusive_end"
+FORMAL_WINDOW_DURATION_S = 25.0
+REQUIRED_RUN_ARTIFACTS = frozenset(
+    {
+        "state.csv",
+        "tip.csv",
+        "reference.csv",
+        "command.csv",
+        "solve_timing.csv",
+        "horizon.csv",
+        "reference_path.csv",
+        "backbone.csv",
+        "metadata.yaml",
+        "summary.json",
+        "aligned_samples.csv",
+        "tactile_safety.csv",
+        "mppi_cost_terms.csv",
+        "mppi_computation.csv",
+        "tracking_error.png",
+        "trajectory_xy.png",
+        "trajectory_3d.png",
+        "tip_trajectory.png",
+        "command_history.png",
+        "solve_time.png",
+        "cumulative_control_effort.png",
+        "curved_wall_clearance.png",
+        "centerline_tracking_error.png",
+        "curved_lumen_trajectory_3d.png",
+        "tactile_safety_response.png",
+        "cost_term_breakdown.png",
+        "deadline_analysis.png",
+        "mppi_computation_breakdown.png",
+    }
+)
+_PROHIBITED_AUTHORITATIVE_SAFETY_REASON_TOKENS = (
+    "authentication",
+    "disconnected",
+    "duplicate_sequence_changed",
+    "future_dated",
+    "integrity",
+    "invalid",
+    "producer",
+    "rollback",
+    "service",
+    "stale",
+    "timeout",
+    "torn_read",
+    "unavailable",
 )
 METRIC_DEFINITIONS = {
     "readiness_time_s": {
@@ -745,15 +800,458 @@ def figure_record(filename: str, title: str, rows: list[dict[str, Any]], aggrega
     }
 
 
-def validate_artifacts(root: Path, rows: list[dict[str, Any]]) -> tuple[str, int]:
-    required = {
-        "state.csv", "tip.csv", "reference.csv", "command.csv", "solve_timing.csv", "horizon.csv", "reference_path.csv", "backbone.csv",
-        "metadata.yaml", "summary.json", "aligned_samples.csv", "tactile_safety.csv", "mppi_cost_terms.csv", "mppi_computation.csv",
-        "tracking_error.png", "trajectory_xy.png", "trajectory_3d.png", "tip_trajectory.png", "command_history.png", "solve_time.png",
-        "cumulative_control_effort.png", "curved_wall_clearance.png", "centerline_tracking_error.png",
-        "curved_lumen_trajectory_3d.png", "tactile_safety_response.png", "cost_term_breakdown.png",
-        "deadline_analysis.png", "mppi_computation_breakdown.png",
+def validate_formal_window_evidence(run_dir: Path) -> dict[str, Any]:
+    """Validate simulator evidence in the committed formal wall-clock window.
+
+    The recorder's state-window convention is inclusive at both boundaries, so
+    this validator uses ``start <= source_stamp <= end``. Safety status rows in
+    ``tactile_safety.csv`` inherit the latest tactile row's generic timestamp;
+    the authenticated ``safety_source_stamp_s`` is therefore the authoritative
+    wall-clock field used to select safety observations. ROS delivery fields
+    remain diagnostic and never substitute for ``safety_queued_age_s``.
+    """
+
+    failures: list[str] = []
+    metadata: dict[str, Any] = {}
+    summary: dict[str, Any] = {}
+    try:
+        metadata = read_yaml(run_dir / "metadata.yaml")
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        failures.append(f"metadata unreadable: {type(exc).__name__}")
+    try:
+        summary = read_json(run_dir / "summary.json")
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        failures.append(f"summary unreadable: {type(exc).__name__}")
+
+    start = _finite_number(metadata.get("evaluation_window_start_time_s"))
+    end = _finite_number(metadata.get("evaluation_window_end_time_s"))
+    duration = _finite_number(metadata.get("evaluation_window_duration_s"))
+    if start is None:
+        failures.append("formal window start is missing or nonfinite")
+    if end is None:
+        failures.append("formal window end is missing or nonfinite")
+    if duration is None:
+        failures.append("formal window duration is missing or nonfinite")
+    if start is not None and end is not None and end <= start:
+        failures.append("formal window is empty or reversed")
+    if duration is not None and not math.isclose(
+        duration, FORMAL_WINDOW_DURATION_S, rel_tol=0.0, abs_tol=1.0e-9
+    ):
+        failures.append("formal window duration is not exactly 25 seconds")
+    if start is not None and end is not None and duration is not None and not math.isclose(
+        end - start, duration, rel_tol=0.0, abs_tol=1.0e-9
+    ):
+        failures.append("formal window endpoints and duration are inconsistent")
+
+    override = metadata.get("metadata_override", {})
+    if isinstance(override, dict):
+        for key, authoritative in (
+            ("evaluation_window_start_time_s", start),
+            ("evaluation_window_end_time_s", end),
+            ("evaluation_window_duration_s", duration),
+        ):
+            if key not in override:
+                continue
+            duplicate = _finite_number(override.get(key))
+            if (
+                duplicate is None
+                or authoritative is None
+                or not math.isclose(
+                    duplicate, authoritative, rel_tol=0.0, abs_tol=1.0e-9
+                )
+            ):
+                failures.append(f"formal window metadata disagrees for {key}")
+
+    recording_start = _finite_number(metadata.get("recording_start_time_s"))
+    recording_stop = _finite_number(metadata.get("recording_stop_time_s"))
+    if start is not None and recording_start is not None and recording_start > start:
+        failures.append("recording starts after the formal window")
+    if end is not None and recording_stop is not None and recording_stop < end:
+        failures.append("recording stops before the formal window")
+
+    paper_metrics = summary.get("paper_metrics", {})
+    requested_duration = _finite_number(
+        paper_metrics.get("requested_runtime_s")
+        if isinstance(paper_metrics, dict)
+        else None
+    )
+    if requested_duration is not None and duration is not None and not math.isclose(
+        requested_duration, duration, rel_tol=0.0, abs_tol=1.0e-9
+    ):
+        failures.append("summary runtime disagrees with the formal window")
+
+    run_status = summary.get("run_status", {})
+    navigation = summary.get("navigation", {})
+    safety_summary = summary.get("slice_7g_safety", {})
+    if not isinstance(run_status, dict) or run_status.get("status") != "completed":
+        failures.append("terminal run status is not completed")
+    if not isinstance(run_status, dict) or run_status.get("interrupted") is not False:
+        failures.append("terminal run is interrupted or lacks interruption status")
+    if (
+        not isinstance(run_status, dict)
+        or run_status.get("completed_evaluation_window") is not True
+    ):
+        failures.append("terminal run did not complete the formal window")
+    for key in (
+        "run_valid",
+        "physical_safety_pass",
+        "safety_margin_pass",
+        "completed_evaluation_window",
+    ):
+        if not isinstance(navigation, dict) or navigation.get(key) is not True:
+            failures.append(f"navigation terminal field is not true: {key}")
+    if (
+        not isinstance(safety_summary, dict)
+        or _finite_number(safety_summary.get("fault_count")) != 0.0
+    ):
+        failures.append("summary reports a safety fault")
+
+    configuration = metadata.get("configuration", {})
+    profile_values = (
+        metadata.get("simulator_paper_evaluation_profile"),
+        configuration.get("simulator_paper_evaluation_profile")
+        if isinstance(configuration, dict)
+        else None,
+        override.get("simulator_paper_evaluation_profile")
+        if isinstance(override, dict)
+        else None,
+    )
+    if True not in profile_values:
+        failures.append("simulator paper-evaluation profile is not enabled")
+
+    tactile_safety_rows = read_csv(run_dir / "tactile_safety.csv")
+    tactile_rows = [
+        row for row in tactile_safety_rows if row.get("event_type") == "tactile"
+    ]
+    safety_rows = [
+        row for row in tactile_safety_rows if row.get("event_type") == "safety"
+    ]
+    if not tactile_safety_rows:
+        failures.append("tactile_safety.csv is missing or empty")
+
+    formal_tactile: list[dict[str, str]] = []
+    formal_safety: list[dict[str, str]] = []
+    if start is not None and end is not None and end > start:
+        formal_tactile = [
+            row
+            for row in tactile_rows
+            if _inside_inclusive_window(row.get("timestamp_s"), start, end)
+        ]
+        formal_safety = [
+            row
+            for row in safety_rows
+            if _inside_inclusive_window(row.get("safety_source_stamp_s"), start, end)
+        ]
+    if not formal_safety:
+        failures.append("formal window has no authoritative safety evidence")
+
+    full_safety_diagnostics = _safety_diagnostics(safety_rows)
+    formal_safety_diagnostics = _safety_diagnostics(formal_safety)
+    full_ros_diagnostics = _ros_delivery_diagnostics(tactile_rows)
+    formal_ros_diagnostics = _ros_delivery_diagnostics(formal_tactile)
+
+    for index, row in enumerate(formal_safety):
+        age = _finite_number(row.get("safety_queued_age_s"))
+        if age is None or age < 0.0:
+            failures.append(
+                f"formal safety row {index} has invalid safety_direct_age_s"
+            )
+        elif age >= SIMULATOR_PAPER_EVALUATION_FRESHNESS_TIMEOUT_S:
+            failures.append(
+                f"formal safety row {index} safety_direct_age_s is outside [0,0.20)"
+            )
+        valid = _csv_bool(row.get("safety_valid"))
+        fault = _csv_bool(row.get("safety_fault"))
+        emergency_stop = _csv_bool(row.get("safety_emergency_stop"))
+        if valid is not True:
+            failures.append(f"formal safety row {index} is invalid")
+        if fault is not False:
+            failures.append(f"formal safety row {index} reports a fault")
+        if emergency_stop is not False:
+            failures.append(f"formal safety row {index} reports emergency stop")
+        reason = str(row.get("safety_reason", "")).split("|", 1)[0]
+        if not reason:
+            failures.append(f"formal safety row {index} lacks a safety reason")
+        elif any(
+            token in reason
+            for token in _PROHIBITED_AUTHORITATIVE_SAFETY_REASON_TOKENS
+        ):
+            failures.append(
+                f"formal safety row {index} has fail-closed reason: {reason}"
+            )
+        if _positive_integer(row.get("safety_source_sequence")) is None:
+            failures.append(
+                f"formal safety row {index} has invalid authoritative sequence"
+            )
+        if _finite_number(row.get("safety_source_stamp_s")) is None:
+            failures.append(
+                f"formal safety row {index} has invalid authoritative source stamp"
+            )
+        if _csv_bool(row.get("safety_out_of_order_sequence")) is True:
+            failures.append(
+                f"formal safety row {index} reports out-of-order evidence"
+            )
+
+    formal_sequence = formal_safety_diagnostics["sequence"]
+    if formal_sequence["rollback_count"]:
+        failures.append("formal authoritative safety sequence rolls back")
+    if formal_sequence["source_stamp_rollback_count"]:
+        failures.append("formal authoritative safety source timestamp rolls back")
+    if formal_sequence["same_sequence_mutation_count"]:
+        failures.append("formal authoritative same sequence changes timestamp")
+
+    result = {
+        "schema_version": FORMAL_WINDOW_EVIDENCE_VALIDATOR_SCHEMA,
+        "eligible": False,
+        "failures": sorted(set(failures)),
+        "formal_window": {
+            "boundary_convention": FORMAL_WINDOW_BOUNDARY_CONVENTION,
+            "start_time_s": start,
+            "end_time_s": end,
+            "duration_s": duration,
+            "tactile_row_count": len(formal_tactile),
+            "authoritative_safety_row_count": len(formal_safety),
+        },
+        "authoritative_safety": {
+            "age_field": "safety_queued_age_s",
+            "reported_name": "safety_direct_age_s",
+            "freshness_rule": "0 <= safety_direct_age_s < 0.20",
+            "freshness_timeout_s": (
+                SIMULATOR_PAPER_EVALUATION_FRESHNESS_TIMEOUT_S
+            ),
+            "full_recording": full_safety_diagnostics,
+            "formal_window": formal_safety_diagnostics,
+        },
+        "ros_tactile_delivery": {
+            "age_field": "data_age_s",
+            "reported_name": "ros_tactile_delivery_age_s",
+            "scientific_freshness_authority": False,
+            "latest_sample_forward_gaps_allowed": True,
+            "source_mailbox_overwrites_are_diagnostic": True,
+            "full_recording": full_ros_diagnostics,
+            "formal_window": formal_ros_diagnostics,
+        },
     }
+    result["eligible"] = not result["failures"]
+    return result
+
+
+def format_formal_window_evidence_validation(result: dict[str, Any]) -> str:
+    """Return deterministic Markdown with explicit ROS/direct-safety labels."""
+
+    safety = result["authoritative_safety"]["formal_window"]
+    ros_full = result["ros_tactile_delivery"]["full_recording"]
+    ros_formal = result["ros_tactile_delivery"]["formal_window"]
+    return "; ".join(
+        (
+            f"schema={result['schema_version']}",
+            f"eligibility={'PASS' if result['eligible'] else 'FAIL'}",
+            f"boundary={result['formal_window']['boundary_convention']}",
+            "safety_direct_age_s(formal)="
+            f"{json.dumps(safety['safety_direct_age_s'], sort_keys=True, allow_nan=False)}",
+            "ros_tactile_delivery_age_s(full)="
+            f"{json.dumps(ros_full['ros_tactile_delivery_age_s'], sort_keys=True, allow_nan=False)}",
+            "ros_tactile_delivery_age_s(formal)="
+            f"{json.dumps(ros_formal['ros_tactile_delivery_age_s'], sort_keys=True, allow_nan=False)}",
+            "ros_forward_gap_count(full/formal)="
+            f"{ros_full['sequence']['forward_gap_count']}/"
+            f"{ros_formal['sequence']['forward_gap_count']}",
+            "source_mailbox_overwrite_total(full/formal)="
+            f"{ros_full['source_mailbox_overwrites']['total']}/"
+            f"{ros_formal['source_mailbox_overwrites']['total']}",
+            f"failures={json.dumps(result['failures'], sort_keys=True, allow_nan=False)}",
+        )
+    )
+
+
+def _finite_number(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _positive_integer(value: Any) -> int | None:
+    numeric = _finite_number(value)
+    if numeric is None or numeric <= 0.0 or not numeric.is_integer():
+        return None
+    return int(numeric)
+
+
+def _csv_bool(value: Any) -> bool | None:
+    if type(value) is bool:
+        return value
+    if type(value) is not str:
+        return None
+    if value.lower() == "true":
+        return True
+    if value.lower() == "false":
+        return False
+    return None
+
+
+def _inside_inclusive_window(value: Any, start: float, end: float) -> bool:
+    stamp = _finite_number(value)
+    return stamp is not None and start <= stamp <= end
+
+
+def _numeric_diagnostics(rows: list[dict[str, str]], field: str) -> dict[str, Any]:
+    values = [
+        numeric
+        for row in rows
+        if (numeric := _finite_number(row.get(field))) is not None
+    ]
+    if not values:
+        return {
+            "count": 0,
+            "invalid_count": len(rows),
+            "min": None,
+            "p50": None,
+            "p95": None,
+            "p99": None,
+            "max": None,
+        }
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "count": len(values),
+        "invalid_count": len(rows) - len(values),
+        "min": float(np.min(array)),
+        "p50": float(np.percentile(array, 50.0)),
+        "p95": float(np.percentile(array, 95.0)),
+        "p99": float(np.percentile(array, 99.0)),
+        "max": float(np.max(array)),
+    }
+
+
+def _sequence_diagnostics(
+    rows: list[dict[str, str]],
+    *,
+    sequence_field: str,
+    stamp_field: str,
+) -> dict[str, Any]:
+    forward_gaps: list[dict[str, Any]] = []
+    rollback_count = 0
+    stamp_rollback_count = 0
+    same_sequence_mutation_count = 0
+    invalid_count = 0
+    previous: tuple[int, float] | None = None
+    for row in rows:
+        sequence = _positive_integer(row.get(sequence_field))
+        stamp = _finite_number(row.get(stamp_field))
+        if sequence is None or stamp is None:
+            invalid_count += 1
+            continue
+        if previous is not None:
+            previous_sequence, previous_stamp = previous
+            delta = sequence - previous_sequence
+            if delta > 1:
+                forward_gaps.append(
+                    {
+                        "previous_sequence": previous_sequence,
+                        "current_sequence": sequence,
+                        "missing_sequence_count": delta - 1,
+                        "previous_source_stamp_s": previous_stamp,
+                        "current_source_stamp_s": stamp,
+                    }
+                )
+            elif delta < 0:
+                rollback_count += 1
+            elif delta == 0 and stamp != previous_stamp:
+                same_sequence_mutation_count += 1
+            if stamp < previous_stamp:
+                stamp_rollback_count += 1
+        previous = (sequence, stamp)
+    return {
+        "observation_count": len(rows),
+        "invalid_count": invalid_count,
+        "forward_gap_count": len(forward_gaps),
+        "missing_sequence_count": sum(
+            item["missing_sequence_count"] for item in forward_gaps
+        ),
+        "forward_gaps": forward_gaps,
+        "rollback_count": rollback_count,
+        "source_stamp_rollback_count": stamp_rollback_count,
+        "same_sequence_mutation_count": same_sequence_mutation_count,
+    }
+
+
+def _safety_diagnostics(rows: list[dict[str, str]]) -> dict[str, Any]:
+    return {
+        "row_count": len(rows),
+        "safety_direct_age_s": _numeric_diagnostics(
+            rows, "safety_queued_age_s"
+        ),
+        "safety_receipt_gap_s": _numeric_diagnostics(
+            rows, "safety_receipt_gap_s"
+        ),
+        "safety_source_stamp_gap_s": _numeric_diagnostics(
+            rows, "safety_source_stamp_gap_s"
+        ),
+        "invalid_status_count": sum(
+            _csv_bool(row.get("safety_valid")) is not True for row in rows
+        ),
+        "fault_status_count": sum(
+            _csv_bool(row.get("safety_fault")) is not False for row in rows
+        ),
+        "emergency_stop_status_count": sum(
+            _csv_bool(row.get("safety_emergency_stop")) is not False
+            for row in rows
+        ),
+        "sequence": _sequence_diagnostics(
+            rows,
+            sequence_field="safety_source_sequence",
+            stamp_field="safety_source_stamp_s",
+        ),
+    }
+
+
+def _ros_delivery_diagnostics(rows: list[dict[str, str]]) -> dict[str, Any]:
+    overwrite_values = [
+        numeric
+        for row in rows
+        if (numeric := _finite_number(row.get("source_mailbox_overwrites")))
+        is not None
+    ]
+    return {
+        "row_count": len(rows),
+        "ros_tactile_delivery_age_s": _numeric_diagnostics(rows, "data_age_s"),
+        "evaluator_receipt_gap_s": _numeric_diagnostics(
+            rows, "evaluator_receipt_gap_s"
+        ),
+        "source_mailbox_overwrites": {
+            "count": len(overwrite_values),
+            "invalid_count": len(rows) - len(overwrite_values),
+            "nonzero_row_count": sum(value > 0.0 for value in overwrite_values),
+            "total": float(sum(overwrite_values)),
+            "max": float(max(overwrite_values, default=0.0)),
+        },
+        "sequence": _sequence_diagnostics(
+            rows,
+            sequence_field="source_sequence",
+            stamp_field="timestamp_s",
+        ),
+    }
+
+
+def _invalid_pngs(run: Path, required: Iterable[str]) -> list[str]:
+    invalid: list[str] = []
+    for name in sorted(item for item in required if item.endswith(".png")):
+        path = run / name
+        if not path.is_file() or path.stat().st_size == 0:
+            continue
+        try:
+            decoded = plt.imread(path)
+        except (OSError, SyntaxError, ValueError):
+            invalid.append(name)
+            continue
+        if np.asarray(decoded).size == 0:
+            invalid.append(name)
+    return invalid
+
+
+def validate_artifacts(root: Path, rows: list[dict[str, Any]]) -> tuple[str, int]:
+    del root
     lines = ["# Artifact Validation", "", "Validation requires finite structured data and nonempty required artifacts.", ""]
     failures = 0
     for row in rows:
@@ -762,18 +1260,29 @@ def validate_artifacts(root: Path, rows: list[dict[str, Any]]) -> tuple[str, int
             lines.append(f"- {row.get('test_id')}: `{row.get('matrix_status')}` — {reason}")
             continue
         run = Path(row["candidate_dir"])
-        missing = sorted(name for name in required if not (run / name).is_file() or (run / name).stat().st_size == 0)
+        missing = sorted(
+            name
+            for name in REQUIRED_RUN_ARTIFACTS
+            if not (run / name).is_file() or (run / name).stat().st_size == 0
+        )
         if row.get("geometry") != "straight" and not (run / "lumen_evaluation.csv").is_file():
             missing.append("lumen_evaluation.csv")
+        invalid_pngs = _invalid_pngs(run, REQUIRED_RUN_ARTIFACTS)
         recomputed, differences = independently_recompute_metrics(run, row)
         failed_differences = {
             key: value for key, value in differences.items() if value > 1.0e-12
         }
-        failures += bool(missing or failed_differences)
+        evidence = validate_formal_window_evidence(run)
+        evidence_markdown = format_formal_window_evidence_validation(evidence)
+        failures += bool(
+            missing or invalid_pngs or failed_differences or evidence["failures"]
+        )
         lines.append(
             f"- {row.get('test_id')}: "
-            f"{'PASS' if not missing and not failed_differences else 'FAIL'}; "
-            f"missing={missing}; recomputed={recomputed}; differences={differences}"
+            f"{'PASS' if not missing and not invalid_pngs and not failed_differences and evidence['eligible'] else 'FAIL'}; "
+            f"missing={missing}; invalid_pngs={invalid_pngs}; "
+            f"recomputed={recomputed}; differences={differences}; "
+            f"formal_window_evidence=({evidence_markdown})"
         )
     lines.extend(("", f"Completed rows with artifact failures: {failures}", ""))
     return "\n".join(lines), failures
