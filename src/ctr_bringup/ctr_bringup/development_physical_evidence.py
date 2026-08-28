@@ -33,9 +33,11 @@ PRODUCTION_HARDWARE_FRESHNESS_TIMEOUT_S = 0.10
 SIMULATOR_PAPER_EVALUATION_FRESHNESS_TIMEOUT_S = 0.20
 PHYSICAL_EVIDENCE_STABLE_READ_TIMEOUT_S = 0.050
 PHYSICAL_EVIDENCE_STABLE_READ_POLL_S = 0.0005
+PHYSICAL_EVIDENCE_CONNECT_TIMEOUT_S = 10.0
 TRANSPORT_ENV = "CTR_DEVELOPMENT_PHYSICAL_EVIDENCE_TRANSPORT"
 SESSION_ENV = "CTR_DEVELOPMENT_PHYSICAL_EVIDENCE_SESSION"
 ROOT_ENV = "CTR_DEVELOPMENT_PHYSICAL_EVIDENCE_ROOT"
+CONNECT_TIMEOUT_ENV = "CTR_DEVELOPMENT_PHYSICAL_EVIDENCE_CONNECT_TIMEOUT_S"
 SOCKET_FILENAME = "physical-evidence.sock"
 SESSION_PATTERN = re.compile(r"[0-9a-f]{64}")
 
@@ -146,6 +148,33 @@ def selected_transport(environment: dict[str, str] | None = None) -> str:
     if value not in TRANSPORT_VALUES:
         raise PhysicalEvidenceError("physical_evidence_transport_invalid")
     return value
+
+
+def connect_timeout_from_environment(
+    environment: dict[str, str] | None = None,
+) -> float:
+    """Return the bounded pre-connect wait; evidence freshness is separate."""
+
+    values = os.environ if environment is None else environment
+    timeout_text = values.get(
+        CONNECT_TIMEOUT_ENV,
+        format(PHYSICAL_EVIDENCE_CONNECT_TIMEOUT_S, ".17g"),
+    )
+    if type(timeout_text) is not str:
+        raise PhysicalEvidenceError("physical_evidence_connect_timeout_invalid")
+    try:
+        connect_timeout_s = float(timeout_text)
+    except (TypeError, ValueError) as exc:
+        raise PhysicalEvidenceError(
+            "physical_evidence_connect_timeout_invalid"
+        ) from exc
+    if (
+        not math.isfinite(connect_timeout_s)
+        or connect_timeout_s <= 0.0
+        or connect_timeout_s > PHYSICAL_EVIDENCE_CONNECT_TIMEOUT_S
+    ):
+        raise PhysicalEvidenceError("physical_evidence_connect_timeout_invalid")
+    return connect_timeout_s
 
 
 def authenticated_session_from_environment(
@@ -366,8 +395,16 @@ class PhysicalEvidenceReader:
         session_id: str,
         *,
         expected_producer_token: str = "simulator_node",
-        connect_timeout_s: float = 10.0,
+        connect_timeout_s: float = PHYSICAL_EVIDENCE_CONNECT_TIMEOUT_S,
     ) -> None:
+        if (
+            type(connect_timeout_s) not in {int, float}
+            or type(connect_timeout_s) is bool
+            or not math.isfinite(connect_timeout_s)
+            or connect_timeout_s <= 0.0
+            or connect_timeout_s > PHYSICAL_EVIDENCE_CONNECT_TIMEOUT_S
+        ):
+            raise PhysicalEvidenceError("physical_evidence_connect_timeout_invalid")
         _authenticate_root(root)
         self.session_id = session_id
         self._session_bytes = _session_bytes(session_id)
@@ -471,7 +508,11 @@ class PhysicalEvidenceReader:
     @classmethod
     def from_environment(cls) -> "PhysicalEvidenceReader":
         root, session_id = authenticated_session_from_environment()
-        return cls(root, session_id)
+        return cls(
+            root,
+            session_id,
+            connect_timeout_s=connect_timeout_from_environment(),
+        )
 
     def read(self) -> PhysicalEvidenceRecord:
         if not self.producer_alive():

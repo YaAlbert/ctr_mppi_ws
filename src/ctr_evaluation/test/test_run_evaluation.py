@@ -7,6 +7,7 @@ import os
 import signal
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -26,6 +27,7 @@ sys.path.insert(0, str(REPO_ROOT / "src" / "ctr_sim"))
 
 from ctr_evaluation.metrics import compare_summaries  # noqa: E402
 from ctr_evaluation.run_evaluation import (  # noqa: E402
+    AbsoluteReadinessDeadline,
     CommandAudit,
     CommandEvent,
     EvaluationOrchestrator,
@@ -57,6 +59,7 @@ from ctr_evaluation.run_evaluation import (  # noqa: E402
     reference_target_identity,
     resolve_result_dir,
     baseline_process_guard_required,
+    bind_physical_evidence_connect_budget,
     settings_with_paper_diagnostics,
     strict_json_file,
     target_vectors_equal,
@@ -67,6 +70,7 @@ from ctr_evaluation.run_evaluation import (  # noqa: E402
     write_orchestration_failure,
 )
 from ctr_bringup.development_physical_evidence import (  # noqa: E402
+    CONNECT_TIMEOUT_ENV as PHYSICAL_EVIDENCE_CONNECT_TIMEOUT_ENV,
     ROOT_ENV as PHYSICAL_EVIDENCE_ROOT_ENV,
     SESSION_ENV as PHYSICAL_EVIDENCE_SESSION_ENV,
     TRANSPORT_AUTHENTICATED_SHARED_MEMORY,
@@ -111,6 +115,24 @@ def settings(**overrides):
     }
     values.update(overrides)
     return OrchestrationSettings(**values)
+
+
+def test_absolute_readiness_deadline_is_created_once_and_only_decreases():
+    now = [10.0]
+    budget = AbsoluteReadinessDeadline(1.0, clock=lambda: now[0])
+    assert budget.started_monotonic == 10.0
+    assert budget.deadline_monotonic == 11.0
+    now[0] = 10.25
+    assert budget.remaining("discovery") == 0.75
+    now[0] = 10.75
+    assert budget.remaining("stability") == 0.25
+    assert budget.remaining("connection", maximum_s=0.1) == 0.1
+    now[0] = 11.0
+    with unittest.TestCase().assertRaisesRegex(
+        OrchestrationError,
+        "timed out waiting for stability",
+    ):
+        budget.remaining("stability")
 
 
 def stable_samples(count=10, *, q_step=0.0, tip_step=0.0, nonfinite=False):
@@ -228,6 +250,22 @@ class RunEvaluationHelpersTest(unittest.TestCase):
                 TRANSPORT_AUTHENTICATED_SHARED_MEMORY,
                 environment[PHYSICAL_EVIDENCE_TRANSPORT_ENV],
             )
+            self.assertNotIn(
+                PHYSICAL_EVIDENCE_CONNECT_TIMEOUT_ENV,
+                environment,
+            )
+            bounded = bind_physical_evidence_connect_budget(
+                environment,
+                TRANSPORT_AUTHENTICATED_SHARED_MEMORY,
+                3.25,
+            )
+            self.assertEqual("3.25", bounded[PHYSICAL_EVIDENCE_CONNECT_TIMEOUT_ENV])
+            fixed_cap = bind_physical_evidence_connect_budget(
+                environment,
+                TRANSPORT_AUTHENTICATED_SHARED_MEMORY,
+                12.0,
+            )
+            self.assertEqual("10", fixed_cap[PHYSICAL_EVIDENCE_CONNECT_TIMEOUT_ENV])
             session.close()
             self.assertFalse(channel_root.exists())
 
@@ -402,6 +440,7 @@ class RunEvaluationHelpersTest(unittest.TestCase):
         metadata_write_error=False,
     ):
         import ctr_evaluation.run_evaluation as module
+        startup_order = []
 
         class FakeRecord:
             def __init__(self, role):
@@ -418,6 +457,7 @@ class RunEvaluationHelpersTest(unittest.TestCase):
                 self.audit_calls = 0
 
             def start(self, *, role, command, env):
+                startup_order.append(f"process:{role}")
                 self.start_calls.append(role)
                 return FakeRecord(role)
 
@@ -441,10 +481,19 @@ class RunEvaluationHelpersTest(unittest.TestCase):
             def set_diagnostic_settings(self, settings):
                 pass
 
-            def wait_for_services(self, timeout):
+            def begin_stability_observation(self, *, deadline_monotonic):
+                startup_order.append("observation:stability")
+                self.readiness_deadline = deadline_monotonic
+
+            def wait_for_services(self, timeout, *, deadline_monotonic=None):
                 pass
 
-            def wait_for_state_tip(self, timeout):
+            def wait_for_state_tip(self, timeout, *, deadline_monotonic=None):
+                pass
+
+            def wait_for_slice_7g_readiness(
+                self, timeout, *, deadline_monotonic=None
+            ):
                 pass
 
             def command_publisher_counts(self):
@@ -456,13 +505,28 @@ class RunEvaluationHelpersTest(unittest.TestCase):
             def spin_for(self, duration):
                 pass
 
-            def collect_stability_samples(self, *, duration_s, timeout_s, minimum_samples):
+            def wait_readiness_interval(
+                self, *, duration_s, deadline_monotonic, label
+            ):
+                pass
+
+            def collect_stability_samples(
+                self,
+                *,
+                duration_s,
+                timeout_s,
+                minimum_samples,
+                deadline_monotonic=None,
+            ):
                 return stable_samples(minimum_samples)
 
             def record_stability_result(self, samples, stability, entry_time):
                 pass
 
             def retire_readiness_subscriptions(self):
+                pass
+
+            def complete_readiness_observation(self, *, deadline_monotonic):
                 pass
 
             def command_events_since(self, receive_time):
@@ -512,6 +576,7 @@ class RunEvaluationHelpersTest(unittest.TestCase):
             monitor = FakeMonitor(stop_actions)
             monitor.response_path = run_dir
             process_manager = FakeProcessManager()
+            process_manager.startup_order = startup_order
             orchestrator = object.__new__(EvaluationOrchestrator)
             orchestrator.args = SimpleNamespace(
                 task="cylinder_navigation",
@@ -608,9 +673,15 @@ class RunEvaluationHelpersTest(unittest.TestCase):
             "readiness_failure_reason": None,
         }
         monitor._state_callback_sequence = 0
+        monitor._readiness_collection_state_sequence = 0
+        monitor._readiness_queue_lock = threading.Lock()
         monitor._readiness_state_queue = []
         monitor._readiness_collection_active = False
         monitor._readiness_subscriptions_retired = False
+        monitor._state_tip_ready_observed_monotonic = None
+        monitor._slice_7g_ready_observed_monotonic = None
+        monitor._state_callbacks_during_collection = 0
+        monitor._tip_callbacks_during_collection = 0
         return monitor
 
     def test_retiring_readiness_callbacks_does_not_destroy_live_executor_handles(self):
@@ -622,6 +693,138 @@ class RunEvaluationHelpersTest(unittest.TestCase):
 
         self.assertTrue(monitor._readiness_subscriptions_retired)
         monitor.node.destroy_subscription.assert_not_called()
+
+    def test_stability_uses_samples_captured_during_earlier_readiness_phases(self):
+        monitor = self.diagnostic_monitor()
+        clock = [0.0]
+        with mock.patch(
+            "ctr_evaluation.run_evaluation.time.monotonic",
+            side_effect=lambda: clock[0],
+        ):
+            monitor.begin_stability_observation(deadline_monotonic=1.0)
+            captured = [
+                StateTipSample(item.timestamp, item.q, item.tip, 0.01 + index * 0.06)
+                for index, item in enumerate(stable_samples(10))
+            ]
+            with monitor._readiness_queue_lock:
+                for sample in captured:
+                    monitor._state_callback_sequence += 1
+                    monitor._readiness_state_queue.append(
+                        (monitor._state_callback_sequence, sample)
+                    )
+            clock[0] = 0.80
+            collected = monitor.collect_stability_samples(
+                duration_s=0.5,
+                timeout_s=0.2,
+                deadline_monotonic=1.0,
+                minimum_samples=10,
+            )
+
+        self.assertEqual(captured, collected)
+        self.assertEqual(0.0, monitor._diagnostics["stability_collection_start_monotonic"])
+        self.assertEqual(0.80, monitor._diagnostics["stability_wait_start_monotonic"])
+
+    def test_predeadline_observation_survives_late_waiter_wakeup(self):
+        monitor = self.diagnostic_monitor()
+        clock = [0.0]
+        observed = [None]
+
+        def wake_after_deadline(_timeout):
+            observed[0] = 0.90
+            clock[0] = 1.05
+
+        monitor.spin_once = wake_after_deadline
+        with mock.patch(
+            "ctr_evaluation.run_evaluation.time.monotonic",
+            side_effect=lambda: clock[0],
+        ):
+            monitor._spin_until(
+                lambda: observed[0] is not None,
+                1.0,
+                "captured readiness",
+                deadline_monotonic=1.0,
+                observed_at=lambda: observed[0],
+            )
+
+        completed = monitor._diagnostics["readiness_phases"][-1]
+        self.assertEqual("completed", completed["status"])
+        self.assertEqual(0.90, completed["authoritative_observation_monotonic"])
+
+    def test_observation_at_deadline_fails_closed(self):
+        monitor = self.diagnostic_monitor()
+        clock = [0.0]
+        observed = [None]
+
+        def wake_at_deadline(_timeout):
+            observed[0] = 1.0
+            clock[0] = 1.0
+
+        monitor.spin_once = wake_at_deadline
+        with mock.patch(
+            "ctr_evaluation.run_evaluation.time.monotonic",
+            side_effect=lambda: clock[0],
+        ), self.assertRaisesRegex(
+            OrchestrationError,
+            "timed out waiting for captured readiness",
+        ):
+            monitor._spin_until(
+                lambda: observed[0] is not None,
+                1.0,
+                "captured readiness",
+                deadline_monotonic=1.0,
+                observed_at=lambda: observed[0],
+            )
+
+        self.assertEqual(
+            "timeout",
+            monitor._diagnostics["readiness_phases"][-1]["status"],
+        )
+
+    def test_exhausted_deadline_does_not_call_next_wait_helper(self):
+        now = [5.0]
+        budget = AbsoluteReadinessDeadline(1.0, clock=lambda: now[0])
+        wait_helper = mock.Mock()
+        now[0] = 6.0
+
+        with self.assertRaisesRegex(
+            OrchestrationError,
+            "timed out waiting for initial stability",
+        ):
+            wait_helper(
+                budget.remaining("initial stability")
+            )
+
+        wait_helper.assert_not_called()
+
+    def test_readiness_timeout_classifications_remain_distinct(self):
+        labels = (
+            "evaluator Start/Stop services",
+            "state/tip readiness",
+            "Slice 7G tactile/safety readiness",
+            "initial stability",
+            "shared physical evidence connection",
+        )
+        for label in labels:
+            with self.subTest(label=label):
+                monitor = self.diagnostic_monitor()
+                monitor.spin_once = lambda _timeout: None
+                with mock.patch(
+                    "ctr_evaluation.run_evaluation.time.monotonic",
+                    return_value=1.0,
+                ), self.assertRaisesRegex(
+                    OrchestrationError,
+                    "timed out waiting for",
+                ) as caught:
+                    monitor._spin_until(
+                        lambda: False,
+                        0.0,
+                        label,
+                        deadline_monotonic=1.0,
+                    )
+                self.assertEqual(
+                    f"timed out waiting for {label}",
+                    str(caught.exception),
+                )
 
     def collect_with_batches(self, batches, *, pre_window=False, duration=0.5, minimum_samples=10):
         monitor = self.diagnostic_monitor()
@@ -1010,6 +1213,10 @@ class RunEvaluationHelpersTest(unittest.TestCase):
         self.assertEqual(1, process_manager.audit_calls)
         self.assertTrue(persisted["orchestration_success"])
         self.assertEqual("completed", persisted["terminal_status"])
+        self.assertLess(
+            process_manager.startup_order.index("observation:stability"),
+            process_manager.startup_order.index("process:candidate_base"),
+        )
 
     def test_run_one_stop_timeout_retry_succeeds_without_prior_failure(self):
         result, error, persisted, monitor, process_manager = self.run_one_with_fake_runtime(

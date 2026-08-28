@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -78,6 +79,34 @@ class PhysicalEvidenceChannelTest(unittest.TestCase):
         expected = record(self.session_id, 1)
         self.producer.write(expected)
         self.assertEqual(expected, self.reader.read())
+
+    def test_environment_connect_timeout_never_exceeds_committed_limit(self):
+        self.assertEqual(10.0, evidence.connect_timeout_from_environment({}))
+        self.assertEqual(
+            2.5,
+            evidence.connect_timeout_from_environment(
+                {evidence.CONNECT_TIMEOUT_ENV: "2.5"}
+            ),
+        )
+        for value in ("0", "-1", "nan", "inf", "10.0000001", "30", "invalid"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                evidence.PhysicalEvidenceError,
+                "physical_evidence_connect_timeout_invalid",
+            ):
+                evidence.connect_timeout_from_environment(
+                    {evidence.CONNECT_TIMEOUT_ENV: value}
+                )
+
+        with self.assertRaisesRegex(
+            evidence.PhysicalEvidenceError,
+            "physical_evidence_connect_timeout_invalid",
+        ):
+            evidence.PhysicalEvidenceReader(
+                self.root,
+                self.session_id,
+                expected_producer_token="python",
+                connect_timeout_s=10.0000001,
+            )
 
     def test_latest_slot_permits_explained_sequence_gap_without_duplication(self):
         self.connect()
@@ -161,12 +190,12 @@ class PhysicalEvidenceChannelTest(unittest.TestCase):
 
     def test_initial_zero_generation_is_immediately_unavailable(self):
         self.connect()
-        started = time.monotonic()
-        with self.assertRaisesRegex(
-            evidence.PhysicalEvidenceError, "physical_evidence_unavailable"
+        with mock.patch.object(evidence.time, "sleep") as sleep, self.assertRaisesRegex(
+            evidence.PhysicalEvidenceError,
+            "physical_evidence_unavailable",
         ):
             self.reader.read()
-        self.assertLess(time.monotonic() - started, 0.025)
+        sleep.assert_not_called()
 
     def test_post_start_zero_generation_retries_then_fails_closed(self):
         self.connect()

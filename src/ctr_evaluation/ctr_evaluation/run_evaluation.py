@@ -28,6 +28,8 @@ import yaml
 
 from ctr_bringup.parameter_validation import load_parameter_files, validate_config_paths, validate_or_raise
 from ctr_bringup.development_physical_evidence import (
+    CONNECT_TIMEOUT_ENV as PHYSICAL_EVIDENCE_CONNECT_TIMEOUT_ENV,
+    PHYSICAL_EVIDENCE_CONNECT_TIMEOUT_S,
     ROOT_ENV as PHYSICAL_EVIDENCE_ROOT_ENV,
     SESSION_ENV as PHYSICAL_EVIDENCE_SESSION_ENV,
     SOCKET_FILENAME as PHYSICAL_EVIDENCE_SOCKET_FILENAME,
@@ -152,6 +154,44 @@ class OrchestrationSettings:
     allow_sigkill_cleanup: bool
     require_no_baseline_command: bool
     require_recording_before_candidate_command: bool
+
+
+class AbsoluteReadinessDeadline:
+    """One monotonic readiness budget shared by every startup phase."""
+
+    def __init__(
+        self,
+        timeout_s: float,
+        *,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        if (
+            type(timeout_s) not in {int, float}
+            or type(timeout_s) is bool
+            or not math.isfinite(timeout_s)
+            or timeout_s <= 0.0
+        ):
+            raise OrchestrationError("readiness timeout must be positive and finite")
+        self._clock = time.monotonic if clock is None else clock
+        self.started_monotonic = float(self._clock())
+        self.deadline_monotonic = self.started_monotonic + float(timeout_s)
+
+    def remaining(self, label: str, *, maximum_s: float | None = None) -> float:
+        if type(label) is not str or not label:
+            raise TypeError("readiness phase label must be a nonempty string")
+        remaining = self.deadline_monotonic - float(self._clock())
+        if remaining <= 0.0:
+            raise OrchestrationError(f"timed out waiting for {label}")
+        if maximum_s is None:
+            return remaining
+        if (
+            type(maximum_s) not in {int, float}
+            or type(maximum_s) is bool
+            or not math.isfinite(maximum_s)
+            or maximum_s <= 0.0
+        ):
+            raise TypeError("readiness phase maximum must be positive and finite")
+        return min(remaining, float(maximum_s))
 
 
 def settings_with_paper_diagnostics(
@@ -359,6 +399,7 @@ def development_physical_evidence_environment(
         result[PHYSICAL_EVIDENCE_TRANSPORT_ENV] = TRANSPORT_ROS
         result.pop(PHYSICAL_EVIDENCE_ROOT_ENV, None)
         result.pop(PHYSICAL_EVIDENCE_SESSION_ENV, None)
+        result.pop(PHYSICAL_EVIDENCE_CONNECT_TIMEOUT_ENV, None)
         return result, None
     if transport != TRANSPORT_AUTHENTICATED_SHARED_MEMORY:
         raise OrchestrationError("physical evidence transport is invalid")
@@ -388,11 +429,43 @@ def development_physical_evidence_environment(
     result[PHYSICAL_EVIDENCE_TRANSPORT_ENV] = transport
     result[PHYSICAL_EVIDENCE_ROOT_ENV] = str(root)
     result[PHYSICAL_EVIDENCE_SESSION_ENV] = session_id
+    result.pop(PHYSICAL_EVIDENCE_CONNECT_TIMEOUT_ENV, None)
     return result, DevelopmentPhysicalEvidenceSession(
         root=root,
         device=member.st_dev,
         inode=member.st_ino,
     )
+
+
+def bind_physical_evidence_connect_budget(
+    environment: dict[str, str],
+    transport: str,
+    remaining_readiness_s: float,
+) -> dict[str, str]:
+    """Cap the child connection wait by both fixed and global deadlines."""
+
+    result = dict(environment)
+    if transport == TRANSPORT_ROS:
+        result.pop(PHYSICAL_EVIDENCE_CONNECT_TIMEOUT_ENV, None)
+        return result
+    if transport != TRANSPORT_AUTHENTICATED_SHARED_MEMORY:
+        raise OrchestrationError("physical evidence transport is invalid")
+    if (
+        type(remaining_readiness_s) not in {int, float}
+        or type(remaining_readiness_s) is bool
+        or not math.isfinite(remaining_readiness_s)
+        or remaining_readiness_s <= 0.0
+    ):
+        raise OrchestrationError("shared physical evidence readiness budget exhausted")
+    connect_timeout_s = min(
+        float(remaining_readiness_s),
+        PHYSICAL_EVIDENCE_CONNECT_TIMEOUT_S,
+    )
+    result[PHYSICAL_EVIDENCE_CONNECT_TIMEOUT_ENV] = format(
+        connect_timeout_s,
+        ".17g",
+    )
+    return result
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -884,15 +957,16 @@ class EvaluationOrchestrator:
             env = run_environment(domain_id)
             if bool(getattr(self, "development_simulation", False)):
                 env = development_evaluation_environment(env)
+            physical_evidence_transport = str(
+                getattr(
+                    self.args,
+                    "physical_evidence_transport",
+                    TRANSPORT_ROS,
+                )
+            )
             env, physical_evidence_session = development_physical_evidence_environment(
                 env,
-                str(
-                    getattr(
-                        self.args,
-                        "physical_evidence_transport",
-                        TRANSPORT_ROS,
-                    )
-                ),
+                physical_evidence_transport,
             )
             base_command = build_base_simulation_command(
                 experiment_group=self.experiment_group,
@@ -921,13 +995,7 @@ class EvaluationOrchestrator:
                 evaluation_diagnostics_enabled=bool(
                     getattr(self.args, "paper_diagnostics", False)
                 ),
-                physical_evidence_transport=str(
-                    getattr(
-                        self.args,
-                        "physical_evidence_transport",
-                        TRANSPORT_ROS,
-                    )
-                ),
+                physical_evidence_transport=physical_evidence_transport,
                 simulator_paper_evaluation_profile=bool(
                     getattr(
                         self.args,
@@ -936,7 +1004,6 @@ class EvaluationOrchestrator:
                     )
                 ),
             )
-            records.append(self.process_manager.start(role=f"{role}_base", command=base_command, env=env))
             monitor = RosRunMonitor(
                 domain_id=domain_id,
                 slice_7g_governed=self.slice_7g_profile_enabled,
@@ -947,28 +1014,56 @@ class EvaluationOrchestrator:
                     self, "development_target_source", "profile"
                 ),
             )
-            monitor.record_runner_event("runner_start", orchestration_id=self.orchestration_id, run_role=role)
+            monitor.set_diagnostic_settings(self.settings)
+            readiness_budget = AbsoluteReadinessDeadline(
+                self.settings.topic_ready_timeout
+            )
+            monitor.begin_stability_observation(
+                deadline_monotonic=readiness_budget.deadline_monotonic
+            )
+            env = bind_physical_evidence_connect_budget(
+                env,
+                physical_evidence_transport,
+                readiness_budget.remaining("shared physical evidence connection"),
+            )
+            monitor.record_runner_event(
+                "runner_start",
+                orchestration_id=self.orchestration_id,
+                run_role=role,
+                readiness_started_monotonic=readiness_budget.started_monotonic,
+                readiness_deadline_monotonic=readiness_budget.deadline_monotonic,
+            )
+            records.append(
+                self.process_manager.start(
+                    role=f"{role}_base",
+                    command=base_command,
+                    env=env,
+                )
+            )
             monitor.record_runner_event(
                 "launch_process_created",
                 role=records[-1].role,
                 pid=records[-1].identity.pid,
                 domain_id=domain_id,
             )
-            monitor.set_diagnostic_settings(self.settings)
-            monitor.wait_for_services(self.settings.service_timeout)
-            readiness_deadline = time.monotonic() + self.settings.topic_ready_timeout
-
-            def readiness_remaining() -> float:
-                remaining = readiness_deadline - time.monotonic()
-                if remaining <= 0.0:
-                    raise OrchestrationError("Slice 7G readiness timeout")
-                return remaining
-
+            monitor.wait_for_services(
+                readiness_budget.remaining(
+                    "evaluator Start/Stop services",
+                    maximum_s=self.settings.service_timeout,
+                ),
+                deadline_monotonic=readiness_budget.deadline_monotonic,
+            )
             monitor.wait_for_state_tip(
-                readiness_remaining() if self.slice_7g_profile_enabled else self.settings.topic_ready_timeout
+                readiness_budget.remaining("state/tip readiness"),
+                deadline_monotonic=readiness_budget.deadline_monotonic,
             )
             if self.slice_7g_profile_enabled:
-                monitor.wait_for_slice_7g_readiness(readiness_remaining())
+                monitor.wait_for_slice_7g_readiness(
+                    readiness_budget.remaining(
+                        "Slice 7G tactile/safety readiness"
+                    ),
+                    deadline_monotonic=readiness_budget.deadline_monotonic,
+                )
             if baseline_process_guard_required(
                 role=role,
                 development_simulation=bool(
@@ -980,11 +1075,20 @@ class EvaluationOrchestrator:
             audit = monitor.command_audit_since_now(publisher_counts)
             if unexpected_command_publishers(publisher_counts, slice_7g_governed=self.slice_7g_profile_enabled):
                 raise OrchestrationError(f"unexpected command publisher exists: {publisher_counts}")
-            time.sleep(simulator_command_timeout())
-            monitor.spin_for(simulator_command_timeout())
+            monitor.wait_readiness_interval(
+                duration_s=simulator_command_timeout(),
+                deadline_monotonic=readiness_budget.deadline_monotonic,
+                label="initial command audit interval",
+            )
+            monitor.wait_readiness_interval(
+                duration_s=simulator_command_timeout(),
+                deadline_monotonic=readiness_budget.deadline_monotonic,
+                label="initial callback drain interval",
+            )
             samples = monitor.collect_stability_samples(
                 duration_s=self.settings.initial_stability_duration,
-                timeout_s=readiness_remaining() if self.slice_7g_profile_enabled else self.settings.topic_ready_timeout,
+                timeout_s=readiness_budget.remaining("initial stability"),
+                deadline_monotonic=readiness_budget.deadline_monotonic,
                 minimum_samples=self.settings.initial_stability_samples,
             )
             stability_entry_time = time.monotonic()
@@ -1001,6 +1105,9 @@ class EvaluationOrchestrator:
             if self.slice_7g_profile_enabled:
                 monitor.require_slice_7g_ready()
                 monitor.arm_safety_fault_monitor()
+            monitor.complete_readiness_observation(
+                deadline_monotonic=readiness_budget.deadline_monotonic
+            )
             monitor.retire_readiness_subscriptions()
             monitor.record_runner_event("readiness_completed", evaluated_sample_count=len(samples))
             if audit.nonzero_count(self.settings.command_zero_tolerance) > 0:
@@ -1809,6 +1916,12 @@ class RosRunMonitor:
             "criteria": None,
             "readiness_result": None,
             "readiness_failure_reason": None,
+            "readiness_started_monotonic": None,
+            "readiness_deadline_monotonic": None,
+            "readiness_completed_monotonic": None,
+            "readiness_elapsed_s": None,
+            "readiness_remaining_s": None,
+            "readiness_phases": [],
             "runner_events": [],
         }
         self._readiness_collection_active = False
@@ -1816,7 +1929,11 @@ class RosRunMonitor:
         self._state_callbacks_during_collection = 0
         self._tip_callbacks_during_collection = 0
         self._state_callback_sequence = 0
+        self._readiness_collection_state_sequence = 0
+        self._readiness_queue_lock = threading.Lock()
         self._readiness_state_queue: list[tuple[int, StateTipSample]] = []
+        self._state_tip_ready_observed_monotonic: float | None = None
+        self._slice_7g_ready_observed_monotonic: float | None = None
         self._diagnostic_settings: OrchestrationSettings | None = None
         self.StartExperiment = StartExperiment
         self.StopExperiment = StopExperiment
@@ -1905,19 +2022,88 @@ class RosRunMonitor:
     def now(self) -> float:
         return float(self.node.get_clock().now().nanoseconds) * 1.0e-9
 
-    def wait_for_services(self, timeout_s: float) -> None:
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            self.spin_once(0.05)
-            if self.start_client.service_is_ready() and self.stop_client.service_is_ready():
-                return
-        raise OrchestrationError("timed out waiting for evaluator Start/Stop services")
+    def begin_stability_observation(self, *, deadline_monotonic: float) -> None:
+        """Install the stability window before the producer can publish."""
 
-    def wait_for_state_tip(self, timeout_s: float) -> None:
-        self._spin_until(lambda: self.latest_state is not None and self.latest_tip is not None, timeout_s, "state/tip readiness")
+        started = time.monotonic()
+        if not math.isfinite(deadline_monotonic) or started >= deadline_monotonic:
+            raise OrchestrationError("timed out waiting for initial stability")
+        if self._readiness_collection_active:
+            raise OrchestrationError("initial stability observation is already active")
+        with self._readiness_queue_lock:
+            self._readiness_state_queue.clear()
+            self._readiness_collection_state_sequence = self._state_callback_sequence
+        self._state_callbacks_during_collection = 0
+        self._tip_callbacks_during_collection = 0
+        self._readiness_collection_active = True
+        self._diagnostics["readiness_started_monotonic"] = started
+        self._diagnostics["readiness_deadline_monotonic"] = deadline_monotonic
+        self._diagnostics["stability_collection_start_monotonic"] = started
+        self._diagnostics["stability_deadline_monotonic"] = deadline_monotonic
+        self._diagnostics["stability_collection_state_sequence"] = (
+            self._readiness_collection_state_sequence
+        )
+        self._diagnostics["state_callback_count_before_collection"] = self._diagnostics[
+            "state_callback_count"
+        ]
+        self._diagnostics["tip_callback_count_before_collection"] = self._diagnostics[
+            "tip_callback_count"
+        ]
 
-    def wait_for_slice_7g_readiness(self, timeout_s: float) -> None:
-        self._spin_until(self._slice_7g_ready, timeout_s, "Slice 7G tactile/safety readiness")
+    def complete_readiness_observation(self, *, deadline_monotonic: float) -> None:
+        completed = time.monotonic()
+        started = self._diagnostics.get("readiness_started_monotonic")
+        if started is None or deadline_monotonic != self._diagnostics.get(
+            "readiness_deadline_monotonic"
+        ):
+            raise OrchestrationError("readiness deadline identity changed")
+        if completed >= deadline_monotonic:
+            raise OrchestrationError("timed out waiting for initial stability")
+        self._diagnostics["readiness_completed_monotonic"] = completed
+        self._diagnostics["readiness_elapsed_s"] = completed - float(started)
+        self._diagnostics["readiness_remaining_s"] = deadline_monotonic - completed
+
+    def wait_for_services(
+        self,
+        timeout_s: float,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> None:
+        self._spin_until(
+            lambda: self.start_client.service_is_ready()
+            and self.stop_client.service_is_ready(),
+            timeout_s,
+            "evaluator Start/Stop services",
+            deadline_monotonic=deadline_monotonic,
+        )
+
+    def wait_for_state_tip(
+        self,
+        timeout_s: float,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> None:
+        self._spin_until(
+            lambda: self._state_tip_ready_observed_monotonic is not None,
+            timeout_s,
+            "state/tip readiness",
+            deadline_monotonic=deadline_monotonic,
+            observed_at=lambda: self._state_tip_ready_observed_monotonic,
+        )
+
+    def wait_for_slice_7g_readiness(
+        self,
+        timeout_s: float,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> None:
+        self._spin_until(
+            lambda: self._slice_7g_ready_observed_monotonic is not None,
+            timeout_s,
+            "Slice 7G tactile/safety readiness",
+            deadline_monotonic=deadline_monotonic,
+            observed_at=lambda: self._slice_7g_ready_observed_monotonic,
+        )
 
     def _slice_7g_ready(self) -> bool:
         now = time.monotonic()
@@ -2046,28 +2232,41 @@ class RosRunMonitor:
             )
 
     def collect_stability_samples(
-        self, *, duration_s: float, timeout_s: float, minimum_samples: int
+        self,
+        *,
+        duration_s: float,
+        timeout_s: float,
+        minimum_samples: int,
+        deadline_monotonic: float | None = None,
     ) -> list[StateTipSample]:
         samples: list[StateTipSample] = []
-        start = time.monotonic()
-        deadline = start + timeout_s
-        collection_state_sequence = self._state_callback_sequence
-        self._diagnostics["stability_collection_start_monotonic"] = start
-        self._diagnostics["stability_deadline_monotonic"] = deadline
-        self._diagnostics["stability_collection_state_sequence"] = collection_state_sequence
-        self._diagnostics["state_callback_count_before_collection"] = self._diagnostics["state_callback_count"]
-        self._diagnostics["tip_callback_count_before_collection"] = self._diagnostics["tip_callback_count"]
-        self._state_callbacks_during_collection = 0
-        self._tip_callbacks_during_collection = 0
-        self._readiness_state_queue.clear()
-        self._readiness_collection_active = True
+        wait_started = time.monotonic()
+        deadline = min(
+            wait_started + timeout_s,
+            deadline_monotonic
+            if deadline_monotonic is not None
+            else wait_started + timeout_s,
+        )
+        if not self._readiness_collection_active:
+            self.begin_stability_observation(deadline_monotonic=deadline)
+        elif (
+            deadline_monotonic is not None
+            and deadline_monotonic
+            != self._diagnostics.get("readiness_deadline_monotonic")
+        ):
+            raise OrchestrationError("readiness deadline identity changed")
+        collection_state_sequence = self._readiness_collection_state_sequence
+        self._diagnostics["stability_wait_start_monotonic"] = wait_started
         try:
-            while time.monotonic() < deadline:
-                self.spin_once(0.02)
-                pending = self._readiness_state_queue
-                self._readiness_state_queue = []
+            while True:
+                with self._readiness_queue_lock:
+                    pending = self._readiness_state_queue
+                    self._readiness_state_queue = []
                 for sequence, sample in pending:
-                    if sequence <= collection_state_sequence:
+                    if (
+                        sequence <= collection_state_sequence
+                        or sample.receive_time >= deadline
+                    ):
                         continue
                     samples.append(sample)
                 if (
@@ -2075,6 +2274,10 @@ class RosRunMonitor:
                     and samples[-1].receive_time - samples[0].receive_time >= duration_s
                 ):
                     break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                self.spin_once(min(0.02, remaining))
         finally:
             self._readiness_collection_active = False
             self._diagnostics["stability_collection_end_monotonic"] = time.monotonic()
@@ -2095,6 +2298,48 @@ class RosRunMonitor:
                 self._diagnostics["last_evaluated_sample_receive_monotonic"] = samples[-1].receive_time
                 self._diagnostics["evaluated_receive_time_span_s"] = samples[-1].receive_time - samples[0].receive_time
         return samples
+
+    def wait_readiness_interval(
+        self,
+        *,
+        duration_s: float,
+        deadline_monotonic: float,
+        label: str,
+    ) -> None:
+        if (
+            type(duration_s) not in {int, float}
+            or type(duration_s) is bool
+            or not math.isfinite(duration_s)
+            or duration_s < 0.0
+        ):
+            raise TypeError("readiness interval must be finite and nonnegative")
+        started = time.monotonic()
+        interval_deadline = started + float(duration_s)
+        if interval_deadline >= deadline_monotonic:
+            raise OrchestrationError(f"timed out waiting for {label}")
+        self._record_readiness_phase(label, "started", started, deadline_monotonic)
+        while True:
+            now = time.monotonic()
+            if now >= interval_deadline:
+                self._record_readiness_phase(
+                    label,
+                    "completed",
+                    now,
+                    deadline_monotonic,
+                    started=started,
+                )
+                return
+            remaining = min(interval_deadline, deadline_monotonic) - now
+            if remaining <= 0.0:
+                self._record_readiness_phase(
+                    label,
+                    "timeout",
+                    now,
+                    deadline_monotonic,
+                    started=started,
+                )
+                raise OrchestrationError(f"timed out waiting for {label}")
+            self.spin_once(min(0.05, remaining))
 
     def record_stability_result(self, samples: list[StateTipSample], stability: StabilityStats, entry_time: float) -> None:
         if self._diagnostic_settings is None:
@@ -2213,13 +2458,71 @@ class RosRunMonitor:
         # concurrent executor spin.
         time.sleep(max(0.0, timeout_s))
 
-    def _spin_until(self, predicate: Callable[[], bool], timeout_s: float, label: str) -> None:
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            self.spin_once(0.05)
+    def _record_readiness_phase(
+        self,
+        label: str,
+        status: str,
+        observed: float,
+        deadline: float,
+        *,
+        started: float | None = None,
+        authoritative_observation: float | None = None,
+    ) -> None:
+        self._diagnostics.setdefault("readiness_phases", []).append(
+            {
+                "phase": label,
+                "status": status,
+                "started_monotonic": observed if started is None else started,
+                "observed_monotonic": observed,
+                "authoritative_observation_monotonic": authoritative_observation,
+                "elapsed_s": 0.0 if started is None else observed - started,
+                "deadline_monotonic": deadline,
+                "remaining_s": deadline - observed,
+            }
+        )
+
+    def _spin_until(
+        self,
+        predicate: Callable[[], bool],
+        timeout_s: float,
+        label: str,
+        *,
+        deadline_monotonic: float | None = None,
+        observed_at: Callable[[], float | None] | None = None,
+    ) -> None:
+        started = time.monotonic()
+        deadline = min(
+            started + timeout_s,
+            deadline_monotonic
+            if deadline_monotonic is not None
+            else started + timeout_s,
+        )
+        self._record_readiness_phase(label, "started", started, deadline)
+        while True:
+            now = time.monotonic()
             if predicate():
-                return
-        raise OrchestrationError(f"timed out waiting for {label}")
+                authoritative = now if observed_at is None else observed_at()
+                if authoritative is not None and authoritative < deadline:
+                    self._record_readiness_phase(
+                        label,
+                        "completed",
+                        now,
+                        deadline,
+                        started=started,
+                        authoritative_observation=authoritative,
+                    )
+                    return
+            remaining = deadline - now
+            if remaining <= 0.0:
+                self._record_readiness_phase(
+                    label,
+                    "timeout",
+                    now,
+                    deadline,
+                    started=started,
+                )
+                raise OrchestrationError(f"timed out waiting for {label}")
+            self.spin_once(min(0.05, remaining))
 
     def _call_service(self, client, request, timeout_s: float, label: str):
         wait_start = time.monotonic()
@@ -2292,7 +2595,16 @@ class RosRunMonitor:
             if len(q) == 6:
                 self.latest_state = sample
                 self._state_callback_sequence += 1
-                self._readiness_state_queue.append((self._state_callback_sequence, sample))
+                if self._readiness_collection_active:
+                    with self._readiness_queue_lock:
+                        self._readiness_state_queue.append(
+                            (self._state_callback_sequence, sample)
+                        )
+                if (
+                    self.latest_tip is not None
+                    and self._state_tip_ready_observed_monotonic is None
+                ):
+                    self._state_tip_ready_observed_monotonic = receive_time
         except (TypeError, ValueError):
             return
 
@@ -2311,6 +2623,11 @@ class RosRunMonitor:
                 [float(msg.pose.position.x), float(msg.pose.position.y), float(msg.pose.position.z)],
                 receive_time,
             )
+            if (
+                self.latest_state is not None
+                and self._state_tip_ready_observed_monotonic is None
+            ):
+                self._state_tip_ready_observed_monotonic = receive_time
         except (TypeError, ValueError):
             return
 
@@ -2340,11 +2657,15 @@ class RosRunMonitor:
         self.command_events.append(command_event_from_message(topic, msg, receive_time=time.monotonic(), receive_timestamp=self.now()))
 
     def _on_tactile(self, msg) -> None:
-        self.latest_tactile_receive_time = time.monotonic()
+        receive_time = time.monotonic()
+        self.latest_tactile_receive_time = receive_time
         self.latest_tactile_valid = bool(getattr(msg, "valid", False)) and getattr(msg, "source", "") == "simulated"
+        if self._slice_7g_ready() and self._slice_7g_ready_observed_monotonic is None:
+            self._slice_7g_ready_observed_monotonic = receive_time
 
     def _on_safety(self, msg) -> None:
-        self.latest_safety_receive_time = time.monotonic()
+        receive_time = time.monotonic()
+        self.latest_safety_receive_time = receive_time
         fault = bool(getattr(msg, "fault", True)) or bool(getattr(msg, "emergency_stop", True))
         self.latest_safety_fault = fault
         self.latest_safety_ready = (
@@ -2354,6 +2675,8 @@ class RosRunMonitor:
         )
         if fault and self._safety_fault_monitor_armed:
             self.safety_fault_count += 1
+        if self._slice_7g_ready() and self._slice_7g_ready_observed_monotonic is None:
+            self._slice_7g_ready_observed_monotonic = receive_time
 
 
 class ProcessManager:
